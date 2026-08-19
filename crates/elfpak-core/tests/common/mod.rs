@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -343,4 +344,166 @@ pub fn ld_cache(entries: &[(&str, &str)]) -> Vec<u8> {
     }
     out.extend_from_slice(&strings);
     out
+}
+
+/// Raw `ldd` output, kept even when the loader reports a missing library.
+///
+/// `ldd` is a *test oracle* only. `elfpak` itself never runs it.
+pub fn ldd_raw(binary: &Path) -> Option<String> {
+    let output = Command::new("ldd").arg(binary).output().ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Library paths the glibc loader resolves for `binary`, canonicalized.
+///
+/// Returns `None` when `ldd` is unavailable or reported a failure, so callers
+/// can skip rather than assert against nothing.
+pub fn ldd_closure(binary: &Path) -> Option<BTreeSet<PathBuf>> {
+    let text = ldd_raw(binary)?;
+    if text.contains("not found") {
+        return None;
+    }
+    let mut paths = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("linux-vdso") || line.contains("statically linked") {
+            continue;
+        }
+        let candidate = match line.split_once("=>") {
+            Some((_, rest)) => rest.trim(),
+            None => line,
+        };
+        let path = candidate.split(" (").next().unwrap_or("").trim();
+        if path.is_empty() || !path.starts_with('/') {
+            continue;
+        }
+        paths.insert(std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)));
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// The same loader scenarios as [`Sysroot`], but installed at absolute paths on
+/// the host so that the real glibc loader resolves them too.
+///
+/// That makes `ldd` usable as an oracle for RPATH inheritance, RUNPATH
+/// non-inheritance and `$ORIGIN` expansion, which a sysroot-only fixture cannot
+/// verify without root privileges.
+pub struct HostFixtures {
+    _tmp: tempfile::TempDir,
+    pub dir: PathBuf,
+}
+
+impl HostFixtures {
+    pub fn build() -> HostFixtures {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let fixtures = HostFixtures { _tmp: tmp, dir };
+        fixtures.populate();
+        fixtures
+    }
+
+    pub fn bin(&self, name: &str) -> PathBuf {
+        self.dir.join("bin").join(name)
+    }
+
+    fn populate(&self) {
+        let lib = self.dir.join("lib");
+        let hidden = self.dir.join("hidden");
+        let bin = self.dir.join("bin");
+        for dir in [&lib, &hidden, &bin] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let src = self.dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let write = |name: &str, body: &str| {
+            let path = src.join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+
+        // A leaf library reached through a soname symlink.
+        cc(&[
+            "-shared",
+            "-fPIC",
+            "-nostdlib",
+            "-Wl,-soname,libbase.so.1",
+            "-o",
+            lib.join("libbase.so.1.4.2").to_str().unwrap(),
+            write("base.c", "int base_value(void) { return 42; }\n")
+                .to_str()
+                .unwrap(),
+        ]);
+        std::os::unix::fs::symlink("libbase.so.1.4.2", lib.join("libbase.so.1")).unwrap();
+
+        // libtop -> libbase, so the executable's search path has to cover a
+        // dependency it does not declare itself.
+        cc(&[
+            "-shared",
+            "-fPIC",
+            "-nostdlib",
+            "-Wl,-soname,libtop.so.1",
+            "-o",
+            lib.join("libtop.so.1").to_str().unwrap(),
+            write(
+                "top.c",
+                "int base_value(void);\nint top_value(void) { return base_value(); }\n",
+            )
+            .to_str()
+            .unwrap(),
+            lib.join("libbase.so.1").to_str().unwrap(),
+            &format!("-Wl,-rpath-link,{}", lib.display()),
+        ]);
+
+        let main = write(
+            "app.c",
+            "int top_value(void);\nvoid _start(void) { top_value(); }\n",
+        );
+        let base_main = write(
+            "app-base.c",
+            "int base_value(void);\nvoid _start(void) { base_value(); }\n",
+        );
+
+        // DT_RPATH: applies to the whole loading chain.
+        cc(&[
+            "-nostdlib",
+            "-o",
+            bin.join("app-rpath").to_str().unwrap(),
+            main.to_str().unwrap(),
+            lib.join("libtop.so.1").to_str().unwrap(),
+            &format!("-Wl,-rpath-link,{}", lib.display()),
+            &format!("-Wl,--disable-new-dtags,-rpath,{}", lib.display()),
+        ]);
+
+        // DT_RUNPATH: applies to this object only, so libbase must not resolve.
+        cc(&[
+            "-nostdlib",
+            "-o",
+            bin.join("app-runpath").to_str().unwrap(),
+            main.to_str().unwrap(),
+            lib.join("libtop.so.1").to_str().unwrap(),
+            &format!("-Wl,-rpath-link,{}", lib.display()),
+            &format!("-Wl,--enable-new-dtags,-rpath,{}", lib.display()),
+        ]);
+
+        // $ORIGIN expansion, against a dependency with no dependencies of its own.
+        cc(&[
+            "-nostdlib",
+            "-o",
+            bin.join("app-origin").to_str().unwrap(),
+            base_main.to_str().unwrap(),
+            lib.join("libbase.so.1").to_str().unwrap(),
+            &format!("-Wl,-rpath-link,{}", lib.display()),
+            "-Wl,--enable-new-dtags,-rpath,$ORIGIN/../lib",
+        ]);
+    }
+}
+
+fn cc(args: &[&str]) {
+    let output = Command::new("cc").args(args).output().expect("cc runs");
+    assert!(
+        output.status.success(),
+        "cc {args:?} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

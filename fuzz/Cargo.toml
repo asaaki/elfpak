@@ -1,0 +1,28 @@
+# Fuzzing harness for the ELF parsing boundary, which is the only place where
+# elfpak consumes untrusted binary input.
+#
+#   cargo +nightly fuzz run parse_elf
+#
+# Kept out of the workspace so a normal `cargo build` does not require nightly.
+
+[package]
+name = "elfpak-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+elfpak-core = { path = "../crates/elfpak-core" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "parse_elf"
+path = "fuzz_targets/parse_elf.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

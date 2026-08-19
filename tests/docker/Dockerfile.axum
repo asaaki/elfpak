@@ -2,6 +2,13 @@
 
 # Docker smoke test: build a real Axum service, package it with elfpak, and run
 # the result on FROM scratch. This is the primary product UX.
+#
+# Unlike the elfpak image, this stage deliberately does *not* cross-compile: the
+# builder runs on the target platform so the arm64 run exercises a natively
+# built application, packaged by a natively running elfpak. Building both
+# architectures in one buildx invocation still runs them in parallel:
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 --load -f ... .
 
 # Base images are pinned by tag *and* digest so a build is reproducible and the
 # toolchain never moves under us. Refresh a digest with:
@@ -15,8 +22,6 @@ FROM ${RUST_IMAGE} AS build
 
 WORKDIR /src
 
-COPY --from=elfpak /elfpak /usr/local/bin/elfpak
-
 COPY fixtures/axum-server/Cargo.toml fixtures/axum-server/Cargo.lock ./
 COPY fixtures/axum-server/src ./src
 
@@ -28,6 +33,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=axum-target-${TARGETARCH},sharing=locked \
     cargo build --release --locked \
     && cp target/release/axum-server /axum-server
+
+# Copied after the application build so that changing elfpak does not invalidate
+# it; under emulation that recompile is the most expensive step in the suite.
+COPY --from=elfpak /elfpak /usr/local/bin/elfpak
 
 # The `minimal` preset is used by the smoke test to prove that outbound HTTPS
 # depends on what `web` adds, not on anything compiled into the application.

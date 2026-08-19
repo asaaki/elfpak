@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use elfpak_core::config::Config;
-use elfpak_core::manifest::{DEFAULT_MANIFEST_NAME, Manifest};
+use elfpak_core::manifest::{DEFAULT_MANIFEST_NAME, Manifest, VerifyOptions};
 use elfpak_core::{
-    DependencyPolicy, Error, Planner, Preset, RootFsBuilder, RuntimePolicy, SourceRoot, UserSpec,
+    DependencyPolicy, Error, Planner, Preset, RootFsBuilder, RootFsReport, RuntimePolicy,
+    SourceRoot, TarBuilder, TarReport, UserSpec,
 };
 
 use cli::{BundleArgs, Cli, Command, InspectArgs, VerifyArgs};
@@ -97,10 +98,14 @@ fn bundle(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()> {
     let output = args
         .output
         .clone()
-        .or_else(|| config.package.output.clone())
-        .ok_or_else(|| Error::Config {
-            message: "no output directory given (pass --output or set package.output)".to_string(),
-        })?;
+        .or_else(|| config.package.output.clone());
+    let tar = args.tar.clone().or_else(|| config.package.tar.clone());
+    if output.is_none() && tar.is_none() {
+        return Err(Error::Config {
+            message: "no output given (pass --output <dir> and/or --tar <file>)".to_string(),
+        }
+        .into());
+    }
     let root = args
         .root
         .clone()
@@ -159,7 +164,11 @@ fn bundle(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()> {
         None => DependencyPolicy::allow_all(),
     };
 
-    let plan = Planner::new(SourceRoot::new(&root), &binary)
+    let mut planner = Planner::new(SourceRoot::new(&root), &binary);
+    if let Some(preset) = args.preset.or(config.runtime.preset) {
+        planner = planner.preset(preset);
+    }
+    let plan = planner
         .install_as(&install)
         .runtime_policy(policy)
         .dependency_policy(dependency_policy)
@@ -169,36 +178,57 @@ fn bundle(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()> {
     let manifest_path = if args.no_manifest {
         None
     } else {
+        // Beside the rootfs, or beside the archive when only a tar was asked for.
+        let beside = output
+            .clone()
+            .or_else(|| tar.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
         Some(
             args.manifest
                 .clone()
-                .unwrap_or_else(|| default_manifest_path(&output)),
+                .unwrap_or_else(|| default_manifest_path(&beside)),
         )
     };
 
-    let report = if args.dry_run {
-        None
-    } else {
-        let report = RootFsBuilder::new(&output).clean(args.clean).apply(&plan)?;
+    let mut outputs = Outputs::default();
+    if !args.dry_run {
+        if let Some(output) = &output {
+            outputs.rootfs = Some(RootFsBuilder::new(output).clean(args.clean).apply(&plan)?);
+        }
+        if let Some(tar) = &tar {
+            outputs.tar = Some(TarBuilder::new(tar).apply(&plan)?);
+        }
         if let Some(path) = &manifest_path {
-            let manifest = Manifest::from_plan(&plan, &root, Some(&output));
+            let manifest =
+                Manifest::from_plan_with_outputs(&plan, &root, output.as_deref(), tar.as_deref());
             manifest.write(path)?;
         }
-        Some(report)
-    };
+        outputs.written = true;
+    }
 
     verbosity.print(|out| {
         render::bundle_summary(
             out,
             &binary,
             &plan,
-            &output,
-            manifest_path.as_deref(),
-            report.as_ref(),
+            render::Destinations {
+                rootfs: output.as_deref(),
+                tar: tar.as_deref(),
+                manifest: manifest_path.as_deref(),
+            },
+            &outputs,
             verbosity.level,
         )
     });
     Ok(())
+}
+
+/// What was actually materialized, as opposed to only planned.
+#[derive(Default)]
+pub struct Outputs {
+    pub rootfs: Option<RootFsReport>,
+    pub tar: Option<TarReport>,
+    pub written: bool,
 }
 
 enum Field {
@@ -244,14 +274,18 @@ fn verify(args: &VerifyArgs, verbosity: Verbosity) -> anyhow::Result<()> {
             message: "manifest does not record a rootfs; pass --rootfs".to_string(),
         })?;
 
-    let report = manifest.verify(&rootfs);
+    let options = VerifyOptions {
+        strict: args.strict,
+    };
+    let report = manifest.verify(&rootfs, &options);
     if report.is_ok() {
         verbosity.print(|out| {
             writeln!(
                 out,
-                "ok: {} entries verified in {}",
+                "ok: {} entries verified in {}{}",
                 report.checked,
-                rootfs.display()
+                rootfs.display(),
+                if options.strict { " (strict)" } else { "" }
             )
         });
         return Ok(());

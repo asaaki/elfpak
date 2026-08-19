@@ -67,7 +67,7 @@ pub enum Error {
     #[error("invalid manifest `{path}`: {message}")]
     Manifest { path: PathBuf, message: String },
 
-    #[error("verification failed: {failures} of {checked} entries did not match")]
+    #[error("verification failed: {failures} problem(s) across {checked} manifest entries")]
     VerifyFailed { checked: usize, failures: usize },
 }
 

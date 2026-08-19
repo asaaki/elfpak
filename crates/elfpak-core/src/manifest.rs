@@ -1,6 +1,6 @@
 //! Machine-readable record of a bundle: what was included and why.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +8,7 @@ use crate::error::{Error, Result, io};
 use crate::hash::sha256_bytes;
 use crate::plan::{BundlePlan, InclusionReason, PlannedFileKind};
 
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 pub const DEFAULT_MANIFEST_NAME: &str = "elfpak-manifest.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,9 +24,34 @@ pub struct Manifest {
     /// Where the rootfs was written, used by `elfpak verify`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rootfs: Option<String>,
+    /// Where the tar archive was written, when one was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tar: Option<String>,
+    /// Resolved runtime and dependency policy. Reproducing a bundle requires
+    /// the same configuration, so the configuration is part of the record.
+    #[serde(default)]
+    pub policy: ManifestPolicy,
     pub files: Vec<ManifestFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManifestPolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    pub ca_certificates: bool,
+    pub tmp: bool,
+    pub passwd_group: bool,
+    pub nsswitch: bool,
+    pub tzdata: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<String>,
+    /// `None` means the dependency allow-list was not enforced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_libraries: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +95,15 @@ impl From<&InclusionReason> for Reason {
 
 impl Manifest {
     pub fn from_plan(plan: &BundlePlan, source_root: &Path, rootfs: Option<&Path>) -> Manifest {
+        Manifest::from_plan_with_outputs(plan, source_root, rootfs, None)
+    }
+
+    pub fn from_plan_with_outputs(
+        plan: &BundlePlan,
+        source_root: &Path,
+        rootfs: Option<&Path>,
+        tar: Option<&Path>,
+    ) -> Manifest {
         let files = plan
             .files
             .iter()
@@ -92,6 +126,23 @@ impl Manifest {
             interpreter: plan.interpreter.as_ref().map(|p| p.display().to_string()),
             source_root: source_root.display().to_string(),
             rootfs: rootfs.map(|p| p.display().to_string()),
+            tar: tar.map(|p| p.display().to_string()),
+            policy: ManifestPolicy {
+                preset: plan.preset.map(|p| p.to_string()),
+                ca_certificates: plan.runtime_policy.ca_certificates,
+                tmp: plan.runtime_policy.tmp,
+                passwd_group: plan.runtime_policy.passwd_group,
+                nsswitch: plan.runtime_policy.nsswitch,
+                tzdata: plan.runtime_policy.tzdata,
+                user: plan.runtime_policy.user.as_ref().map(|u| u.to_string()),
+                includes: plan
+                    .runtime_policy
+                    .includes
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect(),
+                allow_libraries: plan.dependency_policy.allow.clone(),
+            },
             files,
             warnings: plan
                 .warnings
@@ -125,7 +176,7 @@ impl Manifest {
     }
 
     /// Check a materialized rootfs against this manifest.
-    pub fn verify(&self, rootfs: &Path) -> VerifyReport {
+    pub fn verify(&self, rootfs: &Path, options: &VerifyOptions) -> VerifyReport {
         let mut report = VerifyReport::default();
         for file in &self.files {
             report.checked += 1;
@@ -200,7 +251,50 @@ impl Manifest {
                 }
             }
         }
+
+        if options.strict {
+            self.report_unexpected(rootfs, &mut report);
+        }
         report
+    }
+
+    /// Anything present in the rootfs that the manifest does not list. Without
+    /// this, `verify` can only prove that nothing was removed or altered.
+    fn report_unexpected(&self, rootfs: &Path, report: &mut VerifyReport) {
+        let expected: std::collections::HashSet<PathBuf> = self
+            .files
+            .iter()
+            .map(|f| crate::paths::normalize_absolute(Path::new(&f.path)))
+            .collect();
+
+        let mut stack = vec![rootfs.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            let mut found: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            found.sort();
+            for path in found {
+                let Ok(relative) = path.strip_prefix(rootfs) else {
+                    continue;
+                };
+                let logical = crate::paths::normalize_absolute(&Path::new("/").join(relative));
+                let metadata = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                if metadata.is_dir() && !metadata.is_symlink() {
+                    stack.push(path.clone());
+                }
+                if !expected.contains(&logical) {
+                    report.unexpected += 1;
+                    report.problems.push(Problem {
+                        path: logical.display().to_string(),
+                        detail: "present in the rootfs but not listed in the manifest".to_string(),
+                    });
+                }
+            }
+        }
     }
 
     pub fn file_count(&self) -> usize {
@@ -211,9 +305,18 @@ impl Manifest {
     }
 }
 
+/// What `verify` should check beyond "every recorded entry still matches".
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VerifyOptions {
+    /// Also fail on files present in the rootfs but absent from the manifest.
+    pub strict: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct VerifyReport {
     pub checked: usize,
+    /// Entries found in the rootfs that the manifest does not list.
+    pub unexpected: usize,
     pub problems: Vec<Problem>,
 }
 

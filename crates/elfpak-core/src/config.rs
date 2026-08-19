@@ -29,6 +29,7 @@ pub struct PackageConfig {
     pub binary: Option<PathBuf>,
     pub install: Option<PathBuf>,
     pub output: Option<PathBuf>,
+    pub tar: Option<PathBuf>,
     pub root: Option<PathBuf>,
 }
 

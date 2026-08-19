@@ -61,6 +61,10 @@ pub struct BundleArgs {
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
+    /// Also write the rootfs as a deterministic tar archive
+    #[arg(long, value_name = "FILE")]
+    pub tar: Option<PathBuf>,
+
     /// Path of the executable inside the rootfs
     #[arg(long)]
     pub install: Option<PathBuf>,
@@ -142,4 +146,8 @@ pub struct VerifyArgs {
     /// Rootfs to check (default: the path recorded in the manifest)
     #[arg(long)]
     pub rootfs: Option<PathBuf>,
+
+    /// Also fail on files that are present but not listed in the manifest
+    #[arg(long)]
+    pub strict: bool,
 }

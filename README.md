@@ -50,6 +50,9 @@ elfpak bundle  <binary>    build a minimal rootfs plus a manifest
 elfpak verify  <manifest>  check a materialized rootfs against its manifest
 ```
 
+`bundle` writes a directory (`--output`), a deterministic tar archive
+(`--tar`, for `ADD rootfs.tar /`), or both from the same plan.
+
 Two presets: `minimal` is the ELF closure alone, `web` adds CA certificates,
 `/tmp`, `passwd`/`group` and `nsswitch.conf`. Every feature is also switchable
 on its own, and an optional `elfpak.toml` can supply defaults.
@@ -67,7 +70,8 @@ CA-specific code in the application: the system trust store is simply there.
   stays a symlink; nothing is relocated into a private directory with a
   compensating `LD_LIBRARY_PATH`.
 * **Every file has a recorded reason.** The manifest beside the rootfs says what
-  was included and why, and `elfpak verify` re-checks it.
+  was included and why, along with the policy it was built with; `elfpak verify`
+  re-checks it, and `--strict` also rejects anything that was added afterwards.
 * **An allow-list turns dependencies into a contract.** A new native dependency
   fails the build instead of silently growing the image.
 * **Cross-architecture.** `--root` abstracts the source filesystem, so an x86_64
@@ -95,8 +99,15 @@ cross-architecture packaging and the test suite.
 $ cargo test              # unit + integration tests, MSRV 1.97
 $ cargo clippy --all-targets
 $ tests/docker/smoke.sh   # Docker smoke tests (see DOCUMENTATION.md)
+
+$ docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
 ```
+
+The distribution image is multi-platform and cross-compiled, so building every
+architecture never needs emulation.
 
 ## Status
 
-Roadmap 0.1/0.2 is implemented, for x86_64 and aarch64. Tar and OCI output, runtime tracing (`elfpak trace`) and SBOM generation are not implemented yet, by design.
+Roadmap 0.1/0.2 is implemented for x86_64 and aarch64, along with tar output,
+loader-oracle tests against real glibc, and parser fuzzing. OCI output, runtime
+tracing (`elfpak trace`) and SBOM generation are not implemented yet, by design.

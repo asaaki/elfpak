@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1
+
+# Tar smoke test: `ADD` extracts the archive elfpak produced, so the rootfs
+# never touches the build context as a directory.
+
+FROM scratch
+
+ADD rootfs.tar /
+
+ENTRYPOINT ["/app/ls"]

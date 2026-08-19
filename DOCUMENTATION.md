@@ -20,7 +20,8 @@ Reference for `elfpak`. See [README.md](README.md) for the short version.
 elfpak inspect <binary> [--root <sysroot>] [--library-path <dir>] [--json]
 
 elfpak bundle <binary>
-    --output <dir>            where the rootfs is written
+    --output <dir>            where the rootfs directory is written
+    --tar <file>              where the rootfs tar archive is written
     --install <path>          path of the executable inside the rootfs
     --root <sysroot>          logical / used for dependency lookup (default: /)
     --preset <minimal|web>    runtime policy preset
@@ -33,8 +34,11 @@ elfpak bundle <binary>
     --manifest <path> | --no-manifest
     --dry-run --clean --config <file> --no-config
 
-elfpak verify <manifest> [--rootfs <dir>]
+elfpak verify <manifest> [--rootfs <dir>] [--strict]
 ```
+
+At least one of `--output` and `--tar` is required; giving both writes both from
+the same plan.
 
 Global flags: `-q/--quiet`, `-v`/`-vv` for verbosity. `-v` on `bundle` prints
 every planned file with the reason it was included.
@@ -83,6 +87,30 @@ $ elfpak bundle ./server \
 The executable is installed at `--install`; every other file keeps the path it
 had in the source root. The manifest is written beside the rootfs, never inside
 it (`--manifest` overrides the location, `--no-manifest` disables it).
+
+### Tar output
+
+`--tar` writes a tar archive instead of, or in addition to, a directory:
+
+```console
+$ elfpak bundle ./server --tar /out/rootfs.tar --install /app/server --preset web
+```
+
+```dockerfile
+FROM scratch
+ADD rootfs.tar /
+ENTRYPOINT ["/app/server"]
+```
+
+The archive is written from the bundle plan, not from a materialized directory,
+so both backends describe exactly the same tree. It is deterministic by
+construction: entries follow plan order, ownership is `0:0`, timestamps come
+from `SOURCE_DATE_EPOCH` (default: the Unix epoch), modes are the normalized
+ones from the plan, and paths are relative. The same plan produces a
+byte-identical archive on every run.
+
+Symlinks are stored as symlink entries and directories keep their modes,
+including the sticky bit on `/tmp`.
 
 ## Presets and runtime policy
 
@@ -181,6 +209,15 @@ file, its digest, its mode, and why it is there:
   "binary": "/app/server",
   "architecture": "x86_64",
   "interpreter": "/lib64/ld-linux-x86-64.so.2",
+  "policy": {
+    "preset": "web",
+    "ca_certificates": true,
+    "tmp": true,
+    "passwd_group": true,
+    "nsswitch": true,
+    "tzdata": false,
+    "user": "app:65532:65532"
+  },
   "files": [
     { "path": "/app/server", "reason": "application", "sha256": "…" },
     {
@@ -196,6 +233,12 @@ Reasons are one of `application`, `interpreter`, `include`,
 `{ needed_by, soname }` or `{ runtime_policy }`. That makes bundles auditable
 and diffable, and is the basis for future SBOM output.
 
+The `policy` object records the *resolved* runtime and dependency policy —
+preset, every runtime feature, the user identity, explicit includes and the
+allow-list. Reproducing a bundle requires the same configuration, so the
+configuration is part of the record rather than something the caller has to
+remember.
+
 ```console
 $ elfpak verify /out/elfpak-manifest.json
 ok: 25 entries verified in /out/rootfs
@@ -204,6 +247,17 @@ ok: 25 entries verified in /out/rootfs
 `verify` checks that every entry exists, that regular files hash as recorded,
 and that symlinks still point where they did. It needs no Docker. Pass
 `--rootfs` to check a tree other than the one recorded in the manifest.
+
+By default that proves nothing was **removed or altered**. `--strict` also walks
+the rootfs and fails on anything the manifest does not list, which is what
+catches files that were *added* after the bundle was built:
+
+```console
+$ elfpak verify /out/elfpak-manifest.json --strict
+  /opt/payload/extra.so: present in the rootfs but not listed in the manifest
+error[E5001]:
+  verification failed: 1 problem(s) across 25 manifest entries
+```
 
 ## How dependencies are resolved
 
@@ -278,7 +332,33 @@ Dockerfile            static elfpak distribution image (FROM scratch)
 ```
 
 `elfpak-core` holds the reusable implementation; no resolution logic lives in
-the CLI crate. Base images are pinned by tag and digest.
+the CLI crate. Base images are pinned by tag and digest, and every image the
+tests build is produced for all architectures under test in one buildx
+invocation.
+
+## Building the elfpak image
+
+The distribution image is multi-platform and cross-compiled. Its builder stage
+runs on the *build* platform (`FROM --platform=$BUILDPLATFORM`) and targets
+`$TARGETARCH`, so every architecture is produced by a native compiler and none
+of it runs under emulation:
+
+```console
+$ docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
+```
+
+`elfpak` has no C dependencies, so `rust-lld` links every supported target and
+no cross toolchain has to be installed. The result is a static musl binary per
+architecture, together in one image.
+
+`--load` writes a multi-platform image into the local image store, which
+requires the containerd image store to be enabled; `--push` writes it to a
+registry and has no such requirement. Where a multi-platform image cannot be
+loaded, the smoke tests fall back to one tag per platform.
+
+See the [Docker multi-platform documentation][multi-platform] for the details.
+
+[multi-platform]: https://docs.docker.com/build/building/multi-platform/
 
 ## Development
 
@@ -291,6 +371,8 @@ $ tests/docker/smoke.sh            # all Docker smoke tests
 $ tests/docker/smoke.sh axum       # Axum on scratch, host architecture
 $ tests/docker/smoke.sh axum-arm64 # Axum on scratch, linux/arm64
 $ tests/docker/smoke.sh ca         # CA roots come from the bundle, not the binary
+$ tests/docker/smoke.sh musl       # a dynamically linked musl program
+$ tests/docker/smoke.sh tar        # tar output consumed by docker ADD
 $ tests/docker/smoke.sh cross      # non-Rust cross-architecture packaging
 ```
 
@@ -300,9 +382,37 @@ semantics against a synthetic sysroot of purpose-built C fixtures (transitive
 `DT_NEEDED`, RPATH inheritance versus RUNPATH non-inheritance, `$ORIGIN`,
 `ld.so.conf` globs, cache-only libraries, decoy files, symlinked DSOs).
 
-It also compares against the real glibc loader: for host binaries, `elfpak`'s
-closure must equal what `ldd` reports. `ldd` is a test oracle only; the tool
-itself never runs it.
+It also compares against the real glibc loader. Host binaries give breadth:
+`elfpak`'s closure must equal what `ldd` reports. Purpose-built fixtures give
+depth, because a normal system binary never exercises the interesting rules —
+they are installed at absolute paths on the host so the real loader resolves
+them too, and then:
+
+* an executable with `DT_RPATH` must resolve its dependency's dependency, in
+  both `elfpak` and glibc;
+* the same layout with `DT_RUNPATH` must fail in both, since `DT_RUNPATH` is not
+  inherited (`ldd` reports `not found`, `elfpak` reports `E2001`);
+* `$ORIGIN`-relative search must produce the same closure as the loader.
+
+`ldd` is a test oracle only; the tool itself never runs it. The interpreter is
+excluded from the comparison, because `ldd` only prints it when `libc.so.6`
+declares it as `DT_NEEDED`.
+
+### Fuzzing
+
+The ELF parser is the only place where `elfpak` consumes untrusted binary input.
+`tests/elf_robustness.rs` runs deterministic truncation, bit-flip and garbage
+mutations on every `cargo test`, and `fuzz/` holds a `cargo-fuzz` target for
+deeper runs:
+
+```console
+$ cargo install cargo-fuzz
+$ mkdir -p fuzz/corpus/parse_elf && cp /usr/bin/ls /usr/bin/true fuzz/corpus/parse_elf/
+$ cargo +nightly fuzz run parse_elf
+```
+
+The corpus is not checked in; seed it from any system binaries. The fuzz crate is
+outside the workspace, so a normal build never needs nightly.
 
 The Docker smoke tests:
 
@@ -315,8 +425,20 @@ The Docker smoke tests:
   still starts but can no longer make an HTTPS request, which is what proves the
   trust roots come from the bundle rather than from the application.
 * `axum-arm64` — the same end-to-end test on `linux/arm64`: the service, the
-  `elfpak` that packages it, and the resulting scratch image are all aarch64. On
-  an x86_64 host everything compiles under qemu, so it is slow.
+  `elfpak` that packages it, and the resulting scratch image are all aarch64.
+  The full run builds both architectures in a single buildx invocation. The
+  application is deliberately *not* cross-compiled, so that the arm64 run
+  exercises a natively built binary; on an x86_64 host that compile runs under
+  qemu and is the slowest part of the suite.
+* `musl` — compiles a dynamically linked C program on alpine and packages it,
+  on every architecture under test. musl-specific behaviour is a non-goal, but
+  generic ELF handling has to work: the loader *is* libc
+  (`libc.musl-x86_64.so.1` is a symlink to `ld-musl-x86_64.so.1`), there is no
+  `ld.so.cache`, and name resolution needs no NSS modules. Each scratch image
+  must run and resolve DNS.
+* `tar` — packages into an archive, checks the archive is byte-identical across
+  runs, and builds a scratch image with `ADD rootfs.tar /` to prove the output
+  is consumable by a container build.
 * `cross` — exports an aarch64 sysroot, packages an aarch64 binary with the host
   `elfpak`, and runs the result under emulation. Nothing is compiled or executed
   for the foreign architecture, which keeps it cheap and covers the non-Rust
@@ -324,11 +446,12 @@ The Docker smoke tests:
 
 ## Status
 
-Implemented (roadmap 0.1/0.2): workspace, CLI, ELF parsing, architecture
-detection, full static closure, RPATH/RUNPATH/token/cache/conf resolution, path
-and symlink preservation, presets, manifest, hashes, dependency allow-list,
-`verify`, deterministic output, and x86_64 + aarch64 support.
+Implemented (roadmap 0.1/0.2, plus parts of 0.3 and 1.0): workspace, CLI, ELF
+parsing, architecture detection, full static closure,
+RPATH/RUNPATH/token/cache/conf resolution, path and symlink preservation,
+presets, manifest with recorded policy, hashes, dependency allow-list, `verify`
+including strict mode, deterministic directory and tar output, loader-oracle
+tests, parser fuzzing, and x86_64 + aarch64 support.
 
-Not implemented yet, by design: tar and OCI output, runtime tracing
-(`elfpak trace`), SBOM generation, and musl-specific behaviour beyond generic
-ELF parsing.
+Not implemented yet, by design: OCI output, runtime tracing (`elfpak trace`),
+SBOM generation, and musl-specific behaviour beyond generic ELF parsing.

@@ -3,9 +3,19 @@
 use std::io::Write;
 use std::path::Path;
 
+use elfpak_core::Error;
 use elfpak_core::graph::NodeKind;
 use elfpak_core::plan::{BundlePlan, InclusionReason, PlannedFileKind};
-use elfpak_core::{Error, RootFsReport};
+
+use crate::Outputs;
+
+/// Where a bundle was (or would be) written.
+#[derive(Clone, Copy, Default)]
+pub struct Destinations<'a> {
+    pub rootfs: Option<&'a Path>,
+    pub tar: Option<&'a Path>,
+    pub manifest: Option<&'a Path>,
+}
 
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -131,9 +141,8 @@ pub fn bundle_summary(
     out: &mut dyn Write,
     binary: &Path,
     plan: &BundlePlan,
-    output: &Path,
-    manifest: Option<&Path>,
-    report: Option<&RootFsReport>,
+    destinations: Destinations<'_>,
+    outputs: &Outputs,
     verbose: u8,
 ) -> std::io::Result<()> {
     writeln!(
@@ -184,16 +193,19 @@ pub fn bundle_summary(
         "  {files} files, {dirs} directories, {links} symlinks, {}",
         human_size(plan.total_size())
     )?;
-    match report {
-        Some(_) => writeln!(out, "  rootfs:   {}", output.display())?,
-        None => writeln!(
-            out,
-            "  rootfs:   {} (dry run, nothing written)",
-            output.display()
-        )?,
+    let suffix = if outputs.written {
+        ""
+    } else {
+        " (dry run, nothing written)"
+    };
+    if let Some(rootfs) = destinations.rootfs {
+        writeln!(out, "  rootfs:   {}{suffix}", rootfs.display())?;
     }
-    if let Some(manifest) = manifest {
-        writeln!(out, "  manifest: {}", manifest.display())?;
+    if let Some(tar) = destinations.tar {
+        writeln!(out, "  tar:      {}{suffix}", tar.display())?;
+    }
+    if let Some(manifest) = destinations.manifest {
+        writeln!(out, "  manifest: {}{suffix}", manifest.display())?;
     }
 
     for warning in &plan.warnings {

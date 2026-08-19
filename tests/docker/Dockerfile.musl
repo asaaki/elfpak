@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+
+# musl smoke test. musl-specific behaviour is a non-goal, but generic ELF
+# handling has to work: the loader and libc are the same file, reached through a
+# symlink, and there is no ld.so.cache to consult.
+#
+# Built for every architecture under test in one buildx invocation; compiling a
+# single C file under emulation is cheap enough to cover both.
+
+# Base images are pinned by tag *and* digest so a build is reproducible and the
+# toolchain never moves under us. Refresh a digest with:
+#   docker buildx imagetools inspect <tag> --format '{{.Manifest.Digest}}'
+ARG ELFPAK_IMAGE=elfpak:local
+ARG ALPINE_IMAGE=alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+FROM ${ELFPAK_IMAGE} AS elfpak
+
+FROM ${ALPINE_IMAGE} AS build
+
+RUN apk add --no-cache build-base
+
+COPY fixtures/musl-hello/main.c /src/main.c
+
+RUN cc -o /musl-hello /src/main.c
+
+COPY --from=elfpak /elfpak /usr/local/bin/elfpak
+
+RUN elfpak bundle /musl-hello \
+    --output /rootfs \
+    --install /app/hello \
+    --preset minimal \
+    -v
+
+FROM scratch
+
+COPY --from=build /rootfs /
+
+ENTRYPOINT ["/app/hello"]

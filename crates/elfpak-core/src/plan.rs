@@ -12,7 +12,7 @@ use crate::graph::{DependencyGraph, DependencyReason, Digest, NodeKind};
 use crate::hash::{DigestCache, sha256_bytes};
 use crate::paths::{ancestor_dirs, normalize_absolute};
 use crate::resolver::Resolver;
-use crate::rootfs::policy::{DependencyPolicy, RuntimeFeature, RuntimePolicy};
+use crate::rootfs::policy::{DependencyPolicy, Preset, RuntimeFeature, RuntimePolicy};
 use crate::source::{EntryKind, SourceRoot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -76,6 +76,11 @@ pub struct BundlePlan {
     pub files: Vec<PlannedFile>,
     pub graph: DependencyGraph,
     pub architecture: Architecture,
+    /// Preset the policy was derived from, when one was named.
+    pub preset: Option<Preset>,
+    /// Runtime policy this plan was built with, recorded for the manifest.
+    pub runtime_policy: RuntimePolicy,
+    pub dependency_policy: DependencyPolicy,
     /// `PT_INTERP` as declared by the executable.
     pub interpreter: Option<PathBuf>,
     /// Where that interpreter actually lives after following symlinks.
@@ -107,6 +112,7 @@ pub struct Planner {
     runtime_policy: RuntimePolicy,
     dependency_policy: DependencyPolicy,
     library_paths: Vec<PathBuf>,
+    preset: Option<Preset>,
 }
 
 impl Planner {
@@ -125,7 +131,15 @@ impl Planner {
             runtime_policy: RuntimePolicy::default(),
             dependency_policy: DependencyPolicy::allow_all(),
             library_paths: Vec::new(),
+            preset: None,
         }
+    }
+
+    /// Record which preset the runtime policy came from, for the manifest.
+    pub fn preset(mut self, preset: Preset) -> Planner {
+        self.preset = Some(preset);
+        self.runtime_policy = RuntimePolicy::from_preset(preset);
+        self
     }
 
     pub fn install_as(mut self, path: impl Into<PathBuf>) -> Planner {
@@ -268,6 +282,9 @@ impl Planner {
             files,
             graph,
             architecture,
+            preset: self.preset,
+            runtime_policy: self.runtime_policy.clone(),
+            dependency_policy: self.dependency_policy.clone(),
             interpreter,
             interpreter_resolved,
             warnings,

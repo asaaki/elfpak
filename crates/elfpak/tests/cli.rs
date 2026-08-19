@@ -70,6 +70,22 @@ fn bundle_dry_run_writes_nothing() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!rootfs.exists());
     assert!(stdout(&output).contains("dry run"));
+
+    // The same holds for the archive backend.
+    let archive = tmp.path().join("rootfs.tar");
+    let output = elfpak(&[
+        "bundle",
+        binary.to_str().unwrap(),
+        "--tar",
+        archive.to_str().unwrap(),
+        "--install",
+        "/app/server",
+        "--dry-run",
+        "--no-config",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!archive.exists(), "a dry run writes no archive");
+    assert!(!tmp.path().join("elfpak-manifest.json").exists());
 }
 
 #[test]
@@ -235,5 +251,113 @@ fn include_copies_extra_paths_preserving_their_location() {
     assert!(
         rootfs.join("etc/os-release").exists() || rootfs.join("usr/lib/os-release").exists(),
         "the include keeps its original path (or the symlink target's)"
+    );
+}
+
+#[test]
+fn tar_output_can_replace_the_directory() {
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("rootfs.tar");
+
+    let output = elfpak(&[
+        "bundle",
+        binary.to_str().unwrap(),
+        "--tar",
+        archive.to_str().unwrap(),
+        "--install",
+        "/app/server",
+        "--no-config",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(archive.is_file());
+    assert!(stdout(&output).contains("tar:"), "{}", stdout(&output));
+
+    // The manifest lands beside the archive when no directory was requested.
+    let manifest = tmp.path().join("elfpak-manifest.json");
+    assert!(manifest.is_file());
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(value["tar"], archive.display().to_string());
+    assert!(value["rootfs"].is_null(), "no directory was written");
+
+    // Unpacking the archive yields the executable at its install path.
+    let unpacked = tmp.path().join("unpacked");
+    std::fs::create_dir_all(&unpacked).unwrap();
+    let status = Command::new("tar")
+        .args([
+            "-xf",
+            archive.to_str().unwrap(),
+            "-C",
+            unpacked.to_str().unwrap(),
+        ])
+        .status();
+    if matches!(status, Ok(status) if status.success()) {
+        assert!(unpacked.join("app/server").is_file());
+    }
+}
+
+#[test]
+fn bundle_can_write_a_directory_and_an_archive_at_once() {
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = tmp.path().join("rootfs");
+    let archive = tmp.path().join("rootfs.tar");
+
+    let output = elfpak(&[
+        "bundle",
+        binary.to_str().unwrap(),
+        "-o",
+        rootfs.to_str().unwrap(),
+        "--tar",
+        archive.to_str().unwrap(),
+        "--install",
+        "/app/server",
+        "--no-config",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(rootfs.join("app/server").is_file());
+    assert!(archive.is_file());
+}
+
+#[test]
+fn bundle_requires_some_output() {
+    let Some(binary) = subject() else { return };
+    let output = elfpak(&["bundle", binary.to_str().unwrap(), "--no-config"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--tar"), "{}", stderr(&output));
+}
+
+#[test]
+fn strict_verify_rejects_an_unlisted_file() {
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = tmp.path().join("rootfs");
+    let manifest = tmp.path().join("elfpak-manifest.json");
+
+    let output = elfpak(&[
+        "bundle",
+        binary.to_str().unwrap(),
+        "-o",
+        rootfs.to_str().unwrap(),
+        "--install",
+        "/app/server",
+        "--no-config",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    std::fs::write(rootfs.join("unexpected"), b"smuggled").unwrap();
+    let lenient = elfpak(&["verify", manifest.to_str().unwrap()]);
+    assert!(
+        lenient.status.success(),
+        "the default mode ignores extra files"
+    );
+
+    let strict = elfpak(&["verify", manifest.to_str().unwrap(), "--strict"]);
+    assert!(!strict.status.success());
+    assert!(
+        stderr(&strict).contains("not listed in the manifest"),
+        "{}",
+        stderr(&strict)
     );
 }
