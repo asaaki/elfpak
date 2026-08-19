@@ -3,4 +3,3 @@ target/
 tmp/
 
 elfpak-manifest.json
-/fuzz/target
