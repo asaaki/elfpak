@@ -1,0 +1,5 @@
+rootfs/
+target/
+tmp/
+
+elfpak-manifest.json

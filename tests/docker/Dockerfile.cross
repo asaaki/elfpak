@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1
+
+# Cross-architecture smoke test: an aarch64 binary packaged from an aarch64
+# sysroot by an x86_64 elfpak, without ever executing the target.
+
+FROM scratch
+
+COPY rootfs /
+
+ENTRYPOINT ["/app/ls"]
