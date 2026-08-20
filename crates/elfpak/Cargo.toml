@@ -11,6 +11,9 @@ description.workspace = true
 name = "elfpak"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 elfpak-core.workspace = true
 anyhow.workspace = true

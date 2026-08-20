@@ -7,8 +7,18 @@
 #   tests/docker/smoke.sh ca           # CA roots come from the bundle, not the binary
 #   tests/docker/smoke.sh musl         # a dynamically linked musl program
 #   tests/docker/smoke.sh ldcache      # a library the loader only finds through a cache
-#   tests/docker/smoke.sh tar          # tar output consumed by docker ADD
+#   tests/docker/smoke.sh tar          # the same service delivered as a tar and ADDed
+#   tests/docker/smoke.sh verify       # `elfpak verify` as a build gate
 #   tests/docker/smoke.sh cross        # non-Rust cross-architecture packaging
+#
+#   tests/docker/smoke.sh --fresh [test]   # rebuild everything from nothing
+#
+# `--fresh` removes the images the suite owns and passes `--no-cache` to every
+# build, so a rerun cannot be explained by a layer that was already there. It
+# does not discard BuildKit cache mounts, which is what keeps cargo from
+# recompiling the fixtures from scratch; clear those too with:
+#
+#   docker builder prune --filter type=exec.cachemount
 #
 # Requires docker. Anything involving linux/arm64 additionally requires qemu
 # binfmt support and is skipped when that is unavailable.
@@ -36,8 +46,15 @@ elfpak_image="elfpak:local"
 axum_image="elfpak-axum:local"
 musl_image="elfpak-musl:local"
 ldcache_image="elfpak-ldcache:local"
+tar_image="elfpak-tar:local"
+verify_image="elfpak-verify:local"
 cross_image="elfpak-cross:local"
 port="${ELFPAK_SMOKE_PORT:-18080}"
+
+# Appended to every build. A single token or nothing at all, so it is expanded
+# unquoted on purpose: an empty variable must vanish rather than become an
+# empty argument.
+no_cache=""
 
 # Architectures the elfpak image is published for.
 elfpak_platforms="linux/amd64,linux/arm64"
@@ -108,12 +125,12 @@ build_image() {
     shift 3
     if [ -n "$multi_platform" ]; then
         docker buildx build --platform "$platforms" --load -t "$tag" \
-            "$@" -f "$dockerfile" .
+            $no_cache "$@" -f "$dockerfile" .
     else
         local platform
         for platform in $(platform_list "$platforms"); do
             docker build --platform "$platform" -t "$(tag_for "$tag" "$platform")" \
-                "$@" -f "$dockerfile" .
+                $no_cache "$@" -f "$dockerfile" .
         done
     fi
 }
@@ -144,7 +161,7 @@ elfpak_image_for() {
     if [ -z "$multi_platform" ] && ! docker image inspect "$tag" >/dev/null 2>&1; then
         {
             log "building $tag for $platform"
-            docker build --platform "$platform" -q -t "$tag" -f Dockerfile . >/dev/null
+            docker build --platform "$platform" -q -t "$tag" $no_cache -f Dockerfile . >/dev/null
         } >&2
     fi
     printf '%s' "$tag"
@@ -205,8 +222,11 @@ check_axum() {
     ok "the bundled CA file is also usable directly (opt-in)"
 
     # No shell, no package manager, nothing but the plan.
-    docker run --rm --platform "$platform" --entrypoint /bin/sh "$image" -c true 2>/dev/null \
-        && fail "the image contains a shell" || ok "no shell in the image"
+    if docker run --rm --platform "$platform" --entrypoint /bin/sh "$image" -c true 2>/dev/null
+    then
+        fail "the image contains a shell"
+    fi
+    ok "no shell in the image"
 
     cleanup
 }
@@ -298,8 +318,11 @@ test_musl() {
         grep -q "dns:ok" <<<"$output" || fail "musl name resolution failed: $output"
         ok "musl resolves DNS without any NSS modules ($platform)"
 
-        docker run --rm --platform "$platform" --entrypoint /bin/sh "$image" -c true 2>/dev/null \
-            && fail "the image contains a shell" || ok "no shell in the image ($platform)"
+        if docker run --rm --platform "$platform" --entrypoint /bin/sh "$image" -c true 2>/dev/null
+        then
+            fail "the image contains a shell"
+        fi
+        ok "no shell in the image ($platform)"
     done
 }
 
@@ -335,54 +358,91 @@ test_ld_so_cache() {
     ok "without the generated cache the same image cannot start"
 }
 
-# The tar backend, consumed the way a container build would consume it.
+# The tar backend, consumed the way a container build consumes an archive.
+#
+# The same service as the axum test, packaged with `--tar` and delivered by
+# `ADD rootfs.tar /`. `ADD` extracts from the build context only, so the
+# archive is exported from the first build and is the context of the second —
+# which is what a pipeline does, and what makes this a test of the archive
+# rather than of a directory that happens to be tarred.
 test_tar() {
-    local elfpak_tag image work
+    local elfpak_tag work listing
     elfpak_tag="$(elfpak_image_for "$host_platform")"
-    image="elfpak-tar:local"
     work="$(mktemp -d)"
     workdir_to_remove="$work"
-    mkdir -p "$work/sysroot" "$work/out"
+    mkdir -p "$work/out"
 
-    log "packaging into a tar archive"
-    export_sysroot "$host_platform" "$work/sysroot"
-    docker run --rm --platform "$host_platform" \
-        -v "$work/sysroot:/sysroot:ro" \
-        -v "$work/out:/out" \
-        "$elfpak_tag" bundle /sysroot/bin/ls \
-            --root /sysroot \
-            --tar /out/rootfs.tar \
-            --install /app/ls \
-            --preset minimal
+    log "building the Axum service and packaging it into an archive"
+    docker buildx build --platform "$host_platform" $no_cache \
+        --target archive --output "type=local,dest=$work/out" \
+        --build-arg "ELFPAK_IMAGE=$elfpak_tag" \
+        -f tests/docker/Dockerfile.tar .
 
     [ -f "$work/out/rootfs.tar" ] || fail "no archive was written"
+    ok "the archive is exported straight from the build stage"
+
     grep -q '"tar":' "$work/out/elfpak-manifest.json" \
         || fail "the manifest should record the archive"
-    ok "the manifest is written beside the archive"
+    ok "the manifest is written beside the archive, never inside it"
 
-    # Byte-identical on a second run, from the same inputs.
-    docker run --rm --platform "$host_platform" \
-        -v "$work/sysroot:/sysroot:ro" \
-        -v "$work/out:/out" \
-        "$elfpak_tag" bundle /sysroot/bin/ls \
-            --root /sysroot \
-            --tar /out/second.tar \
-            --install /app/ls \
-            --preset minimal \
-            --no-manifest -q
-    cmp -s "$work/out/rootfs.tar" "$work/out/second.tar" \
-        || fail "the archive is not reproducible"
-    rm -f "$work/out/second.tar"
-    ok "the archive is byte-identical across runs"
+    # Listed once: `tar | grep -q` would hand tar a SIGPIPE and pipefail would
+    # then report a failure that never happened.
+    listing="$(tar -tf "$work/out/rootfs.tar")"
+    grep -qx 'app/server' <<<"$listing" || fail "the archive has no /app/server"
+    grep -qx 'etc/ssl/certs/ca-certificates.crt' <<<"$listing" \
+        || fail "the web preset should have contributed a CA bundle"
+    ok "the archive contains the install path and what the preset added"
+
+    if grep -q '^/' <<<"$listing"; then
+        fail "archive entries must be relative, or ADD would write outside /"
+    fi
+    ok "every entry is a relative path"
 
     log "building a scratch image with ADD"
-    cp tests/docker/Dockerfile.tar "$work/out/Dockerfile"
-    docker build --platform "$host_platform" -q -t "$image" "$work/out" >/dev/null
-    docker run --rm --platform "$host_platform" "$image" -la / >/dev/null \
-        || fail "the image built from the archive did not run"
-    ok "docker ADD extracts the archive into a working scratch image"
+    # Always single-platform, so the plain tag is the whole story.
+    docker build --platform "$host_platform" -q -t "$tar_image" $no_cache \
+        --target runtime -f tests/docker/Dockerfile.tar "$work/out" >/dev/null
+    ok "docker ADD unpacks the archive into a scratch image"
 
-    cleanup
+    check_axum "$host_platform" "$tar_image" "$((port + 9))" \
+        "$(attempts_for "$host_platform")"
+}
+
+# `elfpak verify` as a build gate.
+#
+# Dockerfile.verify bundles in one stage, verifies against the manifest in the
+# next, and copies into the image from the stage that verified. The middle
+# stage checks the positive space (this bundle verifies) and the negative space
+# (changed bytes, changed mode, added file, removed file, redirected symlink),
+# so a passing build means all of it held.
+test_verify() {
+    local elfpak_tag image output
+    elfpak_tag="$(elfpak_image_for "$host_platform")"
+    image="$(tag_for "$verify_image" "$host_platform")"
+
+    log "bundling, verifying and shipping in one build"
+    build_image tests/docker/Dockerfile.verify "$host_platform" "$verify_image" \
+        --build-arg "ELFPAK_IMAGE=$elfpak_tag" \
+        --build-arg "DEBIAN_IMAGE=$debian_image"
+    ok "the bundle verifies in the stage between packaging and shipping"
+
+    docker run --rm --platform "$host_platform" "$image" -la /app >/dev/null \
+        || fail "the verified image did not run"
+    ok "the rootfs that ships is the rootfs that was verified, and it runs"
+
+    # A gate that cannot fail proves nothing, so make it fail.
+    log "corrupting the same rootfs before it reaches verification"
+    if output="$(build_image tests/docker/Dockerfile.verify "$host_platform" \
+        "elfpak-verify:local-tampered" \
+        --build-arg "ELFPAK_IMAGE=$elfpak_tag" \
+        --build-arg "DEBIAN_IMAGE=$debian_image" \
+        --build-arg "ELFPAK_TAMPER=1" 2>&1)"
+    then
+        fail "a build whose rootfs was corrupted should not have succeeded"
+    fi
+    grep -q 'E5001' <<<"$output" \
+        || fail "the build failed, but not because verification failed"
+    ok "a corrupted rootfs fails the build instead of shipping"
 }
 
 # Package a foreign-architecture binary from an exported sysroot. Nothing is
@@ -418,7 +478,7 @@ test_cross() {
 
     log "running the aarch64 scratch image"
     cp tests/docker/Dockerfile.cross "$work/out/Dockerfile"
-    docker build --platform linux/arm64 -q -t "$cross_image" "$work/out" >/dev/null
+    docker build --platform linux/arm64 -q -t "$cross_image" $no_cache "$work/out" >/dev/null
     docker run --rm --platform linux/arm64 "$cross_image" -la / >/dev/null \
         || fail "the aarch64 image did not run"
     ok "aarch64 scratch image runs"
@@ -435,20 +495,75 @@ all_platforms() {
     fi
 }
 
+usage() {
+    cat <<'TEXT'
+usage: tests/docker/smoke.sh [--fresh] [test]
+
+tests:
+  axum        Axum on scratch, host architecture (default: all of them)
+  axum-arm64  Axum on scratch, linux/arm64
+  ca          CA roots come from the bundle, not the binary
+  musl        a dynamically linked musl program
+  ldcache     a library the loader only finds through a cache
+  tar         the same service delivered as a tar and ADDed
+  verify      `elfpak verify` as a build gate
+  cross       non-Rust cross-architecture packaging
+
+options:
+  --fresh     remove the images this suite owns and build everything with
+              --no-cache, so nothing in a rerun comes from a previous one
+  --help      this text
+TEXT
+}
+
+# Every image this suite creates, and nothing else: `elfpak:local*` for the
+# tool, `elfpak-<test>:local*` for the fixtures.
+remove_suite_images() {
+    local ids
+    ids="$(docker image ls -q \
+        --filter 'reference=elfpak:local*' \
+        --filter 'reference=elfpak-*:local*' | sort -u)"
+    if [ -z "$ids" ]; then
+        return 0
+    fi
+    # shellcheck disable=SC2086 # one argument per image id, deliberately split.
+    docker rmi -f $ids >/dev/null 2>&1 || true
+}
+
+fresh=""
+test_to_run="all"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fresh|--no-cache) fresh=1; no_cache="--no-cache" ;;
+        -h|--help)          usage; exit 0 ;;
+        -*)                 usage >&2; fail "unknown option: $1" ;;
+        *)                  test_to_run="$1" ;;
+    esac
+    shift
+done
+
 if supports_multi_platform_images; then
     multi_platform=1
 else
     skip "the containerd image store is unavailable, building one platform per tag"
 fi
+
+if [ -n "$fresh" ]; then
+    log "removing the images of previous runs"
+    remove_suite_images
+    ok "every image below is built from nothing"
+fi
+
 build_elfpak
 
-case "${1:-all}" in
+case "$test_to_run" in
     axum)       test_axum ;;
     axum-arm64) test_axum_arm64 ;;
     ca)         test_ca_policy ;;
     musl)       test_musl ;;
     ldcache)    test_ld_so_cache ;;
     tar)        test_tar ;;
+    verify)     test_verify ;;
     cross)      test_cross ;;
     all)
         test_axum "$(all_platforms)"
@@ -456,9 +571,10 @@ case "${1:-all}" in
         test_musl
         test_ld_so_cache
         test_tar
+        test_verify
         test_cross
         ;;
-    *)          fail "unknown test: $1" ;;
+    *)          usage >&2; fail "unknown test: $test_to_run" ;;
 esac
 
 log "all smoke tests passed"

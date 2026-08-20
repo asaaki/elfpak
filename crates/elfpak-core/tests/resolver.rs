@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use common::{Sysroot, have_cc};
 use elfpak_core::{
-    CachePolicy, DependencyPolicy, Error, NodeKind, PlannedFileKind, Planner, Preset, RuntimePolicy,
-    SourceRoot,
+    CachePolicy, DependencyPolicy, Error, NodeKind, PlannedFileKind, Planner, Preset,
+    RuntimePolicy, SourceRoot,
 };
 
 /// The web preset without the CA bundle, which the fixture sysroot has no
@@ -362,9 +362,12 @@ fn bundled_cache(plan: &elfpak_core::BundlePlan) -> Option<elfpak_core::LdCache>
         "runtime policy: ld-so-cache",
         "the cache carries its own reason"
     );
-    assert_eq!(file.sha256, Some(elfpak_core::hash::sha256_bytes(
-        file.content.as_ref().expect("generated content")
-    )));
+    assert_eq!(
+        file.sha256,
+        Some(elfpak_core::hash::sha256_bytes(
+            file.content.as_ref().expect("generated content")
+        ))
+    );
     Some(elfpak_core::LdCache::parse(file.content.as_ref().unwrap()))
 }
 
@@ -567,4 +570,3 @@ fn the_install_path_may_not_displace_a_bundled_library() {
     .unwrap_err();
     assert_eq!(err.code(), "E4001");
 }
-

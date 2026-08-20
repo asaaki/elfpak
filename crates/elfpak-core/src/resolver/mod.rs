@@ -98,6 +98,14 @@ pub trait DynamicLinkerResolver {
     fn resolve(&mut self, request: &LibraryRequest) -> Result<ResolvedLibrary>;
 }
 
+/// Upper bound on the directories one lookup may probe.
+///
+/// A request consults the object's own search paths, `--library-path`, the
+/// cache and the default directories; hundreds would mean a pathological
+/// `DT_RPATH`, and an unbounded list would mean an unbounded lookup.
+const SEARCH_DIRECTORIES_MAX: usize = 256;
+
+#[derive(Debug)]
 pub struct Resolver {
     root: SourceRoot,
     /// Explicit search paths, equivalent to `LD_LIBRARY_PATH`.
@@ -149,11 +157,17 @@ impl Resolver {
     }
 
     fn note(&mut self, request: &LibraryRequest, directory: &Path, origin: SearchOrigin) {
-        if origin.survives_packaging()
-            || search::default_library_paths(&request.architecture)
-                .iter()
-                .any(|default| default == directory)
-        {
+        assert!(directory.is_absolute());
+
+        if origin.survives_packaging() {
+            return;
+        }
+        let is_default = search::default_library_paths(&request.architecture)
+            .iter()
+            .any(|default| default == directory);
+        if is_default {
+            // The loader inside the bundle searches this directory anyway, so
+            // how the library was found here does not survive as a problem.
             return;
         }
         let note = ResolutionNote {
@@ -183,6 +197,8 @@ impl Resolver {
     /// `binary` is a host path; `install` is where the executable will live in
     /// the generated rootfs. Every other object keeps its original location.
     pub fn closure(&mut self, binary: &Path, install: &Path) -> Result<DependencyGraph> {
+        assert!(install.is_absolute());
+
         let metadata = ElfMetadata::parse_file(binary)?;
         if !metadata.architecture.machine.is_supported_target() {
             return Err(Error::UnsupportedArchitecture {
@@ -194,10 +210,7 @@ impl Resolver {
         let architecture = metadata.architecture;
         let logical = self.logical_of_host(binary);
         let mut graph = DependencyGraph::new();
-        graph.declared_interpreter = metadata
-            .interpreter
-            .as_deref()
-            .map(crate::paths::normalize_absolute);
+        graph.declared_interpreter = metadata.interpreter.as_deref().map(normalize_absolute);
         graph.executable_search_paths = metadata
             .rpath
             .iter()
@@ -220,37 +233,49 @@ impl Resolver {
         });
         graph.root = root_id;
 
-        // PT_INTERP: the loader is a hard runtime dependency of the image.
-        if let Some(interp) = &metadata.interpreter {
-            let resolved = self
-                .root
-                .resolve(interp)?
-                .filter(|r| r.kind == EntryKind::File);
-            match resolved {
-                Some(resolved) => {
-                    let interp_meta = self.elf.require(&resolved.host)?;
-                    self.check_architecture(&interp_meta, &architecture, interp, &resolved)?;
-                    let id = self.insert_object(
-                        &mut graph,
-                        &resolved,
-                        &interp_meta,
-                        NodeKind::Interpreter,
-                    )?;
-                    graph.connect(root_id, id, DependencyReason::Interpreter);
-                }
-                None => {
-                    return Err(Error::UnresolvedLibrary {
-                        soname: interp.to_string_lossy().into_owned(),
-                        required_by: logical,
-                        searched: vec![self.root.host_path(interp)],
-                    });
-                }
-            }
+        if metadata.interpreter.is_some() {
+            self.attach_interpreter(&mut graph, &metadata, root_id)?;
         }
 
         self.walk_needed(&mut graph, root_id, metadata, Vec::new())?;
 
+        assert_eq!(graph.root, root_id);
+        assert_eq!(graph.root_node().architecture, architecture);
+        assert!(graph.node_count() >= 1);
         Ok(graph)
+    }
+
+    /// `PT_INTERP`: the loader is a hard runtime dependency of the image, and
+    /// the one dependency the kernel resolves rather than the loader.
+    fn attach_interpreter(
+        &mut self,
+        graph: &mut DependencyGraph,
+        metadata: &ElfMetadata,
+        root_id: NodeId,
+    ) -> Result<()> {
+        let interp = metadata
+            .interpreter
+            .as_ref()
+            .expect("only called for an object that declares PT_INTERP");
+        let architecture = metadata.architecture;
+
+        let resolved = self
+            .root
+            .resolve(interp)?
+            .filter(|r| r.kind == EntryKind::File);
+        let Some(resolved) = resolved else {
+            return Err(Error::UnresolvedLibrary {
+                soname: interp.to_string_lossy().into_owned(),
+                required_by: graph.node(root_id).logical.clone(),
+                searched: vec![self.root.host_path(interp)],
+            });
+        };
+
+        let interp_meta = self.elf.require(&resolved.host)?;
+        self.check_architecture(&interp_meta, &architecture, interp, &resolved)?;
+        let id = self.insert_object(graph, &resolved, &interp_meta, NodeKind::Interpreter)?;
+        graph.connect(root_id, id, DependencyReason::Interpreter);
+        Ok(())
     }
 
     /// Add everything reachable from `start` through `DT_NEEDED`, depth first.
@@ -265,9 +290,18 @@ impl Resolver {
         metadata: ElfMetadata,
         inherited: Vec<Vec<String>>,
     ) -> Result<()> {
+        assert!(graph.contains(start));
+
         let architecture = metadata.architecture;
         let mut queue = vec![(start, metadata, inherited)];
+        // Only an object that was not already in the graph is queued, so the
+        // walk visits each object once and is bounded by the graph's own limit.
+        let mut visits = 0usize;
         while let Some((id, meta, inherited)) = queue.pop() {
+            visits += 1;
+            assert!(visits <= crate::graph::NODES_MAX);
+            assert_eq!(meta.architecture, architecture);
+
             let mut chain = Vec::new();
             if !meta.runpath_is_authoritative() && !meta.rpath.is_empty() {
                 chain.push(meta.rpath.clone());
@@ -361,6 +395,9 @@ impl Resolver {
         metadata: &ElfMetadata,
         kind: NodeKind,
     ) -> Result<NodeId> {
+        assert!(resolved.logical.is_absolute());
+        assert_eq!(resolved.kind, EntryKind::File);
+
         let (digest, size) = self.digests.get(&resolved.host)?;
         Ok(graph.insert(Node {
             source: resolved.host.clone(),
@@ -383,6 +420,8 @@ impl Resolver {
         soname: &Path,
         resolved: &Resolved,
     ) -> Result<()> {
+        assert_eq!(metadata.path, resolved.host);
+
         if metadata.architecture.is_compatible_with(expected) {
             return Ok(());
         }
@@ -407,34 +446,25 @@ impl Resolver {
     fn search_directories(&self, request: &LibraryRequest) -> Vec<(PathBuf, SearchOrigin)> {
         let ctx = self.token_context(&request.requester, &request.architecture);
         let mut dirs: Vec<(PathBuf, SearchOrigin)> = Vec::new();
-        let push = |dirs: &mut Vec<(PathBuf, SearchOrigin)>, dir: PathBuf, origin| {
-            if !dirs.iter().any(|(known, _)| known == &dir) {
-                dirs.push((dir, origin));
-            }
-        };
 
         // 1. DT_RPATH of the object and, transitively, of its loaders.
         for level in &request.rpath_chain {
             for entry in level {
-                push(
-                    &mut dirs,
-                    tokens::expand_search_path(entry, &ctx),
-                    SearchOrigin::ObjectPath,
-                );
+                let dir = tokens::expand_search_path(entry, &ctx);
+                push_directory(&mut dirs, dir, SearchOrigin::ObjectPath);
             }
         }
         // 2. LD_LIBRARY_PATH equivalent.
         for dir in &self.library_paths {
-            push(&mut dirs, dir.clone(), SearchOrigin::LibraryPath);
+            push_directory(&mut dirs, dir.clone(), SearchOrigin::LibraryPath);
         }
         // 3. DT_RUNPATH of the requesting object only.
         for entry in &request.runpath {
-            push(
-                &mut dirs,
-                tokens::expand_search_path(entry, &ctx),
-                SearchOrigin::ObjectPath,
-            );
+            let dir = tokens::expand_search_path(entry, &ctx);
+            push_directory(&mut dirs, dir, SearchOrigin::ObjectPath);
         }
+
+        assert!(dirs.len() <= SEARCH_DIRECTORIES_MAX);
         dirs
     }
 
@@ -449,10 +479,14 @@ impl Resolver {
             .into_iter()
             .map(|dir| (dir, SearchOrigin::DefaultDirectory));
         for (dir, origin) in configured.chain(builtin) {
-            if !dirs.iter().any(|(known, _)| known == &dir) {
-                dirs.push((dir, origin));
-            }
+            push_directory(&mut dirs, dir, origin);
         }
+
+        assert!(
+            !dirs.is_empty(),
+            "every architecture has default directories"
+        );
+        assert!(dirs.len() <= SEARCH_DIRECTORIES_MAX);
         dirs
     }
 
@@ -524,56 +558,56 @@ impl Resolver {
     }
 }
 
+/// Append a directory unless it is already listed. The loader probes each
+/// directory once, in first-seen order, and so does this.
+fn push_directory(dirs: &mut Vec<(PathBuf, SearchOrigin)>, dir: PathBuf, origin: SearchOrigin) {
+    assert!(dir.is_absolute());
+
+    if dirs.iter().any(|(known, _)| known == &dir) {
+        return;
+    }
+    assert!(
+        dirs.len() < SEARCH_DIRECTORIES_MAX,
+        "search list exceeds {SEARCH_DIRECTORIES_MAX}"
+    );
+    dirs.push((dir, origin));
+}
+
 impl DynamicLinkerResolver for Resolver {
+    /// One `DT_NEEDED` lookup. All the control flow of a lookup lives here: a
+    /// soname is either a path or a search, and a search either finds a
+    /// compatible object, finds an incompatible one, or finds nothing.
     fn resolve(&mut self, request: &LibraryRequest) -> Result<ResolvedLibrary> {
+        assert!(!request.soname.is_empty());
+        assert!(request.requester.is_absolute());
+
         let mut searched = Vec::new();
         let mut mismatch = None;
 
         // A soname containing a slash is a path, not a search request.
-        if request.soname.contains('/') {
+        let found = if request.soname.contains('/') {
             let ctx = self.token_context(&request.requester, &request.architecture);
             let path = tokens::expand_search_path(&request.soname, &ctx);
-            if let Some(found) = self.try_path(&path, request, &mut searched, &mut mismatch)? {
-                return Ok(found);
-            }
+            self.try_path(&path, request, &mut searched, &mut mismatch)?
         } else {
-            for (dir, origin) in self.search_directories(request) {
-                if let Some(found) =
-                    self.try_directory(&dir, request, &mut searched, &mut mismatch)?
-                {
-                    self.note(request, &dir, origin);
-                    return Ok(found);
-                }
-            }
+            self.search(request, &mut searched, &mut mismatch)?
+        };
 
-            // 4. /etc/ld.so.cache
-            let cached: Vec<PathBuf> = self
-                .cache
-                .as_ref()
-                .map(|c| c.lookup(&request.soname).to_vec())
-                .unwrap_or_default();
-            for candidate in cached {
-                if let Some(found) =
-                    self.try_path(&candidate, request, &mut searched, &mut mismatch)?
-                {
-                    self.note(request, &logical_parent(&candidate), SearchOrigin::Cache);
-                    return Ok(found);
-                }
-            }
-
-            // 5. Default directories, unless the object opted out.
-            if !request.nodeflib {
-                for (dir, origin) in self.default_directories(&request.architecture) {
-                    if let Some(found) =
-                        self.try_directory(&dir, request, &mut searched, &mut mismatch)?
-                    {
-                        self.note(request, &dir, origin);
-                        return Ok(found);
-                    }
-                }
-            }
+        if let Some(library) = found {
+            // Never trust the file name: an object only satisfies a request if
+            // its own header says it can be mapped into the same process.
+            assert!(
+                library
+                    .metadata
+                    .architecture
+                    .is_compatible_with(&request.architecture)
+            );
+            assert_eq!(library.resolved.kind, EntryKind::File);
+            return Ok(library);
         }
 
+        // Nothing was found. Reporting the incompatible candidate is more
+        // useful than reporting the absence, because it names the real problem.
         if let Some((found, architecture)) = mismatch {
             return Err(Error::IncompatibleArchitecture {
                 soname: request.soname.clone(),
@@ -582,11 +616,57 @@ impl DynamicLinkerResolver for Resolver {
                 found_architecture: architecture.to_string(),
             });
         }
-
         Err(Error::UnresolvedLibrary {
             soname: request.soname.clone(),
             required_by: request.requester.clone(),
             searched,
         })
+    }
+}
+
+impl Resolver {
+    /// glibc's search order for a bare soname: the object's own paths, then the
+    /// cache, then the default directories.
+    fn search(
+        &mut self,
+        request: &LibraryRequest,
+        searched: &mut Vec<PathBuf>,
+        mismatch: &mut Option<(PathBuf, Architecture)>,
+    ) -> Result<Option<ResolvedLibrary>> {
+        assert!(!request.soname.contains('/'));
+
+        // 1-3. DT_RPATH, --library-path, DT_RUNPATH.
+        for (dir, origin) in self.search_directories(request) {
+            if let Some(found) = self.try_directory(&dir, request, searched, mismatch)? {
+                self.note(request, &dir, origin);
+                return Ok(Some(found));
+            }
+        }
+
+        // 4. /etc/ld.so.cache, which names absolute paths rather than directories.
+        let cached: Vec<PathBuf> = self
+            .cache
+            .as_ref()
+            .map(|c| c.lookup(&request.soname).to_vec())
+            .unwrap_or_default();
+        for candidate in cached {
+            assert!(candidate.is_absolute());
+            if let Some(found) = self.try_path(&candidate, request, searched, mismatch)? {
+                self.note(request, &logical_parent(&candidate), SearchOrigin::Cache);
+                return Ok(Some(found));
+            }
+        }
+
+        // 5. Default directories, unless DF_1_NODEFLIB opted the object out.
+        if request.nodeflib {
+            return Ok(None);
+        }
+        for (dir, origin) in self.default_directories(&request.architecture) {
+            if let Some(found) = self.try_directory(&dir, request, searched, mismatch)? {
+                self.note(request, &dir, origin);
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 }

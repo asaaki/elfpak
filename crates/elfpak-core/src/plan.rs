@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::elf::Architecture;
 use crate::error::{Error, Result, io};
-use crate::graph::{DependencyGraph, DependencyReason, Digest, NodeKind};
+use crate::graph::{DependencyGraph, DependencyReason, Digest, Node, NodeId, NodeKind};
 use crate::hash::{DigestCache, sha256_bytes};
 use crate::paths::{ancestor_dirs, logical_parent, normalize_absolute};
 use crate::resolver::Resolver;
@@ -19,6 +19,14 @@ use crate::source::{EntryKind, SourceRoot};
 /// Where the loader looks for its cache, and therefore where a generated one
 /// has to go.
 pub const LD_SO_CACHE: &str = "/etc/ld.so.cache";
+
+/// Upper bound on the entries in one plan.
+///
+/// A minimal rootfs is tens of entries, and the timezone database — the largest
+/// thing any preset contributes — is a few thousand. A plan past this bound is
+/// an `--include` that named far more than it meant to, and the bound turns
+/// that into an error before it turns into a full disk.
+pub const PLAN_ENTRIES_MAX: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PlannedFileKind {
@@ -74,6 +82,36 @@ pub struct PlannedFile {
     pub content: Option<Vec<u8>>,
 }
 
+impl PlannedFile {
+    /// Invariants every entry holds, checked when it enters a plan and again
+    /// before it is written. Two code paths, one property: a plan that could
+    /// not be materialized faithfully never gets as far as being materialized.
+    pub fn assert_well_formed(&self) {
+        assert!(self.destination.is_absolute());
+        assert!(self.mode <= 0o7777);
+
+        match self.kind {
+            PlannedFileKind::Directory => {
+                assert!(self.link_target.is_none());
+                assert!(self.content.is_none());
+                assert_eq!(self.size, 0);
+            }
+            PlannedFileKind::Symlink => {
+                assert!(self.link_target.is_some());
+                assert!(self.content.is_none());
+                assert_eq!(self.size, 0);
+            }
+            // Everything else is a regular file, and its bytes come either from
+            // the source root or from this process. Either way they are hashed.
+            _ => {
+                assert!(self.link_target.is_none());
+                assert!(self.source.is_some() || self.content.is_some());
+                assert!(self.sha256.as_ref().is_some_and(Digest::is_well_formed));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BundlePlan {
     pub executable: PlannedFile,
@@ -110,6 +148,7 @@ impl BundlePlan {
     }
 }
 
+#[derive(Debug)]
 pub struct Planner {
     source_root: SourceRoot,
     binary: PathBuf,
@@ -167,178 +206,167 @@ impl Planner {
         self
     }
 
+    /// Two-phase packaging, phase one. All control flow of a plan lives here:
+    /// resolve, validate, then describe the output. Nothing is written.
     pub fn plan(&self) -> Result<BundlePlan> {
-        if self.install_path.file_name().is_none() {
-            return Err(Error::Config {
-                message: format!(
-                    "install path `{}` does not name a file",
-                    self.install_path.display()
-                ),
-            });
-        }
+        self.check_install_path()?;
+
         let mut resolver =
             Resolver::new(self.source_root.clone()).with_library_paths(self.library_paths.clone());
         let mut graph = resolver.closure(&self.binary, &self.install_path)?;
-        let architecture = graph.root_node().architecture;
-        let interpreter = graph.declared_interpreter.clone();
-        let interpreter_resolved = graph
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Interpreter)
-            .map(|n| n.destination.clone());
-
-        let mut warnings = Vec::new();
-        let mut dlopen_libraries: Vec<String> = Vec::new();
-        let mut builder = PlanBuilder::new(&self.source_root);
-
-        // NSS modules are dlopen()ed by glibc; include them when the policy asks
-        // for name-service configuration and the source root still ships them.
         if self.runtime_policy.nsswitch {
-            let root_id = graph.root;
-            for soname in RuntimePolicy::NSS_MODULES {
-                let requester = graph.root_node().logical.clone();
-                if let Some(library) =
-                    resolver.resolve_extra_library(soname, architecture, &requester)?
-                {
-                    resolver.attach_library(
-                        &mut graph,
-                        &library,
-                        root_id,
-                        DependencyReason::RuntimePolicy {
-                            feature: RuntimeFeature::Nsswitch,
-                        },
-                    )?;
-                }
-            }
+            self.attach_nss_modules(&mut resolver, &mut graph)?;
         }
 
         self.validate_dependencies(&graph)?;
         self.check_install_collision(&graph)?;
 
-        // Two things can leave a bundle unable to load a library it contains:
-        // a library outside the directories the loader searches, and an
-        // executable whose $ORIGIN-relative search paths no longer point where
-        // they did once it is installed somewhere else. Both are cured by the
-        // one thing the loader consults besides those directories — a cache —
-        // and a bundle can only have one if `elfpak` writes it.
-        let unreachable: Vec<String> = resolver
-            .notes()
+        let mut warnings: Vec<Warning> = Vec::new();
+        let mut builder = PlanBuilder::new(&self.source_root);
+        self.plan_loader_cache(&graph, &resolver, &mut builder, &mut warnings);
+        self.plan_closure(&graph, &mut builder, &mut warnings)?;
+        self.apply_runtime_policy(&mut builder, &mut warnings)?;
+
+        let files = builder.finish();
+        let executable = files
             .iter()
-            .map(|note| {
-                format!(
-                    "{} in {} (found through {})",
-                    note.soname,
-                    note.directory.display(),
-                    note.origin.as_str()
-                )
-            })
-            .collect();
+            .find(|f| f.kind == PlannedFileKind::Executable)
+            .cloned()
+            .expect("the plan always contains the executable");
 
-        let source_dir = logical_parent(&graph.root_node().logical);
-        let install_dir = logical_parent(&graph.root_node().destination);
-        let relocated: Vec<String> = if install_dir == source_dir {
-            Vec::new()
-        } else {
-            graph
-                .executable_search_paths
+        // Every object in the closure is an entry, and every entry needs its
+        // parent directories, so a plan is never smaller than the graph.
+        assert_eq!(executable.destination, graph.root_node().destination);
+        assert!(files.len() >= graph.node_count());
+
+        Ok(BundlePlan {
+            executable,
+            architecture: graph.root_node().architecture,
+            interpreter: graph.declared_interpreter.clone(),
+            interpreter_resolved: graph
+                .nodes
                 .iter()
-                .filter(|entry| entry.contains("$ORIGIN") || entry.contains("${ORIGIN}"))
-                .cloned()
-                .collect()
-        };
+                .find(|n| n.kind == NodeKind::Interpreter)
+                .map(|n| n.destination.clone()),
+            files,
+            graph,
+            preset: self.preset,
+            runtime_policy: self.runtime_policy.clone(),
+            dependency_policy: self.dependency_policy.clone(),
+            warnings,
+        })
+    }
 
+    /// The executable has to land somewhere the rootfs can name.
+    fn check_install_path(&self) -> Result<()> {
+        assert!(self.install_path.is_absolute());
+
+        if self.install_path.file_name().is_some() {
+            return Ok(());
+        }
+        Err(Error::Config {
+            message: format!(
+                "install path `{}` does not name a file",
+                self.install_path.display()
+            ),
+        })
+    }
+
+    /// NSS modules are `dlopen`ed by glibc rather than named by `DT_NEEDED`, so
+    /// they are included when the policy asks for name-service configuration
+    /// and the source root still ships them.
+    fn attach_nss_modules(
+        &self,
+        resolver: &mut Resolver,
+        graph: &mut DependencyGraph,
+    ) -> Result<()> {
+        assert!(self.runtime_policy.nsswitch);
+
+        let root_id = graph.root;
+        let architecture = graph.root_node().architecture;
+        for soname in RuntimePolicy::NSS_MODULES {
+            let requester = graph.root_node().logical.clone();
+            let Some(library) = resolver.resolve_extra_library(soname, architecture, &requester)?
+            else {
+                continue;
+            };
+            resolver.attach_library(
+                graph,
+                &library,
+                root_id,
+                DependencyReason::RuntimePolicy {
+                    feature: RuntimeFeature::Nsswitch,
+                },
+            )?;
+        }
+        assert_eq!(graph.root, root_id);
+        Ok(())
+    }
+
+    /// Decide whether the bundle needs a generated `/etc/ld.so.cache`, and warn
+    /// about what it cannot load when it does not get one.
+    ///
+    /// Two things can leave a bundle unable to load a library it contains: a
+    /// library outside the directories the loader searches, and an executable
+    /// whose `$ORIGIN`-relative search paths no longer point where they did once
+    /// it is installed somewhere else. Both are cured by the one thing the
+    /// loader consults besides those directories — a cache — and a bundle can
+    /// only have one if `elfpak` writes it.
+    fn plan_loader_cache(
+        &self,
+        graph: &DependencyGraph,
+        resolver: &Resolver,
+        builder: &mut PlanBuilder<'_>,
+        warnings: &mut Vec<Warning>,
+    ) {
+        let unreachable = unreachable_libraries(resolver);
+        let relocated = relocated_search_paths(graph);
         let needs_cache = !unreachable.is_empty() || !relocated.is_empty();
+
         let cache = self
             .runtime_policy
             .ld_so_cache
             .applies(needs_cache)
-            .then(|| self.ld_so_cache(&graph))
+            .then(|| self.ld_so_cache(graph))
             .flatten();
 
-        match cache {
-            Some(bytes) => builder.push_generated(
+        if let Some(bytes) = cache {
+            assert!(!bytes.is_empty());
+            builder.push_generated(
                 Path::new(LD_SO_CACHE),
                 bytes,
                 InclusionReason::RuntimePolicy {
                     feature: RuntimeFeature::LdSoCache,
                 },
-            ),
-            None => {
-                if !unreachable.is_empty() {
-                    warnings.push(Warning {
-                        code: "E2005",
-                        message: match unreachable.len() {
-                            1 => "a library lives outside the directories the loader searches"
-                                .to_string(),
-                            n => format!(
-                                "{n} libraries live outside the directories the loader searches"
-                            ),
-                        },
-                        details: unreachable
-                            .into_iter()
-                            .chain([if uses_glibc_loader(&graph) {
-                                format!(
-                                    "Without {LD_SO_CACHE} the packaged application finds these \
-                                     only if its DT_RPATH/DT_RUNPATH covers them."
-                                )
-                            } else {
-                                "This loader does not read an ld.so.cache, so the paths have to \
-                                 come from the objects themselves."
-                                    .to_string()
-                            }])
-                            .collect(),
-                    });
-                }
-                if !relocated.is_empty() {
-                    warnings.push(Warning {
-                        code: "E2006",
-                        message: format!(
-                            "the executable declares $ORIGIN-relative search paths and moves from {} to {}",
-                            source_dir.display(),
-                            install_dir.display()
-                        ),
-                        details: relocated
-                            .into_iter()
-                            .chain([format!(
-                                "Install it at {} to keep those paths pointing where they did.",
-                                graph.root_node().logical.display()
-                            )])
-                            .collect(),
-                    });
-                }
-            }
+            );
+            return;
         }
 
-        // ELF closure.
-        for (id, node) in graph.nodes.iter().enumerate() {
-            let reason = if id == graph.root {
-                InclusionReason::Application
-            } else if node.kind == NodeKind::Interpreter {
-                InclusionReason::Interpreter
-            } else {
-                match graph.first_dependent(id) {
-                    Some((edge, parent)) => match &edge.reason {
-                        DependencyReason::Needed { soname } => InclusionReason::NeededBy {
-                            binary: parent.destination.clone(),
-                            soname: soname.clone(),
-                        },
-                        DependencyReason::Interpreter => InclusionReason::Interpreter,
-                        DependencyReason::RuntimePolicy { feature } => {
-                            InclusionReason::RuntimePolicy { feature: *feature }
-                        }
-                    },
-                    None => InclusionReason::Application,
-                }
-            };
-            let kind = match node.kind {
-                NodeKind::Executable => PlannedFileKind::Executable,
-                NodeKind::Interpreter => PlannedFileKind::Interpreter,
-                NodeKind::SharedObject => PlannedFileKind::SharedObject,
-            };
+        // No cache: say exactly what the packaged loader will not find.
+        if !unreachable.is_empty() {
+            warnings.push(warn_unreachable(unreachable, uses_glibc_loader(graph)));
+        }
+        if !relocated.is_empty() {
+            warnings.push(warn_relocated(relocated, graph));
+        }
+    }
+
+    /// Turn every object in the closure into a plan entry, together with the
+    /// symlinks it is reached through and any `dlopen` warning it earns.
+    fn plan_closure(
+        &self,
+        graph: &DependencyGraph,
+        builder: &mut PlanBuilder<'_>,
+        warnings: &mut Vec<Warning>,
+    ) -> Result<()> {
+        let mut dlopen_libraries: Vec<String> = Vec::new();
+
+        for (id, node) in graph.iter() {
+            let reason = inclusion_reason(graph, id, node);
             builder.push_file(PlannedFile {
                 source: Some(node.source.clone()),
                 destination: node.destination.clone(),
-                kind,
+                kind: planned_kind(node.kind),
                 reason: reason.clone(),
                 mode: mode_of(&node.source)?,
                 size: node.size,
@@ -349,22 +377,18 @@ impl Planner {
             for link in &node.links {
                 builder.push_symlink(&link.logical, &link.target, reason.clone());
             }
-            if !node.dlopen_references.is_empty() {
-                if id == graph.root {
-                    warnings.push(Warning {
-                        code: "E1004",
-                        message: format!("{} references dlopen()", node.destination.display()),
-                        details: vec![
-                            "Runtime-loaded libraries cannot be determined using static ELF dependency analysis.".to_string(),
-                            "Consider adding them with --include.".to_string(),
-                        ],
-                    });
-                } else {
-                    dlopen_libraries.push(node.destination.display().to_string());
-                }
+
+            if node.dlopen_references.is_empty() {
+                continue;
+            }
+            if id == graph.root {
+                warnings.push(warn_dlopen_executable(node));
+            } else {
+                dlopen_libraries.push(node.destination.display().to_string());
             }
         }
 
+        assert!(dlopen_libraries.len() <= graph.node_count());
         if !dlopen_libraries.is_empty() {
             warnings.push(Warning {
                 code: "E1004",
@@ -375,28 +399,7 @@ impl Planner {
                 details: dlopen_libraries,
             });
         }
-
-        self.apply_runtime_policy(&mut builder, &mut warnings)?;
-
-        let files = builder.finish();
-        let executable = files
-            .iter()
-            .find(|f| f.kind == PlannedFileKind::Executable)
-            .cloned()
-            .expect("plan always contains the executable");
-
-        Ok(BundlePlan {
-            executable,
-            files,
-            graph,
-            architecture,
-            preset: self.preset,
-            runtime_policy: self.runtime_policy.clone(),
-            dependency_policy: self.dependency_policy.clone(),
-            interpreter,
-            interpreter_resolved,
-            warnings,
-        })
+        Ok(())
     }
 
     /// A `/etc/ld.so.cache` describing every shared object in the bundle.
@@ -432,6 +435,7 @@ impl Planner {
         if entries.is_empty() {
             return None;
         }
+        assert!(entries.len() <= graph.node_count());
         cache::build(&architecture, &entries)
     }
 
@@ -439,16 +443,23 @@ impl Planner {
     /// own path, leaving the bundle with a dependency it cannot load.
     fn check_install_collision(&self, graph: &DependencyGraph) -> Result<()> {
         let install = &graph.root_node().destination;
-        for (id, node) in graph.nodes.iter().enumerate() {
-            if id != graph.root && &node.destination == install {
-                return Err(Error::Config {
-                    message: format!(
-                        "install path `{}` collides with `{}`, which the closure needs at that exact path",
-                        self.install_path.display(),
-                        node.logical.display()
-                    ),
-                });
+        assert!(install.is_absolute());
+
+        for (id, node) in graph.iter() {
+            if id == graph.root {
+                continue;
             }
+            if &node.destination != install {
+                continue;
+            }
+            return Err(Error::Config {
+                message: format!(
+                    "install path `{}` collides with `{}`, which the closure \
+                     needs at that exact path",
+                    self.install_path.display(),
+                    node.logical.display()
+                ),
+            });
         }
         Ok(())
     }
@@ -462,22 +473,21 @@ impl Planner {
     /// still ship.
     fn validate_dependencies(&self, graph: &DependencyGraph) -> Result<()> {
         if self.dependency_policy.allow.is_none() {
+            // No allow-list means no contract to enforce.
             return Ok(());
         }
+
         let application = graph.application_closure();
-        for (id, node) in graph.nodes.iter().enumerate() {
-            if node.kind != NodeKind::SharedObject || !application.contains(&id) {
+        assert!(application.contains(&graph.root));
+
+        for (id, node) in graph.iter() {
+            if node.kind != NodeKind::SharedObject {
                 continue;
             }
-            let soname = node
-                .soname
-                .clone()
-                .or_else(|| {
-                    node.logical
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                })
-                .unwrap_or_default();
+            if !application.contains(&id) {
+                continue;
+            }
+            let soname = library_name(node);
             if self.dependency_policy.is_allowed(&soname, &node.logical) {
                 continue;
             }
@@ -493,6 +503,8 @@ impl Planner {
         Ok(())
     }
 
+    /// Everything runtime policy contributes, in one place. Each feature is a
+    /// branch here and a leaf below, so what a preset does stays readable.
     fn apply_runtime_policy(
         &self,
         builder: &mut PlanBuilder<'_>,
@@ -501,33 +513,10 @@ impl Planner {
         let policy = &self.runtime_policy;
 
         if policy.ca_certificates {
-            let mut found = false;
-            for candidate in RuntimePolicy::CA_BUNDLE_CANDIDATES {
-                let logical = PathBuf::from(candidate);
-                if builder.copy_path(
-                    &logical,
-                    PlannedFileKind::CertificateBundle,
-                    InclusionReason::RuntimePolicy {
-                        feature: RuntimeFeature::CaCertificates,
-                    },
-                    false,
-                )? {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return Err(Error::MissingRuntimeFile {
-                    feature: "ca-certificates",
-                    searched: RuntimePolicy::CA_BUNDLE_CANDIDATES
-                        .iter()
-                        .map(PathBuf::from)
-                        .collect(),
-                });
-            }
+            self.plan_ca_certificates(builder)?;
         }
-
         if policy.tmp {
+            // 1777: every user may write, only the owner may unlink.
             builder.push_dir_with_mode(
                 Path::new("/tmp"),
                 0o1777,
@@ -536,24 +525,9 @@ impl Planner {
                 },
             );
         }
-
         if policy.passwd_group {
-            builder.push_generated(
-                Path::new("/etc/passwd"),
-                policy.passwd_contents(),
-                InclusionReason::RuntimePolicy {
-                    feature: RuntimeFeature::PasswdGroup,
-                },
-            );
-            builder.push_generated(
-                Path::new("/etc/group"),
-                policy.group_contents(),
-                InclusionReason::RuntimePolicy {
-                    feature: RuntimeFeature::PasswdGroup,
-                },
-            );
+            self.plan_passwd_group(builder);
         }
-
         if policy.nsswitch {
             builder.push_generated(
                 Path::new("/etc/nsswitch.conf"),
@@ -563,41 +537,11 @@ impl Planner {
                 },
             );
         }
-
         if policy.tzdata {
-            let reason = InclusionReason::RuntimePolicy {
-                feature: RuntimeFeature::Tzdata,
-            };
-            let zoneinfo = PathBuf::from("/usr/share/zoneinfo");
-            if !builder.copy_path(
-                &zoneinfo,
-                PlannedFileKind::ApplicationData,
-                reason.clone(),
-                true,
-            )? {
-                return Err(Error::MissingRuntimeFile {
-                    feature: "tzdata",
-                    searched: vec![zoneinfo],
-                });
-            }
-            builder.copy_path(
-                Path::new("/etc/localtime"),
-                PlannedFileKind::RuntimeConfig,
-                reason,
-                false,
-            )?;
+            self.plan_tzdata(builder)?;
         }
-
         for include in &policy.includes {
-            let logical = normalize_absolute(include);
-            if !builder.copy_path(
-                &logical,
-                PlannedFileKind::ApplicationData,
-                InclusionReason::ExplicitInclude,
-                true,
-            )? {
-                return Err(Error::MissingSourcePath { path: logical });
-            }
+            self.plan_include(builder, include)?;
         }
 
         if policy.user.is_some() && !policy.passwd_group {
@@ -610,13 +554,234 @@ impl Planner {
                 ],
             });
         }
-
         Ok(())
+    }
+
+    /// The first CA bundle the source root actually has. A `web` preset that
+    /// silently shipped no trust store would fail at the first HTTPS request.
+    fn plan_ca_certificates(&self, builder: &mut PlanBuilder<'_>) -> Result<()> {
+        for candidate in RuntimePolicy::CA_BUNDLE_CANDIDATES {
+            let logical = PathBuf::from(candidate);
+            let found = builder.copy_path(
+                &logical,
+                PlannedFileKind::CertificateBundle,
+                InclusionReason::RuntimePolicy {
+                    feature: RuntimeFeature::CaCertificates,
+                },
+                false,
+            )?;
+            if found {
+                return Ok(());
+            }
+        }
+        Err(Error::MissingRuntimeFile {
+            feature: "ca-certificates",
+            searched: RuntimePolicy::CA_BUNDLE_CANDIDATES
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+        })
+    }
+
+    fn plan_passwd_group(&self, builder: &mut PlanBuilder<'_>) {
+        let reason = InclusionReason::RuntimePolicy {
+            feature: RuntimeFeature::PasswdGroup,
+        };
+        builder.push_generated(
+            Path::new("/etc/passwd"),
+            self.runtime_policy.passwd_contents(),
+            reason.clone(),
+        );
+        builder.push_generated(
+            Path::new("/etc/group"),
+            self.runtime_policy.group_contents(),
+            reason,
+        );
+    }
+
+    /// The zone database, plus `/etc/localtime` when the source root sets one.
+    fn plan_tzdata(&self, builder: &mut PlanBuilder<'_>) -> Result<()> {
+        let reason = InclusionReason::RuntimePolicy {
+            feature: RuntimeFeature::Tzdata,
+        };
+        let zoneinfo = PathBuf::from("/usr/share/zoneinfo");
+        let found = builder.copy_path(
+            &zoneinfo,
+            PlannedFileKind::ApplicationData,
+            reason.clone(),
+            true,
+        )?;
+        if !found {
+            return Err(Error::MissingRuntimeFile {
+                feature: "tzdata",
+                searched: vec![zoneinfo],
+            });
+        }
+        // A missing /etc/localtime is not an error: UTC is a valid default.
+        builder.copy_path(
+            Path::new("/etc/localtime"),
+            PlannedFileKind::RuntimeConfig,
+            reason,
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn plan_include(&self, builder: &mut PlanBuilder<'_>, include: &Path) -> Result<()> {
+        let logical = normalize_absolute(include);
+        let found = builder.copy_path(
+            &logical,
+            PlannedFileKind::ApplicationData,
+            InclusionReason::ExplicitInclude,
+            true,
+        )?;
+        if found {
+            return Ok(());
+        }
+        Err(Error::MissingSourcePath { path: logical })
+    }
+}
+
+/// Why an object is in the bundle, as recorded for the manifest.
+fn inclusion_reason(graph: &DependencyGraph, id: NodeId, node: &Node) -> InclusionReason {
+    if id == graph.root {
+        return InclusionReason::Application;
+    }
+    if node.kind == NodeKind::Interpreter {
+        return InclusionReason::Interpreter;
+    }
+    match graph.first_dependent(id) {
+        Some((edge, parent)) => match &edge.reason {
+            DependencyReason::Needed { soname } => InclusionReason::NeededBy {
+                binary: parent.destination.clone(),
+                soname: soname.clone(),
+            },
+            DependencyReason::Interpreter => InclusionReason::Interpreter,
+            DependencyReason::RuntimePolicy { feature } => {
+                InclusionReason::RuntimePolicy { feature: *feature }
+            }
+        },
+        // Unreachable in a graph built by the resolver: only the executable has
+        // no dependent, and it was handled above.
+        None => InclusionReason::Application,
+    }
+}
+
+fn planned_kind(kind: NodeKind) -> PlannedFileKind {
+    match kind {
+        NodeKind::Executable => PlannedFileKind::Executable,
+        NodeKind::Interpreter => PlannedFileKind::Interpreter,
+        NodeKind::SharedObject => PlannedFileKind::SharedObject,
+    }
+}
+
+/// How a library is named on the command line: its `DT_SONAME` when it has one,
+/// otherwise its file name.
+fn library_name(node: &Node) -> String {
+    node.soname
+        .clone()
+        .or_else(|| {
+            node.logical
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
+/// Libraries that resolved through something the bundle does not reproduce.
+fn unreachable_libraries(resolver: &Resolver) -> Vec<String> {
+    resolver
+        .notes()
+        .iter()
+        .map(|note| {
+            format!(
+                "{} in {} (found through {})",
+                note.soname,
+                note.directory.display(),
+                note.origin.as_str()
+            )
+        })
+        .collect()
+}
+
+/// `$ORIGIN`-relative search paths of an executable that is being installed
+/// somewhere other than where it was built. They point somewhere else now.
+fn relocated_search_paths(graph: &DependencyGraph) -> Vec<String> {
+    let source_dir = logical_parent(&graph.root_node().logical);
+    let install_dir = logical_parent(&graph.root_node().destination);
+    if install_dir == source_dir {
+        return Vec::new();
+    }
+    graph
+        .executable_search_paths
+        .iter()
+        .filter(|entry| entry.contains("$ORIGIN") || entry.contains("${ORIGIN}"))
+        .cloned()
+        .collect()
+}
+
+fn warn_unreachable(libraries: Vec<String>, glibc: bool) -> Warning {
+    assert!(!libraries.is_empty());
+
+    let explanation = if glibc {
+        format!(
+            "Without {LD_SO_CACHE} the packaged application finds these \
+             only if its DT_RPATH/DT_RUNPATH covers them."
+        )
+    } else {
+        "This loader does not read an ld.so.cache, so the paths have to \
+         come from the objects themselves."
+            .to_string()
+    };
+    Warning {
+        code: "E2005",
+        message: match libraries.len() {
+            1 => "a library lives outside the directories the loader searches".to_string(),
+            n => format!("{n} libraries live outside the directories the loader searches"),
+        },
+        details: libraries.into_iter().chain([explanation]).collect(),
+    }
+}
+
+fn warn_relocated(paths: Vec<String>, graph: &DependencyGraph) -> Warning {
+    assert!(!paths.is_empty());
+
+    let source_dir = logical_parent(&graph.root_node().logical);
+    let install_dir = logical_parent(&graph.root_node().destination);
+    assert_ne!(source_dir, install_dir);
+
+    let advice = format!(
+        "Install it at {} to keep those paths pointing where they did.",
+        graph.root_node().logical.display()
+    );
+    Warning {
+        code: "E2006",
+        message: format!(
+            "the executable declares $ORIGIN-relative search paths and moves from {} to {}",
+            source_dir.display(),
+            install_dir.display()
+        ),
+        details: paths.into_iter().chain([advice]).collect(),
+    }
+}
+
+fn warn_dlopen_executable(node: &Node) -> Warning {
+    assert!(!node.dlopen_references.is_empty());
+
+    Warning {
+        code: "E1004",
+        message: format!("{} references dlopen()", node.destination.display()),
+        details: vec![
+            "Runtime-loaded libraries cannot be determined using static ELF dependency analysis."
+                .to_string(),
+            "Consider adding them with --include.".to_string(),
+        ],
     }
 }
 
 /// Accumulates plan entries, deduplicating destinations and creating the
 /// directory scaffolding each entry needs.
+#[derive(Debug)]
 struct PlanBuilder<'a> {
     root: &'a SourceRoot,
     entries: BTreeMap<PathBuf, PlannedFile>,
@@ -635,6 +800,8 @@ impl<'a> PlanBuilder<'a> {
     /// Directories never displace real content; anything else wins over a
     /// previously planned directory placeholder.
     fn insert(&mut self, file: PlannedFile) {
+        file.assert_well_formed();
+
         match self.entries.get(&file.destination) {
             Some(existing) if existing.kind != PlannedFileKind::Directory => {}
             Some(_) if file.kind == PlannedFileKind::Directory => {}
@@ -644,7 +811,11 @@ impl<'a> PlanBuilder<'a> {
         }
     }
 
+    /// Directory scaffolding for an entry. Parents are planned shallowest
+    /// first, which is the order they have to be created in.
     fn push_parents(&mut self, path: &Path, reason: &InclusionReason) {
+        assert!(path.is_absolute());
+
         for dir in ancestor_dirs(path) {
             self.insert(PlannedFile {
                 source: None,
@@ -666,6 +837,12 @@ impl<'a> PlanBuilder<'a> {
     }
 
     fn push_symlink(&mut self, logical: &Path, target: &Path, reason: InclusionReason) {
+        assert!(logical.is_absolute());
+        assert!(
+            !target.as_os_str().is_empty(),
+            "a link needs somewhere to point"
+        );
+
         self.push_parents(logical, &reason);
         self.insert(PlannedFile {
             source: None,
@@ -695,7 +872,11 @@ impl<'a> PlanBuilder<'a> {
         });
     }
 
+    /// An entry whose bytes this process produced rather than copied.
     fn push_generated(&mut self, path: &Path, content: Vec<u8>, reason: InclusionReason) {
+        assert!(path.is_absolute());
+        assert!(!content.is_empty(), "an empty generated file says nothing");
+
         self.push_parents(path, &reason);
         let digest = sha256_bytes(&content);
         self.insert(PlannedFile {
@@ -718,7 +899,10 @@ impl<'a> PlanBuilder<'a> {
         kind: PlannedFileKind,
         reason: InclusionReason,
     ) -> Result<()> {
+        assert!(destination.is_absolute());
+
         let (digest, size) = self.digests.get(&source)?;
+        assert!(digest.is_well_formed());
         self.push_file(PlannedFile {
             source: Some(source.clone()),
             destination,
@@ -778,6 +962,19 @@ impl<'a> PlanBuilder<'a> {
     ) -> Result<()> {
         let mut stack = vec![(logical.to_path_buf(), host.to_path_buf())];
         while let Some((logical, host)) = stack.pop() {
+            assert!(logical.is_absolute());
+            // The one place a plan can grow without an ELF object behind every
+            // entry, and therefore the one place that needs the bound.
+            if self.entries.len() > PLAN_ENTRIES_MAX {
+                return Err(Error::Config {
+                    message: format!(
+                        "the plan exceeds {PLAN_ENTRIES_MAX} entries at `{}`; \
+                         narrow the --include",
+                        logical.display()
+                    ),
+                });
+            }
+
             let mut names = Vec::new();
             for entry in std::fs::read_dir(&host).map_err(|e| io(&host, e))? {
                 let entry = entry.map_err(|e| io(&host, e))?;
@@ -803,8 +1000,16 @@ impl<'a> PlanBuilder<'a> {
         Ok(())
     }
 
+    /// Entries sorted by destination, which is what makes a parent directory
+    /// precede everything inside it when the plan is written out.
     fn finish(self) -> Vec<PlannedFile> {
-        self.entries.into_values().collect()
+        let files: Vec<PlannedFile> = self.entries.into_values().collect();
+        assert!(
+            files
+                .windows(2)
+                .all(|p| p[0].destination < p[1].destination)
+        );
+        files
     }
 }
 
@@ -825,20 +1030,25 @@ fn uses_glibc_loader(graph: &DependencyGraph) -> bool {
 /// else `0644`. Deterministic output matters more than exotic source modes.
 fn mode_of(path: &Path) -> Result<u32> {
     use std::os::unix::fs::PermissionsExt;
+
     let metadata = std::fs::metadata(path).map_err(|e| io(path, e))?;
     let mode = metadata.permissions().mode();
-    Ok(if metadata.is_dir() || mode & 0o111 != 0 {
+    let normalized = if metadata.is_dir() || mode & 0o111 != 0 {
         0o755
     } else {
         0o644
-    })
+    };
+    // Never wider than what the source had, and never setuid/setgid: a bundle
+    // is not the place to discover a privilege bit came along for the ride.
+    assert!(normalized & 0o7000 == 0);
+    Ok(normalized)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::elf::{ElfClass, Endianness, Machine};
-    use crate::graph::{Digest, Node};
+    use crate::graph::Node;
 
     fn graph_with_interpreter(interpreter: Option<&str>) -> DependencyGraph {
         let architecture = Architecture {
@@ -853,7 +1063,8 @@ mod tests {
             kind,
             soname: soname.map(str::to_string),
             architecture,
-            sha256: Digest(String::new()),
+            // A real digest: the graph asserts that every node carries one.
+            sha256: sha256_bytes(logical.as_bytes()),
             size: 0,
             links: Vec::new(),
             dlopen_references: Vec::new(),

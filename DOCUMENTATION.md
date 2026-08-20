@@ -408,7 +408,7 @@ crates/elfpak/        CLI: argument parsing, config loading, rendering
 crates/elfpak-core/   library: elf, graph, resolver, plan, rootfs, manifest
 fixtures/axum-server/ integration fixture: a real Axum service
 fixtures/vendor-lib/  integration fixture: a library outside the loader's path
-tests/docker/         Docker smoke tests
+tests/docker/         Docker smoke tests, one Dockerfile per scenario
 Dockerfile            static elfpak distribution image (FROM scratch)
 ```
 
@@ -447,17 +447,33 @@ See the [Docker multi-platform documentation][multi-platform] for the details.
 Minimum supported Rust version: **1.97**.
 
 ```console
-$ cargo test                       # unit + integration tests
-$ cargo clippy --all-targets
+$ just check                       # fmt, clippy -D warnings, and the whole suite
+$ just test                        # unit, integration and style tests
+$ just style                       # the numeric style limits on their own
 $ tests/docker/smoke.sh            # all Docker smoke tests
 $ tests/docker/smoke.sh axum       # Axum on scratch, host architecture
 $ tests/docker/smoke.sh axum-arm64 # Axum on scratch, linux/arm64
 $ tests/docker/smoke.sh ca         # CA roots come from the bundle, not the binary
 $ tests/docker/smoke.sh musl       # a dynamically linked musl program
 $ tests/docker/smoke.sh ldcache    # a library the loader only finds through a cache
-$ tests/docker/smoke.sh tar        # tar output consumed by docker ADD
+$ tests/docker/smoke.sh tar        # the same service delivered as a tar and ADDed
+$ tests/docker/smoke.sh verify     # `elfpak verify` as a build gate
 $ tests/docker/smoke.sh cross      # non-Rust cross-architecture packaging
+
+$ tests/docker/smoke.sh --fresh    # remove the suite's images, build with --no-cache
 ```
+
+`--fresh` exists so that a rerun cannot be explained by a layer that was already
+there: it removes every `elfpak:local*` and `elfpak-*:local*` image and passes
+`--no-cache` to each build. BuildKit cache mounts survive it — that is what keeps
+cargo from recompiling the fixtures from scratch — and are cleared separately
+with `docker builder prune --filter type=exec.cachemount`.
+
+The code follows [TigerStyle](https://tigerstyle.dev/); [STYLE.md](STYLE.md)
+records how, and `crates/elfpak-core/tests/style.rs` enforces the two numeric
+limits — 100 columns and 70 lines per function — as part of the test suite.
+Assertions are enabled in release builds and the release profile aborts, so an
+invariant that fails stops the run rather than producing a bundle.
 
 The cargo suite covers ELF parsing, token expansion, `ld.so.cache` parsing,
 policy evaluation, manifest round-trips and filesystem safety, plus loader
@@ -534,9 +550,25 @@ The Docker smoke tests:
   (`libc.musl-x86_64.so.1` is a symlink to `ld-musl-x86_64.so.1`), there is no
   `ld.so.cache`, and name resolution needs no NSS modules. Each scratch image
   must run and resolve DNS.
-* `tar` — packages into an archive, checks the archive is byte-identical across
-  runs, and builds a scratch image with `ADD rootfs.tar /` to prove the output
-  is consumable by a container build.
+* `tar` — the same Axum service as `axum`, delivered as an archive instead of a
+  directory. The build stage packages it with `--tar` and asserts in place that
+  a second bundle of the same inputs is byte-identical; the archive and its
+  manifest are then exported with `--output type=local`, and a second build uses
+  that directory as its context so `ADD rootfs.tar /` unpacks it into a
+  `FROM scratch` image. Two builds, because `ADD` extracts from the build
+  context and there is no `ADD --from` — which is exactly how a pipeline
+  consumes an archive. The resulting image then has to pass every assertion the
+  `axum` test makes, so an archive-delivered image is held to the same standard
+  as a directory-delivered one.
+* `verify` — `elfpak verify` as a build gate. One stage bundles, the next
+  verifies against the manifest, and the image is copied out of the stage that
+  verified: a failure fails the build, so the rootfs that ships is the rootfs
+  that was checked. The middle stage covers the negative space too — changed
+  bytes, changed permissions, an added file, a removed file, a redirected
+  symlink — and distinguishes what `--strict` catches from what plain
+  verification catches. The suite then rebuilds the same Dockerfile with
+  `--build-arg ELFPAK_TAMPER=1`, which corrupts the rootfs before verification,
+  and requires that build to fail: a gate that cannot fail proves nothing.
 * `cross` — exports an aarch64 sysroot, packages an aarch64 binary with the host
   `elfpak`, and runs the result under emulation. Nothing is compiled or executed
   for the foreign architecture, which keeps it cheap and covers the non-Rust

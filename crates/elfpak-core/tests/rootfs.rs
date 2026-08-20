@@ -514,7 +514,11 @@ fn timestamps_are_pinned_for_files_and_directories() {
     .unwrap();
     RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
 
-    for entry in [rootfs.join("app/server"), rootfs.join("app"), rootfs.join("usr/lib")] {
+    for entry in [
+        rootfs.join("app/server"),
+        rootfs.join("app"),
+        rootfs.join("usr/lib"),
+    ] {
         let modified = std::fs::metadata(&entry).unwrap().modified().unwrap();
         assert_eq!(
             modified,

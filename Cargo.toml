@@ -10,6 +10,21 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/example/elfpak"
 description = "Package a Linux ELF application and its runtime closure into a minimal rootfs"
 
+# Appreciate all compiler warnings at the strictest setting (TIGER_STYLE):
+# a warning is a bug that has not happened yet.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Assertions and error handling are the safety net; silent truncation is not.
+cast_possible_truncation = "warn"
+cast_lossless = "warn"
+undocumented_unsafe_blocks = "warn"
+
 [workspace.dependencies]
 elfpak-core = { path = "crates/elfpak-core", version = "0.1.0" }
 anyhow = "1"

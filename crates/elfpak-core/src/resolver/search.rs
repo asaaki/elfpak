@@ -3,7 +3,20 @@
 use std::path::{Path, PathBuf};
 
 use crate::elf::{Architecture, ElfClass};
+use crate::paths::{logical_parent, normalize_absolute};
 use crate::source::SourceRoot;
+
+/// How deeply `include` directives may nest.
+///
+/// `ld.so.conf` files include a directory of fragments, and those fragments do
+/// not include further ones in any distribution; eight levels is generous and
+/// finite, which is what matters.
+const CONF_DEPTH_MAX: usize = 8;
+
+/// Upper bound on the files one `ld.so.conf` may pull in, and on the
+/// directories it may name. Both bound the work a hostile sysroot can ask for.
+const CONF_FILES_MAX: usize = 256;
+const CONF_DIRECTORIES_MAX: usize = 256;
 
 /// glibc's built-in trusted directories, plus the Debian/Fedora conventions that
 /// are configured on every mainstream distribution.
@@ -19,41 +32,78 @@ pub fn default_library_paths(architecture: &Architecture) -> Vec<PathBuf> {
     }
     paths.push(PathBuf::from("/lib"));
     paths.push(PathBuf::from("/usr/lib"));
+
+    assert!(!paths.is_empty());
+    assert!(paths.iter().all(|p| p.is_absolute()));
     paths
+}
+
+/// One meaningful line of an `ld.so.conf`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Directive {
+    /// A directory to add to the search list.
+    Directory(PathBuf),
+    /// Another configuration file to read, already expanded to a concrete path.
+    Include(PathBuf),
 }
 
 /// Read `/etc/ld.so.conf`, following `include` directives (with `*` globs).
+///
+/// Iterative rather than recursive, so the depth of the walk is a number in
+/// this function rather than a property of the stack. Directives are pushed in
+/// reverse and popped in order, which reproduces exactly the depth-first,
+/// in-file-order traversal that the loader's own reader performs.
 pub fn parse_ld_so_conf(root: &SourceRoot) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let mut visited = Vec::new();
-    read_conf(
-        root,
-        Path::new("/etc/ld.so.conf"),
-        &mut paths,
-        &mut visited,
-        0,
-    );
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut visited: Vec<PathBuf> = Vec::new();
+    let mut pending = vec![(Directive::Include(PathBuf::from("/etc/ld.so.conf")), 0usize)];
+
+    while let Some((directive, depth)) = pending.pop() {
+        assert!(depth <= CONF_DEPTH_MAX + 1);
+        assert!(visited.len() <= CONF_FILES_MAX);
+
+        let file = match directive {
+            Directive::Directory(dir) => {
+                assert!(dir.is_absolute());
+                if !paths.contains(&dir) && paths.len() < CONF_DIRECTORIES_MAX {
+                    paths.push(dir);
+                }
+                continue;
+            }
+            Directive::Include(file) => file,
+        };
+
+        // A file is read once: an include cycle is a configuration error, not a
+        // reason to keep reading.
+        if depth > CONF_DEPTH_MAX || visited.contains(&file) || visited.len() == CONF_FILES_MAX {
+            continue;
+        }
+        visited.push(file.clone());
+
+        for directive in read_conf(root, &file).into_iter().rev() {
+            pending.push((directive, depth + 1));
+        }
+    }
+
+    assert!(paths.len() <= CONF_DIRECTORIES_MAX);
+    assert!(paths.iter().all(|p| p.is_absolute()));
     paths
 }
 
-fn read_conf(
-    root: &SourceRoot,
-    logical: &Path,
-    paths: &mut Vec<PathBuf>,
-    visited: &mut Vec<PathBuf>,
-    depth: usize,
-) {
-    if depth > 8 || visited.contains(&logical.to_path_buf()) {
-        return;
-    }
-    visited.push(logical.to_path_buf());
+/// Directives of a single file, in file order. Unreadable or non-UTF-8 files
+/// yield nothing: the configuration is a hint, and the default directories
+/// remain either way.
+fn read_conf(root: &SourceRoot, logical: &Path) -> Vec<Directive> {
+    assert!(logical.is_absolute());
+
     let Ok(Some(bytes)) = root.read(logical) else {
-        return;
+        return Vec::new();
     };
     let Ok(text) = String::from_utf8(bytes) else {
-        return;
+        return Vec::new();
     };
 
+    let mut directives = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -64,30 +114,30 @@ fn read_conf(
             .or_else(|| line.strip_prefix("include\t"))
         {
             for pattern in rest.split_whitespace() {
-                for included in expand_include(root, logical, pattern) {
-                    read_conf(root, &included, paths, visited, depth + 1);
-                }
+                let included = expand_include(root, logical, pattern);
+                directives.extend(included.into_iter().map(Directive::Include));
             }
             continue;
         }
         if line.starts_with("hwcap ") {
+            // Obsolete since glibc 2.33 and never a directory.
             continue;
         }
-        let candidate = crate::paths::normalize_absolute(Path::new(line));
-        if !paths.contains(&candidate) {
-            paths.push(candidate);
-        }
+        directives.push(Directive::Directory(normalize_absolute(Path::new(line))));
     }
+    directives
 }
 
 /// Resolve an `include` pattern; only the final component may contain `*`.
 fn expand_include(root: &SourceRoot, current: &Path, pattern: &str) -> Vec<PathBuf> {
+    assert!(current.is_absolute());
+
     let pattern_path = if Path::new(pattern).is_absolute() {
         PathBuf::from(pattern)
     } else {
-        crate::paths::logical_parent(current).join(pattern)
+        logical_parent(current).join(pattern)
     };
-    let pattern_path = crate::paths::normalize_absolute(&pattern_path);
+    let pattern_path = normalize_absolute(&pattern_path);
 
     let Some(name) = pattern_path.file_name().and_then(|n| n.to_str()) else {
         return Vec::new();
@@ -96,7 +146,7 @@ fn expand_include(root: &SourceRoot, current: &Path, pattern: &str) -> Vec<PathB
         return vec![pattern_path];
     }
 
-    let dir = crate::paths::logical_parent(&pattern_path);
+    let dir = logical_parent(&pattern_path);
     let Ok(entries) = root.read_dir(&dir) else {
         return Vec::new();
     };
@@ -105,10 +155,11 @@ fn expand_include(root: &SourceRoot, current: &Path, pattern: &str) -> Vec<PathB
         .into_iter()
         .filter_map(|entry| {
             let entry = entry.to_str()?.to_string();
-            (entry.len() >= prefix.len() + suffix.len()
-                && entry.starts_with(prefix)
-                && entry.ends_with(suffix))
-            .then(|| dir.join(entry))
+            // The two halves must not overlap, or `lib*.conf` would match
+            // `lib.conf` twice over the same bytes.
+            let fits = entry.len() >= prefix.len() + suffix.len();
+            let matches = entry.starts_with(prefix) && entry.ends_with(suffix);
+            (fits && matches).then(|| dir.join(entry))
         })
         .collect()
 }

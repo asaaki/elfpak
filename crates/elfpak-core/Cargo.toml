@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Core library for elfpak: ELF analysis, loader-faithful resolution, and rootfs planning"
 
+[lints]
+workspace = true
+
 [dependencies]
 goblin.workspace = true
 serde.workspace = true

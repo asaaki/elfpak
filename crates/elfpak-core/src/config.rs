@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result, io};
 use crate::rootfs::policy::Preset;
 
-pub const DEFAULT_CONFIG_NAME: &str = "elfpak.toml";
+/// Name of the configuration file discovered beside the working directory.
+pub const CONFIG_NAME_DEFAULT: &str = "elfpak.toml";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +70,8 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Config> {
+        assert!(!path.as_os_str().is_empty());
+
         let text = std::fs::read_to_string(path).map_err(|e| io(path, e))?;
         Config::parse(&text).map_err(|e| match e {
             Error::Config { message } => Error::Config {
@@ -78,15 +81,17 @@ impl Config {
         })
     }
 
-    /// Load `elfpak.toml` from `dir` if it exists.
+    /// Load `elfpak.toml` from `dir` if it exists. A missing file is not an
+    /// error: the tool is fully usable without one.
     pub fn discover(dir: &Path) -> Result<Option<(PathBuf, Config)>> {
-        let candidate = dir.join(DEFAULT_CONFIG_NAME);
-        if candidate.is_file() {
-            let config = Config::load(&candidate)?;
-            Ok(Some((candidate, config)))
-        } else {
-            Ok(None)
+        let candidate = dir.join(CONFIG_NAME_DEFAULT);
+        assert!(candidate.ends_with(CONFIG_NAME_DEFAULT));
+
+        if !candidate.is_file() {
+            return Ok(None);
         }
+        let config = Config::load(&candidate)?;
+        Ok(Some((candidate, config)))
     }
 }
 

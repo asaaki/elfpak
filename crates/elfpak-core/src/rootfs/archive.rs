@@ -14,15 +14,16 @@ use tar::{EntryType, Header};
 use crate::error::{Error, Result, io};
 use crate::plan::{BundlePlan, PlannedFile, PlannedFileKind};
 
+#[derive(Debug)]
 pub struct TarBuilder {
     path: PathBuf,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TarReport {
-    pub files: usize,
-    pub directories: usize,
-    pub symlinks: usize,
+    pub files: u32,
+    pub directories: u32,
+    pub symlinks: u32,
     /// Uncompressed payload, excluding tar headers and padding.
     pub bytes: u64,
 }
@@ -48,13 +49,12 @@ impl TarBuilder {
         let mtime = super::copy::source_date_epoch_secs();
 
         for entry in &plan.files {
+            entry.assert_well_formed();
             let name = archive_name(&entry.destination)?;
-            let mut header = Header::new_gnu();
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mtime(mtime);
-            header.set_mode(entry.mode);
-            header.set_size(0);
+            assert!(!name.is_empty());
+            assert!(!name.starts_with('/'), "tar entries are relative");
+
+            let mut header = pinned_header(entry.mode, mtime);
 
             match entry.kind {
                 PlannedFileKind::Directory => {
@@ -90,8 +90,27 @@ impl TarBuilder {
             .map_err(|e| io(&self.path, e))?
             .flush()
             .map_err(|e| io(&self.path, e))?;
+
+        let entries = report.files + report.directories + report.symlinks;
+        assert_eq!(
+            entries as usize,
+            plan.files.len(),
+            "every entry is archived"
+        );
         Ok(report)
     }
+}
+
+/// A header with everything that could vary between machines already pinned:
+/// ownership is root:root and the timestamp comes from `SOURCE_DATE_EPOCH`.
+fn pinned_header(mode: u32, mtime: u64) -> Header {
+    let mut header = Header::new_gnu();
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(mtime);
+    header.set_mode(mode);
+    header.set_size(0);
+    header
 }
 
 fn append_regular<W: Write>(
@@ -102,6 +121,7 @@ fn append_regular<W: Write>(
 ) -> std::io::Result<()> {
     match (&entry.content, &entry.source) {
         (Some(content), _) => {
+            assert_eq!(content.len() as u64, entry.size);
             header.set_size(content.len() as u64);
             writer.append_data(header, name, content.as_slice())
         }
@@ -119,6 +139,8 @@ fn append_regular<W: Write>(
 
 /// Tar entries are relative paths: `/app/server` becomes `app/server`.
 fn archive_name(destination: &Path) -> Result<String> {
+    assert!(destination.is_absolute());
+
     let normalized = crate::paths::normalize_absolute(destination);
     let relative = normalized.strip_prefix("/").unwrap_or(&normalized);
     relative

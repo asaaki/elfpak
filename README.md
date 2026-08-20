@@ -99,12 +99,17 @@ cross-architecture packaging and the test suite.
 ## Development
 
 ```console
-$ cargo test              # unit + integration tests, MSRV 1.97
-$ cargo clippy --all-targets
-$ tests/docker/smoke.sh   # Docker smoke tests (see DOCUMENTATION.md)
+$ just check              # fmt, clippy -D warnings, and the whole test suite
+$ just test               # unit, integration, loader-oracle and style tests
+$ just smoke              # Docker smoke tests (see DOCUMENTATION.md)
+$ just smoke --fresh      # ... with nothing reused from a previous run
 
 $ docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
 ```
+
+The code follows [TigerStyle](https://tigerstyle.dev/); [STYLE.md](STYLE.md)
+records what that means here — assertions as pre- and postconditions, a bound on
+every loop, no recursion, and the 70-line/100-column limits enforced by a test.
 
 The distribution image is multi-platform and cross-compiled, so building every
 architecture never needs emulation.

@@ -9,7 +9,9 @@ use crate::hash::sha256_file;
 use crate::plan::{BundlePlan, InclusionReason, PlannedFileKind};
 
 pub const MANIFEST_VERSION: u32 = 2;
-pub const DEFAULT_MANIFEST_NAME: &str = "elfpak-manifest.json";
+/// Name of the manifest written beside a bundle. Most significant word first,
+/// qualifier last, so related constants sort and read together.
+pub const MANIFEST_NAME_DEFAULT: &str = "elfpak-manifest.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -98,6 +100,7 @@ impl From<&InclusionReason> for Reason {
 }
 
 impl Manifest {
+    /// A manifest of a plan, without recording where the bundle was written.
     pub fn from_plan(plan: &BundlePlan, source_root: &Path, rootfs: Option<&Path>) -> Manifest {
         Manifest::from_plan_with_outputs(plan, source_root, rootfs, None)
     }
@@ -108,7 +111,7 @@ impl Manifest {
         rootfs: Option<&Path>,
         tar: Option<&Path>,
     ) -> Manifest {
-        let files = plan
+        let files: Vec<ManifestFile> = plan
             .files
             .iter()
             .map(|file| ManifestFile {
@@ -121,6 +124,12 @@ impl Manifest {
                 target: file.link_target.as_ref().map(|t| t.display().to_string()),
             })
             .collect();
+
+        assert_eq!(
+            files.len(),
+            plan.files.len(),
+            "every planned entry is recorded"
+        );
 
         Manifest {
             manifest_version: MANIFEST_VERSION,
@@ -158,7 +167,9 @@ impl Manifest {
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("manifest serializes")
+        let json = serde_json::to_string_pretty(self).expect("a manifest is plain data");
+        assert!(json.starts_with('{'));
+        json
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
@@ -169,6 +180,10 @@ impl Manifest {
         }
         let mut json = self.to_json();
         json.push('\n');
+        assert!(
+            json.ends_with("}\n"),
+            "a manifest is one JSON object per file"
+        );
         std::fs::write(path, json).map_err(|e| io(path, e))
     }
 
@@ -181,11 +196,16 @@ impl Manifest {
     }
 
     /// Check a materialized rootfs against this manifest.
+    ///
+    /// All control flow lives here: an entry is missing, or it is of the wrong
+    /// kind or contents, or — under `--strict` — its permissions changed.
     pub fn verify(&self, rootfs: &Path, options: &VerifyOptions) -> VerifyReport {
         let mut report = VerifyReport::default();
         for file in &self.files {
             report.checked += 1;
             let target = crate::paths::join_under(rootfs, Path::new(&file.path));
+            assert!(target.starts_with(rootfs));
+
             let Ok(metadata) = std::fs::symlink_metadata(&target) else {
                 report.problems.push(Problem {
                     path: file.path.clone(),
@@ -194,65 +214,9 @@ impl Manifest {
                 continue;
             };
 
-            match file.kind.as_str() {
-                "directory" => {
-                    if !metadata.is_dir() {
-                        report.problems.push(Problem {
-                            path: file.path.clone(),
-                            detail: "expected a directory".to_string(),
-                        });
-                    }
-                }
-                "symlink" => {
-                    if !metadata.is_symlink() {
-                        report.problems.push(Problem {
-                            path: file.path.clone(),
-                            detail: "expected a symlink".to_string(),
-                        });
-                        continue;
-                    }
-                    let actual = std::fs::read_link(&target).unwrap_or_default();
-                    let expected = file.target.clone().unwrap_or_default();
-                    if actual.as_os_str() != expected.as_str() {
-                        report.problems.push(Problem {
-                            path: file.path.clone(),
-                            detail: format!(
-                                "link target is `{}`, expected `{}`",
-                                actual.display(),
-                                expected
-                            ),
-                        });
-                    }
-                }
-                _ => {
-                    if !metadata.is_file() {
-                        report.problems.push(Problem {
-                            path: file.path.clone(),
-                            detail: "expected a regular file".to_string(),
-                        });
-                        continue;
-                    }
-                    let Some(expected) = &file.sha256 else {
-                        continue;
-                    };
-                    match sha256_file(&target) {
-                        Ok((actual, _)) => {
-                            if &actual.0 != expected {
-                                report.problems.push(Problem {
-                                    path: file.path.clone(),
-                                    detail: format!(
-                                        "sha256 mismatch (found {}, expected {expected})",
-                                        actual.0
-                                    ),
-                                });
-                            }
-                        }
-                        Err(e) => report.problems.push(Problem {
-                            path: file.path.clone(),
-                            detail: format!("unreadable: {e}"),
-                        }),
-                    }
-                }
+            if let Some(problem) = verify_entry(file, &target, &metadata) {
+                report.problems.push(problem);
+                continue;
             }
 
             // Permission bits are part of the record, and a mode change is a
@@ -268,6 +232,7 @@ impl Manifest {
         if options.strict {
             self.report_unexpected(rootfs, &mut report);
         }
+        assert_eq!(report.checked as usize, self.files.len());
         report
     }
 
@@ -282,20 +247,26 @@ impl Manifest {
 
         let mut stack = vec![rootfs.to_path_buf()];
         while let Some(current) = stack.pop() {
+            assert!(current.starts_with(rootfs), "the walk stays in the rootfs");
+
             let Ok(entries) = std::fs::read_dir(&current) else {
                 continue;
             };
+            // Sorted, so that the problems of a failing verification are
+            // reported in the same order on every run.
             let mut found: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
             found.sort();
+
             for path in found {
                 let Ok(relative) = path.strip_prefix(rootfs) else {
                     continue;
                 };
                 let logical = crate::paths::normalize_absolute(&Path::new("/").join(relative));
-                let metadata = match std::fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(_) => continue,
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                    continue;
                 };
+                // A symlink is never descended into: it is an entry in its own
+                // right, and its target is checked where the target lives.
                 if metadata.is_dir() && !metadata.is_symlink() {
                     stack.push(path.clone());
                 }
@@ -310,11 +281,89 @@ impl Manifest {
         }
     }
 
+    /// Entries that carry content, i.e. everything but the directory scaffolding.
     pub fn file_count(&self) -> usize {
-        self.files
+        let count = self
+            .files
             .iter()
             .filter(|f| f.kind != PlannedFileKind::Directory.as_str())
-            .count()
+            .count();
+        assert!(count <= self.files.len());
+        count
+    }
+}
+
+/// Check one entry against what the manifest recorded for it. `None` means the
+/// entry is what it should be.
+fn verify_entry(
+    file: &ManifestFile,
+    target: &Path,
+    metadata: &std::fs::Metadata,
+) -> Option<Problem> {
+    match file.kind.as_str() {
+        "directory" => (!metadata.is_dir()).then(|| Problem {
+            path: file.path.clone(),
+            detail: "expected a directory".to_string(),
+        }),
+        "symlink" => verify_symlink(file, target, metadata),
+        _ => verify_regular(file, target, metadata),
+    }
+}
+
+/// A symlink is verified by its target, verbatim: the bundle preserves link
+/// structure, so a link that now points elsewhere is a changed bundle.
+fn verify_symlink(
+    file: &ManifestFile,
+    target: &Path,
+    metadata: &std::fs::Metadata,
+) -> Option<Problem> {
+    if !metadata.is_symlink() {
+        return Some(Problem {
+            path: file.path.clone(),
+            detail: "expected a symlink".to_string(),
+        });
+    }
+    let actual = std::fs::read_link(target).unwrap_or_default();
+    let expected = file.target.clone().unwrap_or_default();
+    if actual.as_os_str() == expected.as_str() {
+        return None;
+    }
+    Some(Problem {
+        path: file.path.clone(),
+        detail: format!(
+            "link target is `{}`, expected `{}`",
+            actual.display(),
+            expected
+        ),
+    })
+}
+
+/// A regular file is verified by its digest, which is the whole point of
+/// recording one.
+fn verify_regular(
+    file: &ManifestFile,
+    target: &Path,
+    metadata: &std::fs::Metadata,
+) -> Option<Problem> {
+    if !metadata.is_file() {
+        return Some(Problem {
+            path: file.path.clone(),
+            detail: "expected a regular file".to_string(),
+        });
+    }
+    // An entry without a digest is one `elfpak` never writes; there is nothing
+    // to compare, and the mode check still applies.
+    let expected = file.sha256.as_ref()?;
+    match sha256_file(target) {
+        Ok((actual, _)) if &actual.0 == expected => None,
+        Ok((actual, _)) => Some(Problem {
+            path: file.path.clone(),
+            detail: format!("sha256 mismatch (found {}, expected {expected})", actual.0),
+        }),
+        Err(e) => Some(Problem {
+            path: file.path.clone(),
+            detail: format!("unreadable: {e}"),
+        }),
     }
 }
 
@@ -339,9 +388,9 @@ pub struct VerifyOptions {
 
 #[derive(Debug, Default)]
 pub struct VerifyReport {
-    pub checked: usize,
+    pub checked: u32,
     /// Entries found in the rootfs that the manifest does not list.
-    pub unexpected: usize,
+    pub unexpected: u32,
     pub problems: Vec<Problem>,
 }
 
@@ -354,5 +403,11 @@ pub struct Problem {
 impl VerifyReport {
     pub fn is_ok(&self) -> bool {
         self.problems.is_empty()
+    }
+
+    /// Problems found, saturating: a report with four billion problems has
+    /// already made its point.
+    pub fn failure_count(&self) -> u32 {
+        u32::try_from(self.problems.len()).unwrap_or(u32::MAX)
     }
 }

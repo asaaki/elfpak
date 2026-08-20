@@ -11,7 +11,17 @@ use crate::elf::ElfMetadata;
 use crate::error::{Error, Result, io};
 use crate::paths::normalize_absolute;
 
-const SYMLINK_BUDGET: usize = 40;
+/// How many symlinks may be traversed while resolving one logical path.
+///
+/// glibc's own limit is `SYMLOOP_MAX` (40 on Linux); matching it means a path
+/// that resolves here is a path the loader would also resolve.
+const SYMLINK_HOPS_MAX: usize = 40;
+
+/// Upper bound on the components still waiting to be walked. Each symlink hop
+/// can push the components of its target, so a pathological sysroot could grow
+/// this list without ever repeating a link; the bound turns that into an error
+/// rather than into memory growth.
+const PENDING_COMPONENTS_MAX: usize = 1024;
 
 /// A symlink observed while resolving a logical path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,29 +67,29 @@ impl SourceRoot {
 
     /// Map a logical path onto the host without following symlinks.
     pub fn host_path(&self, logical: &Path) -> PathBuf {
-        crate::paths::join_under(&self.path, logical)
+        let host = crate::paths::join_under(&self.path, logical);
+        assert!(
+            host.starts_with(&self.path),
+            "the source root is never left"
+        );
+        host
     }
 
     /// Resolve a logical path, following symlinks within the root.
     ///
     /// Returns `Ok(None)` when the path does not exist. Symlinks are recorded so
-    /// that the bundle can reproduce the original link structure.
+    /// that the bundle can reproduce the original link structure. All control
+    /// flow lives here; the helpers below only compute.
     pub fn resolve(&self, logical: &Path) -> Result<Option<Resolved>> {
-        let normalized = normalize_absolute(logical);
-        let mut pending: Vec<std::ffi::OsString> = normalized
-            .components()
-            .filter_map(|c| match c {
-                Component::Normal(p) => Some(p.to_os_string()),
-                _ => None,
-            })
-            .rev()
-            .collect();
-
+        let mut pending = components_reversed(&normalize_absolute(logical));
         let mut current = PathBuf::from("/");
-        let mut links = Vec::new();
-        let mut budget = SYMLINK_BUDGET;
+        let mut links: Vec<SymlinkEntry> = Vec::new();
+        let mut hops = 0usize;
 
         while let Some(component) = pending.pop() {
+            assert!(current.is_absolute());
+            assert!(hops <= SYMLINK_HOPS_MAX);
+
             if component == ".." {
                 current.pop();
                 continue;
@@ -87,51 +97,48 @@ impl SourceRoot {
             if component == "." {
                 continue;
             }
+
             let next_logical = current.join(&component);
             let host = self.host_path(&next_logical);
-            let metadata = match std::fs::symlink_metadata(&host) {
-                Ok(metadata) => metadata,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(io(&host, e)),
+            let Some(metadata) = symlink_metadata_optional(&host)? else {
+                return Ok(None);
             };
-
-            if metadata.is_symlink() {
-                if budget == 0 {
-                    return Err(Error::SymlinkLoop {
-                        path: logical.to_path_buf(),
-                    });
-                }
-                budget -= 1;
-                let target = std::fs::read_link(&host).map_err(|e| io(&host, e))?;
-                links.push(SymlinkEntry {
-                    logical: next_logical,
-                    target: target.clone(),
-                });
-                if target.is_absolute() {
-                    current = PathBuf::from("/");
-                }
-                for part in target
-                    .components()
-                    .filter_map(|c| match c {
-                        Component::Normal(p) => Some(p.to_os_string()),
-                        Component::ParentDir => Some(std::ffi::OsString::from("..")),
-                        _ => None,
-                    })
-                    .rev()
-                {
-                    pending.push(part);
-                }
+            if !metadata.is_symlink() {
+                current = next_logical;
                 continue;
             }
 
-            current = next_logical;
+            // A link is a hop: bounded above, and each hop makes progress by
+            // consuming one component, so the walk always terminates.
+            if hops == SYMLINK_HOPS_MAX || pending.len() > PENDING_COMPONENTS_MAX {
+                return Err(Error::SymlinkLoop {
+                    path: logical.to_path_buf(),
+                });
+            }
+            hops += 1;
+
+            let target = std::fs::read_link(&host).map_err(|e| io(&host, e))?;
+            links.push(SymlinkEntry {
+                logical: next_logical,
+                target: target.clone(),
+            });
+            if target.is_absolute() {
+                current = PathBuf::from("/");
+            }
+            pending.extend(components_reversed(&target));
         }
 
-        let host = self.host_path(&current);
-        let metadata = match std::fs::metadata(&host) {
-            Ok(metadata) => metadata,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io(&host, e)),
+        assert!(links.len() <= SYMLINK_HOPS_MAX);
+        self.describe(current, links)
+    }
+
+    /// Stat the destination a walk arrived at, without following any further.
+    fn describe(&self, logical: PathBuf, links: Vec<SymlinkEntry>) -> Result<Option<Resolved>> {
+        assert!(logical.is_absolute());
+
+        let host = self.host_path(&logical);
+        let Some(metadata) = metadata_optional(&host)? else {
+            return Ok(None);
         };
         let kind = if metadata.is_dir() {
             EntryKind::Directory
@@ -140,9 +147,8 @@ impl SourceRoot {
         } else {
             EntryKind::Other
         };
-
         Ok(Some(Resolved {
-            logical: current,
+            logical,
             host,
             links,
             kind,
@@ -151,6 +157,8 @@ impl SourceRoot {
 
     /// Read a file identified by a logical path.
     pub fn read(&self, logical: &Path) -> Result<Option<Vec<u8>>> {
+        assert!(logical.is_absolute());
+
         match self.resolve(logical)? {
             Some(resolved) if resolved.kind == EntryKind::File => Ok(Some(
                 std::fs::read(&resolved.host).map_err(|e| io(&resolved.host, e))?,
@@ -178,8 +186,43 @@ impl SourceRoot {
             let entry = entry.map_err(|e| io(&host, e))?;
             names.push(entry.file_name());
         }
+        // Directory order is whatever the filesystem feels like; sorted order
+        // is what makes two runs on the same tree produce the same bundle.
         names.sort();
+        assert!(names.is_sorted());
         Ok(names)
+    }
+}
+
+/// Path components in pop order, i.e. reversed, with `..` kept as a component
+/// so that the walk resolves it against what it has already traversed.
+fn components_reversed(path: &Path) -> Vec<std::ffi::OsString> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part.to_os_string()),
+            Component::ParentDir => Some(std::ffi::OsString::from("..")),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+        })
+        .rev()
+        .collect()
+}
+
+/// `None` means "not there", which is an ordinary outcome when probing search
+/// directories; any other `io::Error` is a real failure and is propagated.
+fn symlink_metadata_optional(host: &Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(host) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io(host, e)),
+    }
+}
+
+/// As [`symlink_metadata_optional`], but following a final symlink.
+fn metadata_optional(host: &Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::metadata(host) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io(host, e)),
     }
 }
 
@@ -198,6 +241,7 @@ impl ElfCache {
     /// object", which is a normal outcome when probing search directories.
     pub fn get(&mut self, host: &Path) -> Result<Option<ElfMetadata>> {
         if let Some(cached) = self.entries.get(host) {
+            assert!(cached.as_ref().is_none_or(|m| m.path == host));
             return Ok(cached.clone());
         }
         let parsed = match ElfMetadata::parse_file(host) {
@@ -205,6 +249,7 @@ impl ElfCache {
             Err(Error::NotElf { .. }) | Err(Error::Elf { .. }) => None,
             Err(e) => return Err(e),
         };
+        assert!(parsed.as_ref().is_none_or(|m| m.path == host));
         self.entries.insert(host.to_path_buf(), parsed.clone());
         Ok(parsed)
     }

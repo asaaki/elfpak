@@ -27,6 +27,12 @@ const OLD_ENTRY_LEN: usize = 12;
 const NEW_HEADER_LEN: usize = 48;
 const NEW_ENTRY_LEN: usize = 24;
 
+/// Upper bound on the entries taken from a cache image.
+///
+/// A distribution cache holds a few thousand libraries. The bound is on what is
+/// read, not on what exists: `nlibs` comes out of the file and is never trusted.
+const CACHE_ENTRIES_MAX: usize = 65_536;
+
 #[derive(Debug, Clone, Default)]
 pub struct LdCache {
     /// soname -> candidate absolute paths, in cache order.
@@ -60,8 +66,17 @@ impl LdCache {
             Vec::new()
         };
 
+        assert!(pairs.len() <= CACHE_ENTRIES_MAX);
+
         cache.len = pairs.len();
         for (soname, path) in pairs {
+            // ldconfig only ever records absolute paths. A relative one would
+            // be interpreted against the working directory further downstream,
+            // which is exactly the kind of ambient state a packaging tool must
+            // not depend on.
+            if !path.is_absolute() {
+                continue;
+            }
             let list = cache.entries.entry(soname).or_default();
             if !list.contains(&path) {
                 list.push(path);
@@ -81,7 +96,9 @@ impl LdCache {
     }
 
     pub fn lookup(&self, soname: &str) -> &[PathBuf] {
-        self.entries.get(soname).map(Vec::as_slice).unwrap_or(&[])
+        let candidates = self.entries.get(soname).map(Vec::as_slice).unwrap_or(&[]);
+        assert!(candidates.iter().all(|p| p.is_absolute()));
+        candidates
     }
 
     pub fn entry_count(&self) -> usize {
@@ -126,9 +143,13 @@ fn entry_capacity(bytes: &[u8], base: usize, header: usize, entry: usize) -> usi
         .saturating_div(entry)
 }
 
+/// `struct cache_file`: a header followed by `nlibs` fixed-size entries whose
+/// string offsets are relative to the start of the image.
 fn parse_old(bytes: &[u8], nlibs: usize) -> Vec<(String, PathBuf)> {
-    let mut out = Vec::with_capacity(nlibs.min(entry_capacity(bytes, 0, OLD_HEADER_LEN, OLD_ENTRY_LEN)));
-    for index in 0..nlibs {
+    let capacity = entry_capacity(bytes, 0, OLD_HEADER_LEN, OLD_ENTRY_LEN);
+    let count = nlibs.min(capacity).min(CACHE_ENTRIES_MAX);
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
         let Some(offset) = index
             .checked_mul(OLD_ENTRY_LEN)
             .and_then(|at| at.checked_add(OLD_HEADER_LEN))
@@ -156,9 +177,10 @@ fn parse_new(bytes: &[u8], base: usize) -> Vec<(String, PathBuf)> {
         Some(n) => n as usize,
         None => return Vec::new(),
     };
-    let mut out =
-        Vec::with_capacity(nlibs.min(entry_capacity(bytes, base, NEW_HEADER_LEN, NEW_ENTRY_LEN)));
-    for index in 0..nlibs {
+    let capacity = entry_capacity(bytes, base, NEW_HEADER_LEN, NEW_ENTRY_LEN);
+    let count = nlibs.min(capacity).min(CACHE_ENTRIES_MAX);
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
         let Some(offset) = base
             .checked_add(NEW_HEADER_LEN)
             .and_then(|start| index.checked_mul(NEW_ENTRY_LEN)?.checked_add(start))
@@ -207,29 +229,24 @@ fn entry_flags(architecture: &Architecture) -> Option<i32> {
 /// architecture it is running on.
 const FLAGS_ENDIAN_LITTLE: u8 = 2;
 
-/// Build a `glibc-ld.so.cache1.1` image for `entries`.
+/// The string table of a cache image, and the `(soname, path)` offset pair each
+/// entry record points at.
+struct StringTable {
+    bytes: Vec<u8>,
+    offsets: Vec<(u32, u32)>,
+}
+
+/// Encode the strings of `entries`. Offsets are absolute within the image,
+/// hence `base`.
 ///
-/// Returns `None` for a target this function cannot encode faithfully, so the
-/// caller can fall back to reporting the problem instead of writing a cache the
-/// loader would reject.
-pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<u8>> {
-    let flags = entry_flags(architecture)?;
-    if architecture.endianness != Endianness::Little {
-        return None;
-    }
-
-    let mut entries: Vec<&CacheEntry> = entries.iter().collect();
-    // glibc looks entries up with a binary search that walks *down* the table,
-    // so it has to be sorted in descending `_dl_cache_libcmp` order. Ascending
-    // order parses fine and then fails to resolve. The path breaks ties, purely
-    // so that the same plan always produces the same bytes.
-    entries.sort_by(|a, b| libcmp(&b.soname, &a.soname).then_with(|| a.path.cmp(&b.path)));
-    entries.dedup_by(|a, b| a.soname == b.soname && a.path == b.path);
-
+/// `None` for anything that cannot be encoded faithfully: a path that is not
+/// UTF-8, a NUL that would truncate a string, or an image too large to address
+/// with the `u32` offsets the format uses.
+fn encode_strings(entries: &[&CacheEntry], base: usize) -> Option<StringTable> {
     let mut strings: Vec<u8> = Vec::new();
     let mut offsets: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
-    let base = NEW_HEADER_LEN + entries.len() * NEW_ENTRY_LEN;
-    for entry in &entries {
+
+    for entry in entries {
         // A NUL in either string would truncate it; such a name cannot come
         // from an ELF string table, but the file names could in principle.
         let path = entry.path.to_str()?;
@@ -242,8 +259,50 @@ pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<
         let value = u32::try_from(base + strings.len()).ok()?;
         strings.extend_from_slice(path.as_bytes());
         strings.push(0);
+        assert!(key < value, "the soname precedes the path it names");
         offsets.push((key, value));
     }
+    Some(StringTable {
+        bytes: strings,
+        offsets,
+    })
+}
+
+/// Build a `glibc-ld.so.cache1.1` image for `entries`.
+///
+/// Returns `None` for a target this function cannot encode faithfully, so the
+/// caller can fall back to reporting the problem instead of writing a cache the
+/// loader would reject.
+pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<u8>> {
+    assert!(entries.iter().all(|e| e.path.is_absolute()));
+
+    let flags = entry_flags(architecture)?;
+    if architecture.endianness != Endianness::Little {
+        // The header records one byte order and glibc refuses a cache that
+        // disagrees with the architecture reading it.
+        return None;
+    }
+
+    let mut entries: Vec<&CacheEntry> = entries.iter().collect();
+    // glibc looks entries up with a binary search that walks *down* the table,
+    // so it has to be sorted in descending `_dl_cache_libcmp` order. Ascending
+    // order parses fine and then fails to resolve. The path breaks ties, purely
+    // so that the same plan always produces the same bytes.
+    entries.sort_by(|a, b| libcmp(&b.soname, &a.soname).then_with(|| a.path.cmp(&b.path)));
+    entries.dedup_by(|a, b| a.soname == b.soname && a.path == b.path);
+    assert!(
+        entries
+            .windows(2)
+            .all(|pair| libcmp(&pair[0].soname, &pair[1].soname) != Ordering::Less),
+        "the loader binary-searches downwards and needs descending order"
+    );
+
+    let base = NEW_HEADER_LEN + entries.len() * NEW_ENTRY_LEN;
+    let StringTable {
+        bytes: strings,
+        offsets,
+    } = encode_strings(&entries, base)?;
+    assert_eq!(offsets.len(), entries.len());
 
     let mut out = Vec::with_capacity(base + strings.len());
     out.extend_from_slice(NEW_MAGIC);
@@ -254,7 +313,7 @@ pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<
     out.extend_from_slice(&[0, 0, 0]); // `padding_unsed` (sic), reserved
     out.extend_from_slice(&0u32.to_le_bytes()); // extension_offset: none
     out.extend_from_slice(&[0u8; 12]); // `unused`, reserved
-    debug_assert_eq!(out.len(), NEW_HEADER_LEN);
+    assert_eq!(out.len(), NEW_HEADER_LEN);
 
     for (key, value) in offsets {
         out.extend_from_slice(&flags.to_le_bytes());
@@ -263,7 +322,20 @@ pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<
         out.extend_from_slice(&0u32.to_le_bytes()); // osversion, unused
         out.extend_from_slice(&0u64.to_le_bytes()); // hwcap: none required
     }
+    assert_eq!(out.len(), base);
     out.extend_from_slice(&strings);
+    assert_eq!(out.len(), base + strings.len());
+
+    // Pair assertion: what was just written is read back with the same reader
+    // the loader's format is modelled on. A cache the bundle cannot use is
+    // worse than no cache, because it looks like the problem was solved.
+    let written = LdCache::parse(&out);
+    assert_eq!(written.entry_count(), entries.len());
+    assert!(
+        entries
+            .iter()
+            .all(|entry| written.lookup(&entry.soname).contains(&entry.path))
+    );
     Some(out)
 }
 
@@ -286,12 +358,16 @@ fn libcmp(left: &str, right: &str) -> Ordering {
             }
             let mut v1 = 0u64;
             while at(p1, i).is_ascii_digit() {
-                v1 = v1.saturating_mul(10).saturating_add((at(p1, i) - b'0') as u64);
+                v1 = v1
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(at(p1, i) - b'0'));
                 i += 1;
             }
             let mut v2 = 0u64;
             while at(p2, j).is_ascii_digit() {
-                v2 = v2.saturating_mul(10).saturating_add((at(p2, j) - b'0') as u64);
+                v2 = v2
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(at(p2, j) - b'0'));
                 j += 1;
             }
             if v1 != v2 {
@@ -313,15 +389,21 @@ fn libcmp(left: &str, right: &str) -> Ordering {
 mod tests {
     use super::*;
 
+    /// Offsets in the cache format are `u32`; a fixture that did not fit would
+    /// be a broken fixture, not a truncated one.
+    fn offset(value: usize) -> u32 {
+        u32::try_from(value).expect("fixture offsets fit in u32")
+    }
+
     /// Build a `glibc-ld.so.cache1.1` image with the given (soname, path) pairs.
     fn new_format(entries: &[(&str, &str)]) -> Vec<u8> {
         let mut strings = Vec::new();
         let mut offsets = Vec::new();
         for (soname, path) in entries {
-            let key = strings.len() as u32;
+            let key = offset(strings.len());
             strings.extend_from_slice(soname.as_bytes());
             strings.push(0);
-            let value = strings.len() as u32;
+            let value = offset(strings.len());
             strings.extend_from_slice(path.as_bytes());
             strings.push(0);
             offsets.push((key, value));
@@ -331,8 +413,8 @@ mod tests {
         let mut out = Vec::new();
         out.extend_from_slice(NEW_MAGIC);
         out.extend_from_slice(NEW_VERSION);
-        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        out.extend_from_slice(&offset(entries.len()).to_le_bytes());
+        out.extend_from_slice(&offset(strings.len()).to_le_bytes());
         out.push(0);
         out.extend_from_slice(&[0, 0, 0]);
         out.extend_from_slice(&0u32.to_le_bytes());
@@ -341,8 +423,8 @@ mod tests {
 
         for (key, value) in &offsets {
             out.extend_from_slice(&0x0300_0003u32.to_le_bytes());
-            out.extend_from_slice(&(key + header_len as u32).to_le_bytes());
-            out.extend_from_slice(&(value + header_len as u32).to_le_bytes());
+            out.extend_from_slice(&(key + offset(header_len)).to_le_bytes());
+            out.extend_from_slice(&(value + offset(header_len)).to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
             out.extend_from_slice(&0u64.to_le_bytes());
         }
@@ -372,7 +454,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(OLD_MAGIC);
         bytes.push(0); // padding to the u32 boundary
-        bytes.extend_from_slice(&(nlibs as u32).to_le_bytes());
+        bytes.extend_from_slice(&offset(nlibs).to_le_bytes());
         // One old entry pointing at strings we never read.
         bytes.extend_from_slice(&[0u8; OLD_ENTRY_LEN]);
         while bytes.len() < align8(OLD_HEADER_LEN + nlibs * OLD_ENTRY_LEN) {
@@ -438,7 +520,10 @@ mod tests {
         assert_eq!(nlibs, 2);
         assert_eq!(flags, FLAGS_ENDIAN_LITTLE, "glibc checks the byte order");
         assert_eq!(extension_offset, 0, "no extension section is written");
-        assert_eq!(bytes.len(), NEW_HEADER_LEN + 2 * NEW_ENTRY_LEN + len_strings as usize);
+        assert_eq!(
+            bytes.len(),
+            NEW_HEADER_LEN + 2 * NEW_ENTRY_LEN + len_strings as usize
+        );
 
         let cache = LdCache::parse(&bytes);
         assert_eq!(cache.entry_count(), 2);
@@ -534,7 +619,10 @@ mod tests {
     /// bound that can be trusted for allocation.
     #[test]
     fn an_absurd_entry_count_allocates_nothing() {
-        assert_eq!(entry_capacity(&[0u8; 48], 0, NEW_HEADER_LEN, NEW_ENTRY_LEN), 0);
+        assert_eq!(
+            entry_capacity(&[0u8; 48], 0, NEW_HEADER_LEN, NEW_ENTRY_LEN),
+            0
+        );
         assert_eq!(
             entry_capacity(&[0u8; 48 + 24], 0, NEW_HEADER_LEN, NEW_ENTRY_LEN),
             1
@@ -545,7 +633,11 @@ mod tests {
         bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
         let cache = LdCache::parse(&bytes);
         assert_eq!(cache.lookup("libc.so.6"), [PathBuf::from("/lib/libc.so.6")]);
-        assert_eq!(cache.entry_count(), 1, "parsing stops at the end of the file");
+        assert_eq!(
+            cache.entry_count(),
+            1,
+            "parsing stops at the end of the file"
+        );
     }
 
     #[test]

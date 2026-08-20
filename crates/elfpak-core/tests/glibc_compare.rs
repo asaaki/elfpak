@@ -157,6 +157,74 @@ fn can_bind_mount() -> bool {
 
 /// The one test that proves the point: a cache `elfpak` generated is read by
 /// the real glibc loader, not merely by `elfpak`'s own parser.
+/// Compile `libhidden.so.1` into `directory` and return its path. Nothing about
+/// the library matters except that it is real and that it says where it is.
+fn build_hidden_library(tmp: &Path, directory: &Path) -> PathBuf {
+    let source = tmp.join("hidden.c");
+    std::fs::write(&source, "int hidden_value(void) { return 42; }\n").unwrap();
+
+    let library = directory.join("libhidden.so.1");
+    cc(&[
+        "-shared",
+        "-fPIC",
+        "-Wl,-soname,libhidden.so.1",
+        "-o",
+        library.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    library
+}
+
+/// Compile a program that prints `value=42` if — and only if — it managed to
+/// load `library` at runtime.
+fn build_hidden_program(tmp: &Path, library: &Path) -> PathBuf {
+    let main = tmp.join("main.c");
+    std::fs::write(
+        &main,
+        "#include <stdio.h>\nint hidden_value(void);\n\
+         int main(void) { printf(\"value=%d\\n\", hidden_value()); return 0; }\n",
+    )
+    .unwrap();
+
+    let program = tmp.join("app");
+    cc(&[
+        "-o",
+        program.to_str().unwrap(),
+        main.to_str().unwrap(),
+        library.to_str().unwrap(),
+        &format!("-Wl,-rpath-link,{}", library.parent().unwrap().display()),
+    ]);
+    program
+}
+
+/// The real entry, surrounded by decoys on both sides of it in sort order.
+///
+/// With a single entry the loader's binary search finds it whatever order the
+/// table is in, so a table sorted the wrong way round would still pass.
+fn cache_entries_with_decoys(library: &Path) -> Vec<elfpak_core::resolver::cache::CacheEntry> {
+    use elfpak_core::resolver::cache::CacheEntry;
+
+    let mut entries: Vec<CacheEntry> = [
+        "libaaa.so.1",
+        "libccc.so.1",
+        "libmmm.so.1",
+        "libppp.so.1",
+        "libyyy.so.1",
+        "libzzz.so.1",
+    ]
+    .iter()
+    .map(|soname| CacheEntry {
+        soname: (*soname).to_string(),
+        path: PathBuf::from("/nonexistent").join(soname),
+    })
+    .collect();
+    entries.push(CacheEntry {
+        soname: "libhidden.so.1".to_string(),
+        path: library.to_path_buf(),
+    });
+    entries
+}
+
 ///
 /// A library is placed somewhere the loader does not search, so the program
 /// cannot start; the generated cache is then bind-mounted over
@@ -171,33 +239,8 @@ fn glibc_loads_a_library_through_a_generated_cache() {
     let hidden = tmp.path().join("hidden");
     std::fs::create_dir_all(&hidden).unwrap();
 
-    let source = tmp.path().join("hidden.c");
-    std::fs::write(&source, "int hidden_value(void) { return 42; }\n").unwrap();
-    let library = hidden.join("libhidden.so.1");
-    cc(&[
-        "-shared",
-        "-fPIC",
-        "-Wl,-soname,libhidden.so.1",
-        "-o",
-        library.to_str().unwrap(),
-        source.to_str().unwrap(),
-    ]);
-
-    let main = tmp.path().join("main.c");
-    std::fs::write(
-        &main,
-        "#include <stdio.h>\nint hidden_value(void);\n\
-         int main(void) { printf(\"value=%d\\n\", hidden_value()); return 0; }\n",
-    )
-    .unwrap();
-    let program = tmp.path().join("app");
-    cc(&[
-        "-o",
-        program.to_str().unwrap(),
-        main.to_str().unwrap(),
-        library.to_str().unwrap(),
-        &format!("-Wl,-rpath-link,{}", hidden.display()),
-    ]);
+    let library = build_hidden_library(tmp.path(), &hidden);
+    let program = build_hidden_program(tmp.path(), &library);
 
     // Without help, the loader cannot find the library at all.
     let bare = std::process::Command::new(&program).output().unwrap();
@@ -207,27 +250,7 @@ fn glibc_loads_a_library_through_a_generated_cache() {
     );
 
     let architecture = ElfMetadata::parse_file(&program).unwrap().architecture;
-    // Decoys on both sides of the real entry: with a single entry the loader's
-    // binary search finds it whatever order the table is in, so a table that is
-    // sorted the wrong way round would still pass.
-    let mut entries: Vec<elfpak_core::resolver::cache::CacheEntry> = [
-        "libaaa.so.1",
-        "libccc.so.1",
-        "libmmm.so.1",
-        "libppp.so.1",
-        "libyyy.so.1",
-        "libzzz.so.1",
-    ]
-    .iter()
-    .map(|soname| elfpak_core::resolver::cache::CacheEntry {
-        soname: (*soname).to_string(),
-        path: PathBuf::from("/nonexistent").join(soname),
-    })
-    .collect();
-    entries.push(elfpak_core::resolver::cache::CacheEntry {
-        soname: "libhidden.so.1".to_string(),
-        path: library.clone(),
-    });
+    let entries = cache_entries_with_decoys(&library);
 
     let Some(image) = elfpak_core::resolver::cache::build(&architecture, &entries) else {
         return; // an architecture the cache format cannot describe
@@ -323,34 +346,10 @@ fn a_bundled_rootfs_starts_from_a_directory_the_loader_never_searches() {
     let hidden = tmp.path().join("elsewhere/lib");
     std::fs::create_dir_all(&hidden).unwrap();
 
-    let source = tmp.path().join("hidden.c");
-    std::fs::write(&source, "int hidden_value(void) { return 42; }\n").unwrap();
-    cc(&[
-        "-shared",
-        "-fPIC",
-        "-Wl,-soname,libhidden.so.1",
-        "-o",
-        hidden.join("libhidden.so.1").to_str().unwrap(),
-        source.to_str().unwrap(),
-    ]);
+    let library = build_hidden_library(tmp.path(), &hidden);
+    let program = build_hidden_program(tmp.path(), &library);
 
-    let main = tmp.path().join("main.c");
-    std::fs::write(
-        &main,
-        "#include <stdio.h>\nint hidden_value(void);\n\
-         int main(void) { printf(\"value=%d\\n\", hidden_value()); return 0; }\n",
-    )
-    .unwrap();
-    let program = tmp.path().join("app");
-    cc(&[
-        "-o",
-        program.to_str().unwrap(),
-        main.to_str().unwrap(),
-        hidden.join("libhidden.so.1").to_str().unwrap(),
-        &format!("-Wl,-rpath-link,{}", hidden.display()),
-    ]);
-
-    let run = |rootfs: &std::path::Path| {
+    let run = |rootfs: &Path| {
         std::process::Command::new("unshare")
             .args(["-Urm", "sh", "-c"])
             .arg(format!("chroot {} /app/server", rootfs.display()))

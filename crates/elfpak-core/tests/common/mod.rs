@@ -3,6 +3,9 @@
 //! Everything is compiled with `-nostdlib` so the dependency graph contains
 //! exactly the objects the fixture declares, with no libc noise.
 
+// This module is compiled into each integration test binary, so items that
+// one test uses look unreachable from another. That is the pattern, not a bug.
+#![allow(unreachable_pub)]
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -143,7 +146,20 @@ impl Sysroot {
         std::os::unix::fs::symlink(target, path).unwrap();
     }
 
+    /// The whole fixture sysroot, in four phases: what can be linked against,
+    /// what links against it, what tells the loader where to look, and what is
+    /// there to be ignored.
     fn populate(&self) {
+        self.populate_libraries();
+        self.populate_executables();
+        self.populate_loader_config();
+        self.populate_decoys();
+        self.install_interpreter("/bin/app-default");
+    }
+
+    /// Shared objects, including ones deliberately placed where no default
+    /// search directory would find them.
+    fn populate_libraries(&self) {
         self.mkdir("/usr/lib");
         self.mkdir("/bin");
 
@@ -203,6 +219,20 @@ impl Sysroot {
             &[],
         );
 
+        // An NSS module: glibc dlopen()s these, so runtime policy adds them
+        // rather than DT_NEEDED. Nothing in the fixtures links against it.
+        self.dso(
+            "/usr/lib/libnss_files.so.2",
+            "libnss_files.so.2",
+            "int _nss_files_getpwnam_r(void) { return 0; }\n",
+            &[],
+        );
+    }
+
+    /// One executable per way of finding a library: the defaults, an inherited
+    /// `DT_RPATH`, a non-inherited `DT_RUNPATH`, `$ORIGIN`, `ld.so.conf`, the
+    /// cache — and one whose dependency is simply not there.
+    fn populate_executables(&self) {
         let main = "int top_value(void);\nvoid _start(void) { top_value(); }\n";
         self.exe("/bin/app-default", main, &["/usr/lib/libtop.so.1"], &[]);
 
@@ -244,16 +274,8 @@ impl Sysroot {
             &[],
         );
 
-        // An NSS module: glibc dlopen()s these, so runtime policy adds them
-        // rather than DT_NEEDED. Nothing in the fixtures links against it.
-        self.dso(
-            "/usr/lib/libnss_files.so.2",
-            "libnss_files.so.2",
-            "int _nss_files_getpwnam_r(void) { return 0; }\n",
-            &[],
-        );
-
-        // A dependency that is simply not there.
+        // A dependency that is simply not there: the binary is linked against a
+        // real library, then its DT_NEEDED is patched to name a missing one.
         let missing_main = "int base_value(void);\nvoid _start(void) { base_value(); }\n";
         self.exe(
             "/bin/app-missing",
@@ -266,7 +288,11 @@ impl Sysroot {
             "libbase.so.1",
             "libgone.so.9",
         );
+    }
 
+    /// What tells the loader where to look: `ld.so.conf`, its fragments, and a
+    /// real `ld.so.cache` written without ever running `ldconfig`.
+    fn populate_loader_config(&self) {
         self.write("/etc/ld.so.conf", "include /etc/ld.so.conf.d/*.conf\n");
         self.write(
             "/etc/ld.so.conf.d/local.conf",
@@ -277,15 +303,17 @@ impl Sysroot {
             ld_cache(&[("libcached.so.1", "/opt/cached/libcached.so.1")]),
         )
         .unwrap();
+    }
 
+    /// Things that must never be mistaken for a library, and the merged-`/usr`
+    /// symlink every mainstream distribution now has.
+    fn populate_decoys(&self) {
         // A file that merely has the right name must never satisfy a lookup.
         self.mkdir("/opt/decoy");
         self.write("/opt/decoy/libbase.so.1", "this is not an ELF object\n");
 
         // /lib is a symlink to usr/lib, like on a merged-/usr distribution.
         self.symlink("usr/lib", "/lib");
-
-        self.install_interpreter("/bin/app-default");
     }
 
     /// Copy the host's dynamic loader to the PT_INTERP path the fixtures declare.
@@ -318,6 +346,12 @@ fn patch_needed(path: &Path, from: &str, to: &str) {
 }
 
 /// Minimal `glibc-ld.so.cache1.1` image.
+/// Offsets in the cache format are `u32`; a fixture that did not fit would be
+/// a broken fixture, not a truncated one.
+fn offset(value: usize) -> u32 {
+    u32::try_from(value).expect("fixture offsets fit in u32")
+}
+
 pub fn ld_cache(entries: &[(&str, &str)]) -> Vec<u8> {
     const HEADER: usize = 48;
     const ENTRY: usize = 24;
@@ -325,21 +359,21 @@ pub fn ld_cache(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut strings = Vec::new();
     let mut offsets = Vec::new();
     for (soname, path) in entries {
-        let key = strings.len() as u32;
+        let key = offset(strings.len());
         strings.extend_from_slice(soname.as_bytes());
         strings.push(0);
-        let value = strings.len() as u32;
+        let value = offset(strings.len());
         strings.extend_from_slice(path.as_bytes());
         strings.push(0);
         offsets.push((key, value));
     }
-    let base = (HEADER + entries.len() * ENTRY) as u32;
+    let base = offset(HEADER + entries.len() * ENTRY);
 
     let mut out = Vec::new();
     out.extend_from_slice(b"glibc-ld.so.cache");
     out.extend_from_slice(b"1.1");
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    out.extend_from_slice(&offset(entries.len()).to_le_bytes());
+    out.extend_from_slice(&offset(strings.len()).to_le_bytes());
     out.push(0);
     out.extend_from_slice(&[0, 0, 0]);
     out.extend_from_slice(&0u32.to_le_bytes());
@@ -417,19 +451,24 @@ impl HostFixtures {
 
     fn populate(&self) {
         let lib = self.dir.join("lib");
-        let hidden = self.dir.join("hidden");
         let bin = self.dir.join("bin");
-        for dir in [&lib, &hidden, &bin] {
+        let src = self.dir.join("src");
+        for dir in [&lib, &bin, &src, &self.dir.join("hidden")] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let src = self.dir.join("src");
-        std::fs::create_dir_all(&src).unwrap();
+        self.populate_libraries(&lib, &src);
+        self.populate_executables(&lib, &bin, &src);
+    }
 
-        let write = |name: &str, body: &str| {
-            let path = src.join(name);
-            std::fs::write(&path, body).unwrap();
-            path
-        };
+    /// Write a C source file and return its path.
+    fn source(src: &Path, name: &str, body: &str) -> PathBuf {
+        let path = src.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn populate_libraries(&self, lib: &Path, src: &Path) {
+        let write = |name: &str, body: &str| Self::source(src, name, body);
 
         // A leaf library reached through a soname symlink.
         cc(&[
@@ -463,6 +502,10 @@ impl HostFixtures {
             lib.join("libbase.so.1").to_str().unwrap(),
             &format!("-Wl,-rpath-link,{}", lib.display()),
         ]);
+    }
+
+    fn populate_executables(&self, lib: &Path, bin: &Path, src: &Path) {
+        let write = |name: &str, body: &str| Self::source(src, name, body);
 
         let main = write(
             "app.c",

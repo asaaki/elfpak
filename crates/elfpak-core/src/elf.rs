@@ -164,6 +164,9 @@ pub struct ElfMetadata {
     pub size: u64,
 }
 
+/// `EI_MAG0..EI_MAG3`, the four bytes every ELF object starts with.
+const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+
 const DF_ORIGIN: u64 = 0x1;
 const DF_1_NODEFLIB: u64 = 0x0000_0800;
 const DF_1_ORIGIN: u64 = 0x0000_0080;
@@ -173,81 +176,55 @@ const DLOPEN_SYMBOLS: &[&str] = &["dlopen", "dlmopen", "__libc_dlopen_mode"];
 impl ElfMetadata {
     pub fn parse_file(path: &Path) -> Result<ElfMetadata> {
         let bytes = std::fs::read(path).map_err(|e| io(path, e))?;
-        Self::parse_bytes(path, &bytes)
+        let metadata = Self::parse_bytes(path, &bytes)?;
+        assert_eq!(metadata.path, path);
+        assert_eq!(metadata.size, bytes.len() as u64);
+        Ok(metadata)
     }
 
     /// Cheap check used to decide whether a candidate file is worth parsing.
     pub fn looks_like_elf(bytes: &[u8]) -> bool {
-        bytes.len() >= 4 && &bytes[..4] == b"\x7fELF"
+        bytes.len() >= ELF_MAGIC.len() && &bytes[..ELF_MAGIC.len()] == ELF_MAGIC
     }
 
+    /// The domain model of an ELF object. Every `goblin` type stops here.
     pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ElfMetadata> {
         if !Self::looks_like_elf(bytes) {
             return Err(Error::NotElf {
                 path: path.to_path_buf(),
             });
         }
+
         let elf = goblin::elf::Elf::parse(bytes).map_err(|e| Error::Elf {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
 
-        let class = if elf.is_64 {
-            ElfClass::Elf64
-        } else {
-            ElfClass::Elf32
-        };
-        let endianness = if elf.little_endian {
-            Endianness::Little
-        } else {
-            Endianness::Big
-        };
-        let architecture = Architecture {
-            machine: Machine::from_e_machine(elf.header.e_machine),
-            class,
-            endianness,
-        };
-
-        let object_type = match elf.header.e_type {
-            goblin::elf::header::ET_EXEC => ObjectType::Executable,
-            goblin::elf::header::ET_DYN => ObjectType::SharedObject,
-            goblin::elf::header::ET_REL => ObjectType::Relocatable,
-            goblin::elf::header::ET_CORE => ObjectType::Core,
-            other => ObjectType::Other(other),
-        };
-
         let (flags, flags_1) = match &elf.dynamic {
             Some(dynamic) => (dynamic.info.flags, dynamic.info.flags_1),
             None => (0, 0),
         };
-
-        let mut dlopen_references = Vec::new();
-        for sym in elf.dynsyms.iter() {
-            // Only undefined symbols are calls *out* of this object.
-            if let Some(name) = elf.dynstrtab.get_at(sym.st_name)
-                && sym.st_shndx == 0
-                && DLOPEN_SYMBOLS.contains(&name)
-            {
-                dlopen_references.push(name.to_string());
-            }
-        }
-        dlopen_references.sort_unstable();
-        dlopen_references.dedup();
+        let rpath: Vec<String> = elf.rpaths.iter().flat_map(|s| split_paths(s)).collect();
+        let runpath: Vec<String> = elf.runpaths.iter().flat_map(|s| split_paths(s)).collect();
+        // Search path lists are consulted entry by entry, so an empty entry
+        // would silently mean "the current directory" further downstream.
+        assert!(!rpath.iter().any(String::is_empty));
+        assert!(!runpath.iter().any(String::is_empty));
 
         Ok(ElfMetadata {
             path: path.to_path_buf(),
-            architecture,
+            architecture: architecture_of(&elf),
             e_machine: elf.header.e_machine,
-            object_type,
+            object_type: object_type_of(elf.header.e_type),
             interpreter: elf.interpreter.map(PathBuf::from),
             needed: elf.libraries.iter().map(|s| s.to_string()).collect(),
             soname: elf.soname.map(|s| s.to_string()),
-            rpath: elf.rpaths.iter().flat_map(|s| split_paths(s)).collect(),
-            runpath: elf.runpaths.iter().flat_map(|s| split_paths(s)).collect(),
+            rpath,
+            runpath,
             nodeflib: flags_1 & DF_1_NODEFLIB != 0,
             origin_flag: flags & DF_ORIGIN != 0 || flags_1 & DF_1_ORIGIN != 0,
             is_dynamic: elf.dynamic.is_some(),
-            dlopen_references,
+            dlopen_references: dlopen_references(&elf),
             size: bytes.len() as u64,
         })
     }
@@ -259,13 +236,68 @@ impl ElfMetadata {
     }
 }
 
+/// Machine, class and endianness: what decides whether two objects can share a
+/// process image.
+fn architecture_of(elf: &goblin::elf::Elf<'_>) -> Architecture {
+    Architecture {
+        machine: Machine::from_e_machine(elf.header.e_machine),
+        class: if elf.is_64 {
+            ElfClass::Elf64
+        } else {
+            ElfClass::Elf32
+        },
+        endianness: if elf.little_endian {
+            Endianness::Little
+        } else {
+            Endianness::Big
+        },
+    }
+}
+
+fn object_type_of(e_type: u16) -> ObjectType {
+    match e_type {
+        goblin::elf::header::ET_EXEC => ObjectType::Executable,
+        goblin::elf::header::ET_DYN => ObjectType::SharedObject,
+        goblin::elf::header::ET_REL => ObjectType::Relocatable,
+        goblin::elf::header::ET_CORE => ObjectType::Core,
+        other => ObjectType::Other(other),
+    }
+}
+
+/// Undefined `dlopen`-family symbols, i.e. calls *out* of this object. A
+/// defined one would be the implementation, which says nothing about what the
+/// object loads at runtime.
+fn dlopen_references(elf: &goblin::elf::Elf<'_>) -> Vec<String> {
+    let mut found = Vec::new();
+    for sym in elf.dynsyms.iter() {
+        if let Some(name) = elf.dynstrtab.get_at(sym.st_name)
+            && sym.st_shndx == 0
+            && DLOPEN_SYMBOLS.contains(&name)
+        {
+            found.push(name.to_string());
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    assert!(found.len() <= DLOPEN_SYMBOLS.len());
+    assert!(found.is_sorted());
+    found
+}
+
 /// `DT_RPATH`/`DT_RUNPATH`/`LD_LIBRARY_PATH` are colon separated lists.
+///
+/// Empty entries are dropped rather than kept: to the loader an empty entry
+/// means the current working directory, which a packaging tool must never
+/// search — the answer would depend on where `elfpak` was invoked from.
 pub fn split_paths(value: &str) -> Vec<String> {
-    value
+    let parts: Vec<String> = value
         .split(':')
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+        .map(str::to_string)
+        .collect();
+    assert!(parts.len() <= value.len() + 1);
+    assert!(!parts.iter().any(String::is_empty));
+    parts
 }
 
 #[cfg(test)]

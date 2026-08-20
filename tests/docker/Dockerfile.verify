@@ -1,0 +1,123 @@
+# syntax=docker/dockerfile:1
+
+# Verification smoke test: `elfpak verify` as a build gate.
+#
+# A bundle is built in one stage, checked against its manifest in a middle
+# stage, and only then copied into the image. If verification fails the build
+# fails, which is how a pipeline is meant to use it — the rootfs that ships is
+# the rootfs that was verified, and there is no step in between.
+#
+# The middle stage checks both spaces: the bundle it was given must verify, and
+# every way a bundle can drift — changed bytes, changed permissions, an added
+# file, a removed file, a redirected symlink — must be rejected. `--strict` is
+# what separates "nothing recorded has changed" from "nothing has changed at
+# all", so the cases that only `--strict` catches are checked both ways.
+#
+# Build with `--build-arg ELFPAK_TAMPER=1` to corrupt the rootfs before it is
+# verified: that build must fail, which is what proves the gate is load-bearing.
+
+# Base images are pinned by tag *and* digest so a build is reproducible and the
+# toolchain never moves under us. Refresh a digest with:
+#   docker buildx imagetools inspect <tag> --format '{{.Manifest.Digest}}'
+ARG ELFPAK_IMAGE=elfpak:local
+ARG DEBIAN_IMAGE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+
+FROM ${ELFPAK_IMAGE} AS elfpak
+
+# `/bin/ls` rather than a compiled fixture: this test is about the manifest, and
+# the distribution's own binary is a closure someone else decided the shape of.
+FROM ${DEBIAN_IMAGE} AS build
+
+COPY --from=elfpak /elfpak /usr/local/bin/elfpak
+
+RUN elfpak bundle /bin/ls \
+    --output /rootfs \
+    --install /app/ls \
+    --manifest /elfpak-manifest.json \
+    --tmp --passwd-group --nsswitch \
+    --user 65532:65532 \
+    -v
+
+FROM ${DEBIAN_IMAGE} AS verify
+
+COPY --from=elfpak /elfpak /usr/local/bin/elfpak
+COPY --from=build /rootfs /rootfs
+COPY --from=build /elfpak-manifest.json /elfpak-manifest.json
+
+ARG ELFPAK_TAMPER=
+
+RUN <<'SHELL'
+set -eu
+
+manifest=/elfpak-manifest.json
+
+# Fails the build unless `elfpak verify` rejects $1, and rejects it as a
+# verification failure rather than for some unrelated reason.
+expect_rejected() {
+    tree="$1"
+    what="$2"
+    shift 2
+    if elfpak verify "$manifest" --rootfs "$tree" "$@" >/tmp/verify.log 2>&1; then
+        echo "FAIL: $what went undetected" >&2
+        cat /tmp/verify.log >&2
+        exit 1
+    fi
+    if ! grep -q 'error\[E5001\]' /tmp/verify.log; then
+        echo "FAIL: $what was rejected, but not as a verification failure" >&2
+        cat /tmp/verify.log >&2
+        exit 1
+    fi
+    echo "  ok: $what is detected"
+}
+
+if [ -n "${ELFPAK_TAMPER:-}" ]; then
+    # ELFPAK_TAMPER exists to prove that this stage can fail a build.
+    printf 'x' >> /rootfs/app/ls
+fi
+
+# The manifest records where the rootfs was written, so the happy path needs no
+# --rootfs at all: it checks the tree the manifest itself names.
+elfpak verify "$manifest" --strict
+echo "  ok: the bundle still verifies after being copied between build stages"
+
+cp -a /rootfs /changed
+printf 'x' >> /changed/app/ls
+expect_rejected /changed "a changed file"
+
+cp -a /rootfs /added
+: > /added/app/stowaway
+elfpak verify "$manifest" --rootfs /added
+echo "  ok: an added file changes nothing that was recorded"
+expect_rejected /added "a file the manifest does not list" --strict
+
+cp -a /rootfs /remoded
+chmod 0777 /remoded/app/ls
+elfpak verify "$manifest" --rootfs /remoded
+echo "  ok: a mode change leaves every digest intact"
+expect_rejected /remoded "a changed mode" --strict
+
+cp -a /rootfs /removed
+rm /removed/app/ls
+expect_rejected /removed "a missing file"
+
+cp -a /rootfs /relinked
+link="$(find /relinked -type l | head -n 1)"
+if [ -n "$link" ]; then
+    ln -sfn "$(readlink "$link")-elsewhere" "$link"
+    expect_rejected /relinked "a symlink that points somewhere else"
+else
+    echo "  skip: this bundle contains no symlink to redirect"
+fi
+
+echo "  ok: every way a bundle can drift is rejected"
+SHELL
+
+# Only reachable if the stage above succeeded.
+FROM scratch
+
+COPY --from=verify /rootfs /
+
+USER 65532:65532
+WORKDIR /app
+
+ENTRYPOINT ["/app/ls"]

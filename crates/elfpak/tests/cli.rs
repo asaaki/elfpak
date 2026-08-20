@@ -156,7 +156,13 @@ fn config_file_supplies_defaults_and_cli_overrides_them() {
     std::fs::write(
         &config,
         format!(
-            "[package]\nbinary = \"{}\"\ninstall = \"/srv/app\"\noutput = \"{}\"\n\n[runtime]\npreset = \"minimal\"\n",
+            "[package]\n\
+             binary = \"{}\"\n\
+             install = \"/srv/app\"\n\
+             output = \"{}\"\n\
+             \n\
+             [runtime]\n\
+             preset = \"minimal\"\n",
             binary.display(),
             configured.display()
         ),

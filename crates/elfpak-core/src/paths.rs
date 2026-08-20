@@ -20,6 +20,8 @@ pub fn normalize_absolute(path: &Path) -> PathBuf {
             Component::Normal(part) => out.push(part),
         }
     }
+    assert!(out.is_absolute());
+    assert!(!out.components().any(|c| c == Component::ParentDir));
     out
 }
 
@@ -27,22 +29,34 @@ pub fn normalize_absolute(path: &Path) -> PathBuf {
 /// would land outside of it.
 pub fn join_under(base: &Path, logical: &Path) -> PathBuf {
     let normalized = normalize_absolute(logical);
-    match normalized.strip_prefix("/") {
+    let joined = match normalized.strip_prefix("/") {
         Ok(rel) if rel.as_os_str().is_empty() => base.to_path_buf(),
         Ok(rel) => base.join(rel),
+        // `normalize_absolute` always returns a path below `/`, so this arm is
+        // unreachable; falling back to the base keeps the write inside it.
         Err(_) => base.to_path_buf(),
-    }
+    };
+    // The whole point of this function: containment is a postcondition, not a
+    // hope. It is checked here, and again by the caller before it writes.
+    assert!(joined.starts_with(base));
+    joined
 }
 
 /// Absolute parent directory of a logical path (`/` for top-level entries).
 pub fn logical_parent(path: &Path) -> PathBuf {
-    path.parent()
+    assert!(path.is_absolute());
+    let parent = path
+        .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("/"))
+        .unwrap_or_else(|| PathBuf::from("/"));
+    assert!(parent.is_absolute());
+    parent
 }
 
 /// Every ancestor directory of a logical path, shallowest first, excluding `/`.
 pub fn ancestor_dirs(path: &Path) -> Vec<PathBuf> {
+    assert!(path.is_absolute());
+
     let mut dirs = Vec::new();
     let mut current = PathBuf::from("/");
     let parent = logical_parent(path);
@@ -52,6 +66,11 @@ pub fn ancestor_dirs(path: &Path) -> Vec<PathBuf> {
             dirs.push(current.clone());
         }
     }
+    // Shallowest first is what lets a caller create directories in list order.
+    if let Some(last) = dirs.last() {
+        assert_eq!(last, &parent);
+        assert!(dirs[0].parent() == Some(Path::new("/")));
+    }
     dirs
 }
 
@@ -59,9 +78,11 @@ pub fn ancestor_dirs(path: &Path) -> Vec<PathBuf> {
 pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        s.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((byte & 0xf) as u32, 16).unwrap());
+        // A nibble is always a valid hex digit, so neither `from_digit` can fail.
+        s.push(char::from_digit(u32::from(byte >> 4), 16).expect("a nibble is one hex digit"));
+        s.push(char::from_digit(u32::from(byte & 0xf), 16).expect("a nibble is one hex digit"));
     }
+    assert_eq!(s.len(), bytes.len() * 2);
     s
 }
 

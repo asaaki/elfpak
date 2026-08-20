@@ -1,10 +1,88 @@
 # syntax=docker/dockerfile:1
 
-# Tar smoke test: `ADD` extracts the archive elfpak produced, so the rootfs
-# never touches the build context as a directory.
+# Tar smoke test: the primary product UX, delivered as an archive instead of a
+# directory. The same Axum service as Dockerfile.axum is built and packaged, but
+# the scratch image is assembled by `ADD rootfs.tar /`, so what is exercised is
+# the tar backend and the archive a container build actually consumes.
+#
+# `ADD` extracts only from the build context — there is no `ADD --from` — which
+# is why this file is built twice, and why that is the point rather than a
+# workaround: a real pipeline produces the archive in one build and consumes it
+# in the next, exactly like `docker buildx build --output`.
+#
+#   docker buildx build --target archive --output type=local,dest=out -f ... .
+#   docker build --target runtime -f ... out
+#
+# The `build` stage below is deliberately identical to the one in
+# Dockerfile.axum, up to the point where the two differ, so the compiled
+# application is a layer-cache hit rather than a second compile.
 
-FROM scratch
+# Base images are pinned by tag *and* digest so a build is reproducible and the
+# toolchain never moves under us. Refresh a digest with:
+#   docker buildx imagetools inspect <tag> --format '{{.Manifest.Digest}}'
+ARG ELFPAK_IMAGE=elfpak:local
+ARG RUST_IMAGE=rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c
+
+FROM ${ELFPAK_IMAGE} AS elfpak
+
+FROM ${RUST_IMAGE} AS build
+
+WORKDIR /src
+
+COPY fixtures/axum-server/Cargo.toml fixtures/axum-server/Cargo.lock ./
+COPY fixtures/axum-server/src ./src
+
+# The target cache is keyed per architecture so the amd64 and arm64 builds do
+# not clobber each other (emulated rebuilds are expensive).
+ARG TARGETARCH
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target,id=axum-target-${TARGETARCH},sharing=locked \
+    cargo build --release --locked \
+    && cp target/release/axum-server /axum-server
+
+# Copied after the application build so that changing elfpak does not invalidate
+# it; under emulation that recompile is the most expensive step in the suite.
+COPY --from=elfpak /elfpak /usr/local/bin/elfpak
+
+ARG ELFPAK_PRESET=web
+
+# The manifest lands beside the archive, which is what `--tar` on its own means:
+# the record belongs next to the bundle, never inside it.
+RUN elfpak bundle /axum-server \
+    --tar /archive/rootfs.tar \
+    --install /app/server \
+    --preset "${ELFPAK_PRESET}" \
+    --user 65532:65532 \
+    -v
+
+# Determinism, asserted where it is cheapest to assert: the same binary, source
+# root and policy must produce byte-identical bytes, or `ADD` would rebuild a
+# different image from the same inputs.
+RUN elfpak bundle /axum-server \
+        --tar /tmp/again.tar \
+        --install /app/server \
+        --preset "${ELFPAK_PRESET}" \
+        --user 65532:65532 \
+        --no-manifest -q \
+    && cmp /archive/rootfs.tar /tmp/again.tar \
+    && rm /tmp/again.tar \
+    && echo "ok: the archive is byte-identical across runs"
+
+# Everything the next build needs, and nothing else: the archive and its
+# manifest, exported with `--output type=local`.
+FROM scratch AS archive
+
+COPY --from=build /archive/ /
+
+# Built with the exported directory as its context, so `rootfs.tar` is a plain
+# context file that `ADD` unpacks the way any Dockerfile would.
+FROM scratch AS runtime
 
 ADD rootfs.tar /
 
-ENTRYPOINT ["/app/ls"]
+USER 65532:65532
+WORKDIR /app
+EXPOSE 8080
+
+ENTRYPOINT ["/app/server"]

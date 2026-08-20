@@ -21,6 +21,7 @@ pub(crate) fn source_date_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Debug)]
 pub struct RootFsBuilder {
     output: PathBuf,
     clean: bool,
@@ -40,6 +41,8 @@ impl RootFsBuilder {
         self
     }
 
+    /// Materialize a plan. All control flow lives here; the helpers below each
+    /// write one kind of entry and nothing else.
     pub fn apply(&self, plan: &BundlePlan) -> Result<RootFsReport> {
         if self.clean && self.output.exists() {
             guard_clean(&self.output)?;
@@ -50,31 +53,22 @@ impl RootFsBuilder {
             .output
             .canonicalize()
             .map_err(|e| io(&self.output, e))?;
+        assert!(output.is_absolute());
 
         let mut report = RootFsReport::default();
         // Entries are sorted by destination, so parents always precede children.
         for file in &plan.files {
+            file.assert_well_formed();
             let target = self.target_path(&output, file)?;
+            assert!(target.starts_with(&output));
+
             match file.kind {
                 PlannedFileKind::Directory => {
-                    // Anything else occupying the path — including a symlink,
-                    // which a later write would silently follow — is replaced.
-                    let existing = std::fs::symlink_metadata(&target).ok();
-                    if !existing.is_some_and(|metadata| metadata.is_dir()) {
-                        remove_existing(&target)?;
-                        std::fs::create_dir_all(&target).map_err(|e| io(&target, e))?;
-                    }
-                    set_mode(&target, file.mode)?;
+                    write_directory(&target, file.mode)?;
                     report.directories += 1;
                 }
                 PlannedFileKind::Symlink => {
-                    let link_target = file
-                        .link_target
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from("/"));
-                    remove_existing(&target)?;
-                    std::os::unix::fs::symlink(&link_target, &target)
-                        .map_err(|e| io(&target, e))?;
+                    write_symlink(&target, file.link_target.as_deref())?;
                     report.symlinks += 1;
                 }
                 _ => {
@@ -100,12 +94,16 @@ impl RootFsBuilder {
             pin_times(&crate::paths::join_under(&output, &file.destination));
         }
 
+        let entries = report.files + report.directories + report.symlinks;
+        assert_eq!(entries as usize, plan.files.len());
         Ok(report)
     }
 
     /// Resolve a plan destination inside the output root, refusing anything that
     /// would write through a symlink or outside the root.
     fn target_path(&self, output: &Path, file: &PlannedFile) -> Result<PathBuf> {
+        assert!(file.destination.is_absolute());
+
         let target = crate::paths::join_under(output, &file.destination);
         if !target.starts_with(output) {
             return Err(Error::PathEscape {
@@ -126,13 +124,35 @@ impl RootFsBuilder {
     }
 }
 
+/// Create a directory, replacing anything else that occupies the path —
+/// including a symlink, which a later write would silently follow.
+fn write_directory(target: &Path, mode: u32) -> Result<()> {
+    let existing = std::fs::symlink_metadata(target).ok();
+    if !existing.is_some_and(|metadata| metadata.is_dir()) {
+        remove_existing(target)?;
+        std::fs::create_dir_all(target).map_err(|e| io(target, e))?;
+    }
+    set_mode(target, mode)
+}
+
+/// Recreate a symlink verbatim. A planned symlink always has a target; `/` is
+/// the one link target that cannot mean anything else if it somehow does not.
+fn write_symlink(target: &Path, link_target: Option<&Path>) -> Result<()> {
+    let link_target = link_target.unwrap_or(Path::new("/"));
+    remove_existing(target)?;
+    std::os::unix::fs::symlink(link_target, target).map_err(|e| io(target, e))
+}
+
 /// Write the contents of a planned entry, returning the number of bytes.
 ///
 /// Source-backed files are copied rather than read into memory, so an
 /// `--include` of an arbitrarily large file costs no more than a buffer.
 fn write_file(target: &Path, file: &PlannedFile) -> Result<u64> {
+    assert!(file.link_target.is_none());
+
     match (&file.content, &file.source) {
         (Some(content), _) => {
+            assert_eq!(content.len() as u64, file.size);
             std::fs::write(target, content).map_err(|e| io(target, e))?;
             Ok(content.len() as u64)
         }
@@ -147,7 +167,9 @@ fn write_file(target: &Path, file: &PlannedFile) -> Result<u64> {
 /// Refuse to delete something that is obviously not a previous bundle: `--clean`
 /// is meant to replace an output directory, not to wipe a filesystem.
 fn guard_clean(output: &Path) -> Result<()> {
-    let resolved = output.canonicalize().unwrap_or_else(|_| output.to_path_buf());
+    let resolved = output
+        .canonicalize()
+        .unwrap_or_else(|_| output.to_path_buf());
     if resolved.parent().is_none() {
         return Err(Error::Config {
             message: format!("refusing to --clean `{}`", resolved.display()),
@@ -161,9 +183,7 @@ fn remove_existing(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         // `is_dir` is false for a symlink to a directory, so the link itself is
         // unlinked and its target is left alone.
-        Ok(metadata) if metadata.is_dir() => {
-            std::fs::remove_dir_all(path).map_err(|e| io(path, e))
-        }
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path).map_err(|e| io(path, e)),
         Ok(_) => std::fs::remove_file(path).map_err(|e| io(path, e)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(io(path, e)),
@@ -174,8 +194,14 @@ fn remove_existing(path: &Path) -> Result<()> {
 /// only the immediate parent lets `create_dir_all` follow a pre-existing
 /// symlink higher in the path.
 fn has_symlinked_ancestor(output: &Path, path: &Path) -> bool {
+    // Every step drops one component, so the walk is bounded by the depth of
+    // the path it starts from.
+    let mut steps = 0usize;
     let mut current = path;
     while current != output {
+        steps += 1;
+        assert!(steps <= path.components().count());
+
         match std::fs::symlink_metadata(current) {
             Ok(metadata) if metadata.is_symlink() => return true,
             Ok(_) | Err(_) => {}
@@ -188,16 +214,20 @@ fn has_symlinked_ancestor(output: &Path, path: &Path) -> bool {
     false
 }
 
+/// What was written, counted as it was written. Explicitly sized: a rootfs with
+/// more than four billion entries is not a rootfs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RootFsReport {
-    pub files: usize,
-    pub directories: usize,
-    pub symlinks: usize,
+    pub files: u32,
+    pub directories: u32,
+    pub symlinks: u32,
     pub bytes: u64,
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+
+    assert!(mode <= 0o7777);
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| io(path, e))
 }
 

@@ -22,7 +22,9 @@ pub enum Error {
     #[error("`{path}` is not an ELF file")]
     NotElf { path: PathBuf },
 
-    #[error("`{path}` targets an unsupported architecture: {architecture} (e_machine = {machine:#x})")]
+    #[error(
+        "`{path}` targets an unsupported architecture: {architecture} (e_machine = {machine:#x})"
+    )]
     UnsupportedArchitecture {
         path: PathBuf,
         architecture: String,
@@ -72,12 +74,25 @@ pub enum Error {
     Manifest { path: PathBuf, message: String },
 
     #[error("verification failed: {failures} problem(s) across {checked} manifest entries")]
-    VerifyFailed { checked: usize, failures: usize },
+    VerifyFailed { checked: u32, failures: u32 },
 }
 
 impl Error {
     /// Stable diagnostic code, rendered as `error[E1001]` by the CLI.
+    ///
+    /// Codes are documented and matched on by scripts, so they are stable in
+    /// the way an API is stable: `E1xxx` reads an object, `E2xxx` resolves a
+    /// dependency, `E3xxx` touches a path, `E4xxx` is configuration, `E5xxx` is
+    /// verification.
     pub fn code(&self) -> &'static str {
+        let code = self.code_inner();
+        assert_eq!(code.len(), 5);
+        assert!(code.starts_with('E'));
+        assert!(code[1..].bytes().all(|b| b.is_ascii_digit()));
+        code
+    }
+
+    fn code_inner(&self) -> &'static str {
         match self {
             Error::Io { .. } => "E1000",
             Error::Elf { .. } => "E1001",
@@ -96,7 +111,8 @@ impl Error {
         }
     }
 
-    /// Extra context printed underneath the headline message.
+    /// Extra context printed underneath the headline message. Empty when the
+    /// message already says everything there is to say.
     pub fn details(&self) -> Vec<String> {
         match self {
             Error::UnresolvedLibrary {

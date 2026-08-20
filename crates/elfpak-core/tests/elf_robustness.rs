@@ -23,7 +23,9 @@ impl Rng {
     }
 
     fn below(&mut self, bound: usize) -> usize {
-        (self.next() % bound as u64) as usize
+        assert!(bound > 0);
+        let bound = u64::try_from(bound).expect("a bound fits in u64");
+        usize::try_from(self.next() % bound).expect("a value below the bound fits in usize")
     }
 }
 
@@ -85,7 +87,7 @@ fn structured_garbage_never_panics() {
         for _ in 0..64 {
             let mut bytes = vec![0u8; size];
             for byte in bytes.iter_mut() {
-                *byte = rng.next() as u8;
+                *byte = u8::try_from(rng.next() & 0xff).expect("masked to one byte");
             }
             // Half the samples look like ELF so the parser gets past the magic.
             if rng.next().is_multiple_of(2) && bytes.len() >= 4 {
