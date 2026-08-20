@@ -70,8 +70,6 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Config> {
-        assert!(!path.as_os_str().is_empty());
-
         let text = std::fs::read_to_string(path).map_err(|e| io(path, e))?;
         Config::parse(&text).map_err(|e| match e {
             Error::Config { message } => Error::Config {
@@ -84,8 +82,6 @@ impl Config {
     /// Load `elfpak.toml` from `dir` if it exists. A missing file is not an error.
     pub fn discover(dir: &Path) -> Result<Option<(PathBuf, Config)>> {
         let candidate = dir.join(CONFIG_NAME_DEFAULT);
-        assert!(candidate.ends_with(CONFIG_NAME_DEFAULT));
-
         if !candidate.is_file() {
             return Ok(None);
         }

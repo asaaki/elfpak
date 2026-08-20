@@ -124,12 +124,6 @@ impl Manifest {
             })
             .collect();
 
-        assert_eq!(
-            files.len(),
-            plan.files.len(),
-            "every planned entry is recorded"
-        );
-
         Manifest {
             manifest_version: MANIFEST_VERSION,
             elfpak_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -166,9 +160,7 @@ impl Manifest {
     }
 
     pub fn to_json(&self) -> String {
-        let json = serde_json::to_string_pretty(self).expect("a manifest is plain data");
-        assert!(json.starts_with('{'));
-        json
+        serde_json::to_string_pretty(self).expect("a manifest is plain data")
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
@@ -179,7 +171,6 @@ impl Manifest {
         }
         let mut json = self.to_json();
         json.push('\n');
-        assert!(json.ends_with("}\n"));
         std::fs::write(path, json).map_err(|e| io(path, e))
     }
 
@@ -227,7 +218,6 @@ impl Manifest {
         if options.strict {
             self.report_unexpected(rootfs, &mut report);
         }
-        assert_eq!(report.checked as usize, self.files.len());
         report
     }
 
@@ -278,13 +268,10 @@ impl Manifest {
 
     /// Entries that carry content, i.e. everything but the directory scaffolding.
     pub fn file_count(&self) -> usize {
-        let count = self
-            .files
+        self.files
             .iter()
             .filter(|f| f.kind != PlannedFileKind::Directory.as_str())
-            .count();
-        assert!(count <= self.files.len());
-        count
+            .count()
     }
 }
 

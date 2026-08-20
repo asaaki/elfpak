@@ -95,21 +95,28 @@ impl PlannedFile {
 
         match self.kind {
             PlannedFileKind::Directory => {
+                assert!(self.source.is_none());
                 assert!(self.link_target.is_none());
                 assert!(self.content.is_none());
+                assert!(self.sha256.is_none());
                 assert_eq!(self.size, 0);
             }
             PlannedFileKind::Symlink => {
+                assert!(self.source.is_none());
                 assert!(self.link_target.is_some());
                 assert!(self.content.is_none());
+                assert!(self.sha256.is_none());
                 assert_eq!(self.size, 0);
             }
             // Everything else is a regular file, and its bytes come either from
             // the source root or from this process. Either way they are hashed.
             _ => {
                 assert!(self.link_target.is_none());
-                assert!(self.source.is_some() || self.content.is_some());
+                assert_ne!(self.source.is_some(), self.content.is_some());
                 assert!(self.sha256.as_ref().is_some_and(Digest::is_well_formed));
+                if let Some(content) = &self.content {
+                    assert_eq!(self.size, content.len() as u64);
+                }
             }
         }
     }
@@ -303,7 +310,6 @@ impl Planner {
                 },
             )?;
         }
-        assert_eq!(graph.root, root_id);
         Ok(())
     }
 
@@ -333,7 +339,6 @@ impl Planner {
             .flatten();
 
         if let Some(bytes) = cache {
-            assert!(!bytes.is_empty());
             builder.push_generated(
                 Path::new(LD_SO_CACHE),
                 bytes,
@@ -390,7 +395,6 @@ impl Planner {
             }
         }
 
-        assert!(dlopen_libraries.len() <= graph.node_count());
         if !dlopen_libraries.is_empty() {
             warnings.push(Warning {
                 code: "E1004",
@@ -436,7 +440,6 @@ impl Planner {
         if entries.is_empty() {
             return None;
         }
-        assert!(entries.len() <= graph.node_count());
         cache::build(&architecture, &entries)
     }
 
@@ -478,7 +481,6 @@ impl Planner {
         }
 
         let application = graph.application_closure();
-        assert!(application.contains(&graph.root));
 
         for (id, node) in graph.iter() {
             if node.kind != NodeKind::SharedObject {
@@ -898,7 +900,6 @@ impl<'a> PlanBuilder<'a> {
         assert!(destination.is_absolute());
 
         let (digest, size) = self.digests.get(&source)?;
-        assert!(digest.is_well_formed());
         self.push_file(PlannedFile {
             source: Some(source.clone()),
             destination,
@@ -959,26 +960,21 @@ impl<'a> PlanBuilder<'a> {
         let mut stack = vec![(logical.to_path_buf(), host.to_path_buf())];
         while let Some((logical, host)) = stack.pop() {
             assert!(logical.is_absolute());
-            // The only place a plan grows without an ELF object behind each
-            // entry, and so the only place that needs the bound.
-            if self.entries.len() > PLAN_ENTRIES_MAX {
-                return Err(Error::Config {
-                    message: format!(
-                        "the plan exceeds {PLAN_ENTRIES_MAX} entries at `{}`; \
-                         narrow the --include",
-                        logical.display()
-                    ),
-                });
-            }
+            self.check_size(&logical)?;
 
             let mut names = Vec::new();
+            let remaining = PLAN_ENTRIES_MAX.saturating_sub(self.entries.len());
             for entry in std::fs::read_dir(&host).map_err(|e| io(&host, e))? {
+                if names.len() == remaining {
+                    return Err(Self::size_error(&logical));
+                }
                 let entry = entry.map_err(|e| io(&host, e))?;
                 names.push(entry.file_name());
             }
             names.sort();
             for name in names {
                 let child_logical = logical.join(&name);
+                self.check_size(&child_logical)?;
                 let child_host = host.join(&name);
                 let metadata =
                     std::fs::symlink_metadata(&child_host).map_err(|e| io(&child_host, e))?;
@@ -991,21 +987,32 @@ impl<'a> PlanBuilder<'a> {
                 } else if metadata.is_file() {
                     self.push_source_file(child_host, child_logical, kind, reason.clone())?;
                 }
+                self.check_size(&logical)?;
             }
         }
         Ok(())
     }
 
+    fn check_size(&self, logical: &Path) -> Result<()> {
+        if self.entries.len() <= PLAN_ENTRIES_MAX {
+            return Ok(());
+        }
+        Err(Self::size_error(logical))
+    }
+
+    fn size_error(logical: &Path) -> Error {
+        Error::Config {
+            message: format!(
+                "bundle plan exceeds {PLAN_ENTRIES_MAX} entries at `{}`; narrow --include",
+                logical.display()
+            ),
+        }
+    }
+
     /// Entries sorted by destination, which is what makes a parent directory
     /// precede everything inside it when the plan is written out.
     fn finish(self) -> Vec<PlannedFile> {
-        let files: Vec<PlannedFile> = self.entries.into_values().collect();
-        assert!(
-            files
-                .windows(2)
-                .all(|p| p[0].destination < p[1].destination)
-        );
-        files
+        self.entries.into_values().collect()
     }
 }
 
@@ -1034,8 +1041,6 @@ fn mode_of(path: &Path) -> Result<u32> {
     } else {
         0o644
     };
-    // Never setuid or setgid: a privilege bit must not travel with the bundle.
-    assert!(normalized & 0o7000 == 0);
     Ok(normalized)
 }
 
@@ -1068,16 +1073,22 @@ mod tests {
         };
 
         let mut graph = DependencyGraph::new();
-        graph.root = graph.insert(node(NodeKind::Executable, "/app/server", None));
+        graph.root = graph
+            .insert(node(NodeKind::Executable, "/app/server", None))
+            .unwrap();
         graph.declared_interpreter = interpreter.map(PathBuf::from);
         if let Some(interpreter) = interpreter {
-            graph.insert(node(NodeKind::Interpreter, interpreter, Some("ld.so")));
+            graph
+                .insert(node(NodeKind::Interpreter, interpreter, Some("ld.so")))
+                .unwrap();
         }
-        graph.insert(node(
-            NodeKind::SharedObject,
-            "/opt/vendor/lib/libvendor.so.1",
-            Some("libvendor.so.1"),
-        ));
+        graph
+            .insert(node(
+                NodeKind::SharedObject,
+                "/opt/vendor/lib/libvendor.so.1",
+                Some("libvendor.so.1"),
+            ))
+            .unwrap();
         graph
     }
 

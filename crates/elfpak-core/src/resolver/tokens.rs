@@ -24,7 +24,6 @@ pub fn expand(input: &str, ctx: &TokenContext) -> String {
     while i < bytes.len() {
         // Every branch below advances `i` by at least one byte, so the walk is
         // bounded by the length of the input.
-        let progress = i;
         if bytes[i] != b'$' {
             // Copy verbatim up to the next `$`. Copying byte by byte would
             // re-encode every non-ASCII character in the path.
@@ -45,9 +44,7 @@ pub fn expand(input: &str, ctx: &TokenContext) -> String {
                 i += 1;
             }
         }
-        assert!(i > progress);
     }
-    assert!(i >= bytes.len(), "the walk consumes the whole input");
     out
 }
 
@@ -56,7 +53,7 @@ pub fn expand(input: &str, ctx: &TokenContext) -> String {
 /// The count includes the braces of a `${NAME}` spelling, so a caller that
 /// advances by it lands just past the token either way.
 fn read_token(rest: &str) -> (String, usize) {
-    let (name, consumed) = if let Some(stripped) = rest.strip_prefix('{') {
+    if let Some(stripped) = rest.strip_prefix('{') {
         match stripped.find('}') {
             Some(end) => (stripped[..end].to_string(), end + 2),
             // Unterminated: not a token, and nothing is consumed.
@@ -67,10 +64,7 @@ fn read_token(rest: &str) -> (String, usize) {
             .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .unwrap_or(rest.len());
         (rest[..end].to_string(), end)
-    };
-    assert!(consumed <= rest.len());
-    assert!(name.len() <= consumed);
-    (name, consumed)
+    }
 }
 
 fn substitute(name: &str, ctx: &TokenContext) -> Option<String> {
@@ -87,19 +81,13 @@ fn substitute(name: &str, ctx: &TokenContext) -> Option<String> {
 /// Relative entries are interpreted against the requesting object's directory,
 /// which is what the loader effectively does for `$ORIGIN`-style layouts.
 pub fn expand_search_path(entry: &str, ctx: &TokenContext) -> PathBuf {
-    assert!(ctx.origin.is_absolute());
-
     let expanded = expand(entry, ctx);
     let path = Path::new(&expanded);
-    let logical = if path.is_absolute() {
+    if path.is_absolute() {
         crate::paths::normalize_absolute(path)
     } else {
         crate::paths::normalize_absolute(&ctx.origin.join(path))
-    };
-    // Search paths are logical paths in the target filesystem: a relative one
-    // would be resolved against this process's working directory.
-    assert!(logical.is_absolute());
-    logical
+    }
 }
 
 #[cfg(test)]

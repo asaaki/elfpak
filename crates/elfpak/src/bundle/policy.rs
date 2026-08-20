@@ -39,9 +39,6 @@ pub(crate) fn runtime_policy(
         args.includes.clone()
     };
 
-    // Every field above is either the preset's answer or an explicit override.
-    assert!(policy.user.is_none() || args.user.is_some() || config.runtime.user.is_some());
-    assert!(policy.includes.len() <= args.includes.len() + config.include.paths.len());
     Ok(policy)
 }
 

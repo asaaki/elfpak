@@ -64,7 +64,6 @@ pub(crate) fn human_size(bytes: u64) -> String {
         value /= UNIT_STEP_BYTES;
         unit += 1;
     }
-    assert!(unit < UNITS.len());
     if unit == 0 {
         format!("{bytes} B")
     } else {
@@ -255,8 +254,16 @@ fn summary_entry(out: &mut dyn Write, file: &PlannedFile) -> std::io::Result<()>
 fn summary_counts(out: &mut dyn Write, plan: &BundlePlan) -> std::io::Result<()> {
     let dirs = plan.files_of_kind(PlannedFileKind::Directory).count();
     let links = plan.files_of_kind(PlannedFileKind::Symlink).count();
-    let files = plan.files.len() - dirs - links;
-    assert!(files <= plan.files.len());
+    let files = plan
+        .files
+        .iter()
+        .filter(|file| {
+            !matches!(
+                file.kind,
+                PlannedFileKind::Directory | PlannedFileKind::Symlink
+            )
+        })
+        .count();
 
     writeln!(
         out,
@@ -304,6 +311,5 @@ pub(crate) fn error(err: &Error) -> String {
         out.push_str(&detail);
         out.push('\n');
     }
-    assert!(out.starts_with("error["));
     out
 }

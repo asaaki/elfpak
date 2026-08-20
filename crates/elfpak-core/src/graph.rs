@@ -1,6 +1,11 @@
 //! The dependency graph records both *what* is included and *why*.
 
-use crate::{elf::Architecture, rootfs::policy::RuntimeFeature, source::SymlinkEntry};
+use crate::{
+    elf::Architecture,
+    error::{Error, Result},
+    rootfs::policy::RuntimeFeature,
+    source::SymlinkEntry,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -13,9 +18,7 @@ pub type NodeId = u32;
 /// Upper bound on the objects in one runtime closure.
 ///
 /// A real closure is tens of objects; a thousand would already be remarkable.
-/// The limit catches a mistake in the graph-building code before it eats
-/// memory. It is asserted rather than reported: hitting it is a bug here, not
-/// bad input.
+/// The limit bounds work requested by a synthetic or malformed ELF graph.
 pub const NODES_MAX: usize = 4096;
 
 /// Upper bound on edges. Every edge is one `DT_NEEDED`, `PT_INTERP` or policy
@@ -26,13 +29,17 @@ pub const EDGES_MAX: usize = NODES_MAX * 64;
 #[serde(transparent)]
 pub struct Digest(pub String);
 
-/// Length of a SHA-256 digest in lowercase hex.
+/// Length of a SHA-256 digest in lowercase hexadecimal.
 pub const DIGEST_LEN_HEX: usize = 64;
 
 impl Digest {
     /// Whether this is a well-formed SHA-256 digest.
     pub fn is_well_formed(&self) -> bool {
-        self.0.len() == DIGEST_LEN_HEX && self.0.bytes().all(|b| b.is_ascii_hexdigit())
+        self.0.len() == DIGEST_LEN_HEX
+            && self
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
     }
 }
 
@@ -112,31 +119,32 @@ impl DependencyGraph {
     /// Re-inserting a known object merges its symlink chain: the same library
     /// is often reached through several link paths (`/lib64/ld-linux…` and
     /// `/lib/<tuple>/ld-linux…`), and every one of them must be preserved.
-    pub fn insert(&mut self, node: Node) -> NodeId {
+    pub fn insert(&mut self, node: Node) -> Result<NodeId> {
         assert!(node.logical.is_absolute());
         assert!(node.destination.is_absolute());
         assert!(node.sha256.is_well_formed());
 
         if let Some(&id) = self.by_logical.get(&node.logical) {
             let existing = &mut self.nodes[id as usize];
-            assert_eq!(existing.logical, node.logical);
             for link in node.links {
                 if !existing.links.contains(&link) {
                     existing.links.push(link);
                 }
             }
-            return id;
+            return Ok(id);
         }
 
-        assert!(
-            self.nodes.len() < NODES_MAX,
-            "closure exceeds {NODES_MAX} objects"
-        );
+        if self.nodes.len() >= NODES_MAX {
+            return Err(Error::LimitExceeded {
+                resource: "runtime closure",
+                limit: NODES_MAX,
+            });
+        }
         let id = NodeId::try_from(self.nodes.len()).expect("node count is bounded by NODES_MAX");
         self.by_logical.insert(node.logical.clone(), id);
         self.nodes.push(node);
         assert_eq!(self.nodes.len(), self.by_logical.len());
-        id
+        Ok(id)
     }
 
     pub fn find(&self, logical: &Path) -> Option<NodeId> {
@@ -144,23 +152,30 @@ impl DependencyGraph {
         self.by_logical.get(logical).copied()
     }
 
-    pub fn connect(&mut self, from: NodeId, to: NodeId, reason: DependencyReason) {
+    pub fn connect(&mut self, from: NodeId, to: NodeId, reason: DependencyReason) -> Result<()> {
         assert!(self.contains(from));
         assert!(self.contains(to));
-        assert_ne!(from, to, "an object cannot depend on itself");
+        if from == to {
+            // The loader considers an object that is already mapped to satisfy
+            // a self-reference; it adds no useful edge to the closure.
+            return Ok(());
+        }
 
         let known = self
             .edges
             .iter()
             .any(|e| e.from == from && e.to == to && e.reason == reason);
         if known {
-            return;
+            return Ok(());
         }
-        assert!(
-            self.edges.len() < EDGES_MAX,
-            "closure exceeds {EDGES_MAX} dependencies"
-        );
+        if self.edges.len() >= EDGES_MAX {
+            return Err(Error::LimitExceeded {
+                resource: "runtime dependency graph",
+                limit: EDGES_MAX,
+            });
+        }
         self.edges.push(Edge { from, to, reason });
+        Ok(())
     }
 
     pub fn contains(&self, id: NodeId) -> bool {
@@ -228,11 +243,7 @@ impl DependencyGraph {
         let mut queue = vec![self.root];
         // A node is queued only when it is first reached, so the walk is
         // bounded by the size of the graph.
-        let mut visits = 0usize;
         while let Some(id) = queue.pop() {
-            visits += 1;
-            assert!(visits <= self.nodes.len());
-
             for edge in self.edges.iter().filter(|e| e.from == id) {
                 if matches!(edge.reason, DependencyReason::RuntimePolicy { .. }) {
                     continue;
@@ -242,8 +253,72 @@ impl DependencyGraph {
                 }
             }
         }
-        assert!(reached.contains(&self.root));
-        assert!(reached.len() <= self.nodes.len());
         reached
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        elf::{ElfClass, Endianness, Machine},
+        hash::sha256_bytes,
+    };
+
+    fn node(path: PathBuf) -> Node {
+        Node {
+            source: path.clone(),
+            logical: path.clone(),
+            destination: path,
+            kind: NodeKind::SharedObject,
+            soname: None,
+            architecture: Architecture {
+                machine: Machine::X86_64,
+                class: ElfClass::Elf64,
+                endianness: Endianness::Little,
+            },
+            sha256: sha256_bytes(b"test"),
+            size: 0,
+            links: Vec::new(),
+            dlopen_references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_oversized_closure_is_an_error() {
+        let mut graph = DependencyGraph::new();
+        for index in 0..NODES_MAX {
+            graph
+                .insert(node(PathBuf::from(format!("/lib/{index}"))))
+                .unwrap();
+        }
+
+        let error = graph
+            .insert(node(PathBuf::from("/lib/overflow")))
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::LimitExceeded {
+                resource: "runtime closure",
+                limit: NODES_MAX,
+            }
+        ));
+        assert_eq!(error.code(), "E1005");
+    }
+
+    #[test]
+    fn a_self_dependency_does_not_add_an_edge() {
+        let mut graph = DependencyGraph::new();
+        let id = graph.insert(node(PathBuf::from("/lib/self.so"))).unwrap();
+        graph
+            .connect(
+                id,
+                id,
+                DependencyReason::Needed {
+                    soname: "self.so".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(graph.edges.is_empty());
     }
 }

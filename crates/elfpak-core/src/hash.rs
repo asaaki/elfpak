@@ -1,8 +1,4 @@
-//! Content hashing. Every included file is hashed exactly once.
-//!
-//! A digest ties a planned entry, a manifest line and a materialized file
-//! together, so it is checked on the way out of here and again on the way into
-//! the graph.
+//! Content hashing and a small per-run cache.
 
 use crate::{
     error::{Result, io},
@@ -18,17 +14,13 @@ use std::{
 pub fn sha256_bytes(bytes: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let digest = Digest(crate::paths::hex(&hasher.finalize()));
-    assert!(digest.is_well_formed());
-    digest
+    Digest(crate::paths::hex(&hasher.finalize()))
 }
 
-/// Read buffer for streamed hashing: large enough to amortize the read
-/// syscalls, small enough to not show up in RSS.
+/// Read buffer for streamed hashing.
 const HASH_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 
-/// Hash a file in chunks. An `--include`d file can be arbitrarily large and
-/// nothing here needs its contents in memory.
+/// Hash a file without loading it all at once.
 pub fn sha256_file(path: &Path) -> Result<(Digest, u64)> {
     let file = std::fs::File::open(path).map_err(|e| io(path, e))?;
     let mut reader = std::io::BufReader::with_capacity(HASH_BUFFER_SIZE_BYTES, file);
@@ -39,21 +31,15 @@ pub fn sha256_file(path: &Path) -> Result<(Digest, u64)> {
         if chunk.is_empty() {
             break;
         }
-        // Bounded by the length of the file: every iteration consumes at least
-        // one byte, so a short read cannot turn into a spin.
         let consumed = chunk.len();
-        assert!(consumed > 0);
-        assert!(consumed <= HASH_BUFFER_SIZE_BYTES);
         hasher.update(chunk);
         size += consumed as u64;
         reader.consume(consumed);
     }
-    let digest = Digest(crate::paths::hex(&hasher.finalize()));
-    assert!(digest.is_well_formed());
-    Ok((digest, size))
+    Ok((Digest(crate::paths::hex(&hasher.finalize())), size))
 }
 
-/// Hashes each path once, however many plan entries and graph nodes refer to it.
+/// Hashes a path once per run.
 #[derive(Debug, Default)]
 pub struct DigestCache {
     entries: HashMap<PathBuf, (Digest, u64)>,
@@ -66,13 +52,10 @@ impl DigestCache {
 
     pub fn get(&mut self, path: &Path) -> Result<(Digest, u64)> {
         if let Some(hit) = self.entries.get(path) {
-            assert!(hit.0.is_well_formed());
             return Ok(hit.clone());
         }
         let value = sha256_file(path)?;
-        assert!(value.0.is_well_formed());
-        let previous = self.entries.insert(path.to_path_buf(), value.clone());
-        assert!(previous.is_none());
+        self.entries.insert(path.to_path_buf(), value.clone());
         Ok(value)
     }
 

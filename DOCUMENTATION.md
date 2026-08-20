@@ -448,8 +448,7 @@ Minimum supported Rust version: **1.97**.
 
 ```console
 $ just check                       # fmt, clippy -D warnings, and the whole suite
-$ just test                        # unit, integration and style tests
-$ just style                       # the numeric style limits on their own
+$ just test                        # unit and integration tests
 $ tests/docker/smoke.sh            # all Docker smoke tests
 $ tests/docker/smoke.sh axum       # Axum on scratch, host architecture
 $ tests/docker/smoke.sh axum-arm64 # Axum on scratch, linux/arm64
@@ -469,11 +468,12 @@ there: it removes every `elfpak:local*` and `elfpak-*:local*` image and passes
 from recompiling the fixtures every time; clear those separately with
 `docker builder prune --filter type=exec.cachemount`.
 
-The code follows [TigerStyle](https://tigerstyle.dev/); [STYLE.md](STYLE.md)
-records how, and `crates/elfpak-core/tests/style.rs` enforces the two numeric
-limits — 100 columns and 70 lines per function — as part of the test suite.
-Assertions are enabled in release builds and the release profile aborts, so an
-invariant that fails stops the run rather than producing a bundle.
+The design is inspired by [TigerStyle](https://tigerstyle.dev/), with safety,
+performance, and developer experience prioritized in that order. In practice
+that means bounded input-driven work, explicit invariants, deterministic output,
+and ordinary Rust formatting and linting. [STYLE.md](STYLE.md) describes the
+adaptation. It deliberately avoids mechanical measures such as assertion
+density or maximum function length.
 
 The cargo suite covers ELF parsing, token expansion, `ld.so.cache` parsing,
 policy evaluation, manifest round-trips and filesystem safety, plus loader

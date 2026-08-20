@@ -12,10 +12,6 @@ pub(crate) fn run(args: &InspectArgs, verbosity: Verbosity) -> anyhow::Result<()
     let plan = Planner::new(root, &args.binary)
         .library_paths(args.library_paths.clone())
         .plan()?;
-    assert!(
-        !plan.files.is_empty(),
-        "a plan always contains the executable"
-    );
 
     if args.json {
         let manifest = Manifest::from_plan(&plan, &args.root, None);

@@ -35,8 +35,12 @@ impl Paths {
             }
             .into());
         }
-        assert!(!binary.as_os_str().is_empty());
-        assert!(output.is_some() || tar.is_some());
+        if binary.as_os_str().is_empty() {
+            return Err(Error::Config {
+                message: "binary path cannot be empty".to_string(),
+            }
+            .into());
+        }
 
         Ok(Paths {
             install: args
@@ -75,10 +79,8 @@ pub(crate) fn manifest_path(args: &BundleArgs, paths: &Paths) -> Option<PathBuf>
 /// The manifest sits beside the bundle: a rootfs contains only what the plan
 /// put there.
 fn manifest_path_default(output: &Path) -> PathBuf {
-    let path = match output.parent() {
+    match output.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(MANIFEST_NAME_DEFAULT),
         _ => PathBuf::from(MANIFEST_NAME_DEFAULT),
-    };
-    assert!(path.ends_with(MANIFEST_NAME_DEFAULT));
-    path
+    }
 }

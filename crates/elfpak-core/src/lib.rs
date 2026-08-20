@@ -1,13 +1,4 @@
-//! `elfpak-core`: analyze a Linux ELF application, resolve its runtime closure
-//! the way the glibc loader would, and plan a minimal rootfs for it.
-//!
-//! Guarantees held by this crate:
-//!
-//! * the target binary is never executed
-//! * `ldd`, `ldconfig` and shell commands are never invoked
-//! * no network access
-//! * the source root is only ever read
-//! * every output file carries a recorded reason
+//! ELF analysis, dependency resolution, bundle planning, and rootfs output.
 
 pub mod config;
 pub mod elf;

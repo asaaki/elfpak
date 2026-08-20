@@ -35,7 +35,5 @@ pub(crate) fn write_outputs(
         manifest.write(path)?;
     }
     outputs.written = true;
-    assert_eq!(outputs.rootfs.is_some(), paths.output.is_some());
-    assert_eq!(outputs.tar.is_some(), paths.tar.is_some());
     Ok(outputs)
 }

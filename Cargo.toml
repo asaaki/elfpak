@@ -10,8 +10,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/example/elfpak"
 description = "Package a Linux ELF application and its runtime closure into a minimal rootfs"
 
-# Appreciate all compiler warnings at the strictest setting (TIGER_STYLE):
-# a warning is a bug that has not happened yet.
+# Keep compiler warnings visible across the workspace.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

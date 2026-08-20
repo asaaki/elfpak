@@ -1,13 +1,11 @@
 //! Lexical path handling.
 //!
-//! All logical paths inside `elfpak` are absolute paths *as seen by the target
-//! process*. They are never handed to the OS directly; they are always joined
-//! onto a source root or an output root first.
+//! Logical paths are interpreted relative to a source or output root, never
+//! passed directly to the host OS.
 
 use std::path::{Component, Path, PathBuf};
 
-/// Lexically normalize an absolute path: drop `.`, resolve `..` textually and
-/// never allow escaping above `/`.
+/// Normalize a path into an absolute logical path.
 pub fn normalize_absolute(path: &Path) -> PathBuf {
     let mut out = PathBuf::from("/");
     for component in path.components() {
@@ -20,8 +18,6 @@ pub fn normalize_absolute(path: &Path) -> PathBuf {
             Component::Normal(part) => out.push(part),
         }
     }
-    assert!(out.is_absolute());
-    assert!(!out.components().any(|c| c == Component::ParentDir));
     out
 }
 
@@ -29,13 +25,10 @@ pub fn normalize_absolute(path: &Path) -> PathBuf {
 /// would land outside of it.
 pub fn join_under(base: &Path, logical: &Path) -> PathBuf {
     let normalized = normalize_absolute(logical);
-    let joined = match normalized.strip_prefix("/") {
-        Ok(rel) if rel.as_os_str().is_empty() => base.to_path_buf(),
-        Ok(rel) => base.join(rel),
-        // `normalize_absolute` always returns a path below `/`, so this arm is
-        // unreachable; falling back to the base keeps the write inside it.
-        Err(_) => base.to_path_buf(),
-    };
+    let relative = normalized
+        .strip_prefix("/")
+        .expect("normalized logical paths are absolute");
+    let joined = base.join(relative);
     // Containment is checked here, and again by the caller before it writes.
     assert!(joined.starts_with(base));
     joined
@@ -44,12 +37,9 @@ pub fn join_under(base: &Path, logical: &Path) -> PathBuf {
 /// Absolute parent directory of a logical path (`/` for top-level entries).
 pub fn logical_parent(path: &Path) -> PathBuf {
     assert!(path.is_absolute());
-    let parent = path
-        .parent()
+    path.parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    assert!(parent.is_absolute());
-    parent
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Every ancestor directory of a logical path, shallowest first, excluding `/`.
@@ -65,11 +55,6 @@ pub fn ancestor_dirs(path: &Path) -> Vec<PathBuf> {
             dirs.push(current.clone());
         }
     }
-    // Shallowest first, so a caller can create them in list order.
-    if let Some(last) = dirs.last() {
-        assert_eq!(last, &parent);
-        assert!(dirs[0].parent() == Some(Path::new("/")));
-    }
     dirs
 }
 
@@ -81,7 +66,6 @@ pub fn hex(bytes: &[u8]) -> String {
         s.push(char::from_digit(u32::from(byte >> 4), 16).expect("a nibble is one hex digit"));
         s.push(char::from_digit(u32::from(byte & 0xf), 16).expect("a nibble is one hex digit"));
     }
-    assert_eq!(s.len(), bytes.len() * 2);
     s
 }
 

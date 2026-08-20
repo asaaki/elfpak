@@ -53,8 +53,6 @@ impl TarBuilder {
         for entry in &plan.files {
             entry.assert_well_formed();
             let name = archive_name(&entry.destination)?;
-            assert!(!name.is_empty());
-            assert!(!name.starts_with('/'), "tar entries are relative");
 
             let mut header = pinned_header(entry.mode, mtime);
 
@@ -70,7 +68,7 @@ impl TarBuilder {
                     let target = entry
                         .link_target
                         .clone()
-                        .unwrap_or_else(|| PathBuf::from("/"));
+                        .expect("validated symlinks have a target");
                     header.set_entry_type(EntryType::Symlink);
                     writer
                         .append_link(&mut header, &name, &target)
@@ -121,7 +119,7 @@ fn append_regular<W: Write>(
     entry: &PlannedFile,
 ) -> std::io::Result<()> {
     match (&entry.content, &entry.source) {
-        (Some(content), _) => {
+        (Some(content), None) => {
             assert_eq!(content.len() as u64, entry.size);
             header.set_size(content.len() as u64);
             writer.append_data(header, name, content.as_slice())
@@ -131,17 +129,12 @@ fn append_regular<W: Write>(
             header.set_size(file.metadata()?.len());
             writer.append_data(header, name, file)
         }
-        (None, None) => {
-            header.set_size(0);
-            writer.append_data(header, name, std::io::empty())
-        }
+        _ => unreachable!("validated regular files have exactly one content source"),
     }
 }
 
 /// Tar entries are relative paths: `/app/server` becomes `app/server`.
 fn archive_name(destination: &Path) -> Result<String> {
-    assert!(destination.is_absolute());
-
     let normalized = crate::paths::normalize_absolute(destination);
     let relative = normalized.strip_prefix("/").unwrap_or(&normalized);
     relative

@@ -33,8 +33,6 @@ pub fn default_library_paths(architecture: &Architecture) -> Vec<PathBuf> {
     paths.push(PathBuf::from("/lib"));
     paths.push(PathBuf::from("/usr/lib"));
 
-    assert!(!paths.is_empty());
-    assert!(paths.iter().all(|p| p.is_absolute()));
     paths
 }
 
@@ -57,12 +55,8 @@ pub fn parse_ld_so_conf(root: &SourceRoot) -> Vec<PathBuf> {
     let mut pending = vec![(Directive::Include(PathBuf::from("/etc/ld.so.conf")), 0usize)];
 
     while let Some((directive, depth)) = pending.pop() {
-        assert!(depth <= CONF_DEPTH_MAX + 1);
-        assert!(visited.len() <= CONF_FILES_MAX);
-
         let file = match directive {
             Directive::Directory(dir) => {
-                assert!(dir.is_absolute());
                 if !paths.contains(&dir) && paths.len() < CONF_DIRECTORIES_MAX {
                     paths.push(dir);
                 }
@@ -82,8 +76,6 @@ pub fn parse_ld_so_conf(root: &SourceRoot) -> Vec<PathBuf> {
         }
     }
 
-    assert!(paths.len() <= CONF_DIRECTORIES_MAX);
-    assert!(paths.iter().all(|p| p.is_absolute()));
     paths
 }
 

@@ -1,4 +1,4 @@
-# Style by the numbers (TIGER_STYLE): 100 columns, 4 spaces, Unix newlines.
+# Keep formatting consistent across the workspace.
 max_width = 100
 tab_spaces = 4
 newline_style = "Unix"

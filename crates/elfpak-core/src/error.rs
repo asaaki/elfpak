@@ -58,6 +58,12 @@ pub enum Error {
         searched: Vec<PathBuf>,
     },
 
+    #[error("{resource} exceeds the supported limit of {limit}")]
+    LimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
+
     #[error("path `{path}` escapes the {kind} root")]
     PathEscape { path: PathBuf, kind: &'static str },
 
@@ -84,19 +90,12 @@ impl Error {
     /// `E2xxx` resolves a dependency, `E3xxx` touches a path, `E4xxx` is
     /// configuration, `E5xxx` is verification.
     pub fn code(&self) -> &'static str {
-        let code = self.code_inner();
-        assert_eq!(code.len(), 5);
-        assert!(code.starts_with('E'));
-        assert!(code[1..].bytes().all(|b| b.is_ascii_digit()));
-        code
-    }
-
-    fn code_inner(&self) -> &'static str {
         match self {
             Error::Io { .. } => "E1000",
             Error::Elf { .. } => "E1001",
             Error::NotElf { .. } => "E1002",
             Error::UnsupportedArchitecture { .. } => "E1003",
+            Error::LimitExceeded { .. } => "E1005",
             Error::UnresolvedLibrary { .. } => "E2001",
             Error::DisallowedLibrary { .. } => "E2002",
             Error::IncompatibleArchitecture { .. } => "E2003",

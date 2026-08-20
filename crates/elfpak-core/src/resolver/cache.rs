@@ -66,8 +66,6 @@ impl LdCache {
             Vec::new()
         };
 
-        assert!(pairs.len() <= CACHE_ENTRIES_MAX);
-
         cache.len = pairs.len();
         for (soname, path) in pairs {
             // ldconfig only records absolute paths. A relative one would be
@@ -94,9 +92,7 @@ impl LdCache {
     }
 
     pub fn lookup(&self, soname: &str) -> &[PathBuf] {
-        let candidates = self.entries.get(soname).map(Vec::as_slice).unwrap_or(&[]);
-        assert!(candidates.iter().all(|p| p.is_absolute()));
-        candidates
+        self.entries.get(soname).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn entry_count(&self) -> usize {
@@ -256,7 +252,6 @@ fn encode_strings(entries: &[&CacheEntry], base: usize) -> Option<StringTable> {
         let value = u32::try_from(base + strings.len()).ok()?;
         strings.extend_from_slice(path.as_bytes());
         strings.push(0);
-        assert!(key < value, "the soname precedes the path it names");
         offsets.push((key, value));
     }
     Some(StringTable {
@@ -271,7 +266,9 @@ fn encode_strings(entries: &[&CacheEntry], base: usize) -> Option<StringTable> {
 /// caller can fall back to reporting the problem instead of writing a cache the
 /// loader would reject.
 pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<u8>> {
-    assert!(entries.iter().all(|e| e.path.is_absolute()));
+    if entries.iter().any(|entry| !entry.path.is_absolute()) {
+        return None;
+    }
 
     let flags = entry_flags(architecture)?;
     if architecture.endianness != Endianness::Little {
@@ -299,8 +296,6 @@ pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<
         bytes: strings,
         offsets,
     } = encode_strings(&entries, base)?;
-    assert_eq!(offsets.len(), entries.len());
-
     let mut out = Vec::with_capacity(base + strings.len());
     out.extend_from_slice(NEW_MAGIC);
     out.extend_from_slice(NEW_VERSION);

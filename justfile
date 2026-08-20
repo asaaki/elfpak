@@ -23,13 +23,9 @@ imports:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Unit, integration, loader-oracle and style tests.
+# Unit, integration, and loader-oracle tests.
 test:
     cargo test --workspace
-
-# The numeric style limits on their own: 100 columns, 70 lines per function.
-style:
-    cargo test -p elfpak-core --test style
 
 # Docker smoke tests: a test name, --fresh, or nothing (see DOCUMENTATION.md).
 smoke *args:

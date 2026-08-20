@@ -21,7 +21,6 @@ pub(crate) fn run(args: &VerifyArgs, verbosity: Verbosity) -> anyhow::Result<()>
         strict: args.strict,
     };
     let report = manifest.verify(&rootfs, &options);
-    assert_eq!(report.checked as usize, manifest.files.len());
 
     if report.is_ok() {
         verbosity.print(|out| {

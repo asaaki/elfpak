@@ -70,12 +70,7 @@ impl SourceRoot {
 
     /// Map a logical path onto the host without following symlinks.
     pub fn host_path(&self, logical: &Path) -> PathBuf {
-        let host = crate::paths::join_under(&self.path, logical);
-        assert!(
-            host.starts_with(&self.path),
-            "the source root is never left"
-        );
-        host
+        crate::paths::join_under(&self.path, logical)
     }
 
     /// Resolve a logical path, following symlinks within the root.
@@ -89,9 +84,6 @@ impl SourceRoot {
         let mut hops = 0usize;
 
         while let Some(component) = pending.pop() {
-            assert!(current.is_absolute());
-            assert!(hops <= SYMLINK_HOPS_MAX);
-
             if component == ".." {
                 current.pop();
                 continue;
@@ -130,7 +122,6 @@ impl SourceRoot {
             pending.extend(components_reversed(&target));
         }
 
-        assert!(links.len() <= SYMLINK_HOPS_MAX);
         self.describe(current, links)
     }
 
@@ -159,8 +150,6 @@ impl SourceRoot {
 
     /// Read a file identified by a logical path.
     pub fn read(&self, logical: &Path) -> Result<Option<Vec<u8>>> {
-        assert!(logical.is_absolute());
-
         match self.resolve(logical)? {
             Some(resolved) if resolved.kind == EntryKind::File => Ok(Some(
                 std::fs::read(&resolved.host).map_err(|e| io(&resolved.host, e))?,
@@ -191,7 +180,6 @@ impl SourceRoot {
         // Readdir order differs between filesystems; sorting is what makes two
         // runs over the same tree produce the same bundle.
         names.sort();
-        assert!(names.is_sorted());
         Ok(names)
     }
 }
@@ -243,7 +231,6 @@ impl ElfCache {
     /// ELF object.
     pub fn get(&mut self, host: &Path) -> Result<Option<ElfMetadata>> {
         if let Some(cached) = self.entries.get(host) {
-            assert!(cached.as_ref().is_none_or(|m| m.path == host));
             return Ok(cached.clone());
         }
         let parsed = match ElfMetadata::parse_file(host) {
@@ -251,7 +238,6 @@ impl ElfCache {
             Err(Error::NotElf { .. }) | Err(Error::Elf { .. }) => None,
             Err(e) => return Err(e),
         };
-        assert!(parsed.as_ref().is_none_or(|m| m.path == host));
         self.entries.insert(host.to_path_buf(), parsed.clone());
         Ok(parsed)
     }

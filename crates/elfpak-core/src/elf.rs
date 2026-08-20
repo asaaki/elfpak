@@ -174,10 +174,7 @@ const DLOPEN_SYMBOLS: &[&str] = &["dlopen", "dlmopen", "__libc_dlopen_mode"];
 impl ElfMetadata {
     pub fn parse_file(path: &Path) -> Result<ElfMetadata> {
         let bytes = std::fs::read(path).map_err(|e| io(path, e))?;
-        let metadata = Self::parse_bytes(path, &bytes)?;
-        assert_eq!(metadata.path, path);
-        assert_eq!(metadata.size, bytes.len() as u64);
-        Ok(metadata)
+        Self::parse_bytes(path, &bytes)
     }
 
     /// Cheap check used to decide whether a candidate file is worth parsing.
@@ -203,9 +200,6 @@ impl ElfMetadata {
         };
         let rpath: Vec<String> = elf.rpaths.iter().flat_map(|s| split_paths(s)).collect();
         let runpath: Vec<String> = elf.runpaths.iter().flat_map(|s| split_paths(s)).collect();
-        assert!(!rpath.iter().any(String::is_empty));
-        assert!(!runpath.iter().any(String::is_empty));
-
         Ok(ElfMetadata {
             path: path.to_path_buf(),
             architecture: architecture_of(&elf),
@@ -271,8 +265,6 @@ fn dlopen_references(elf: &goblin::elf::Elf<'_>) -> Vec<String> {
     }
     found.sort_unstable();
     found.dedup();
-    assert!(found.len() <= DLOPEN_SYMBOLS.len());
-    assert!(found.is_sorted());
     found
 }
 
@@ -282,14 +274,11 @@ fn dlopen_references(elf: &goblin::elf::Elf<'_>) -> Vec<String> {
 /// working directory, which would make the result depend on where `elfpak` was
 /// invoked from.
 pub fn split_paths(value: &str) -> Vec<String> {
-    let parts: Vec<String> = value
+    value
         .split(':')
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .collect();
-    assert!(parts.len() <= value.len() + 1);
-    assert!(!parts.iter().any(String::is_empty));
-    parts
+        .collect()
 }
 
 #[cfg(test)]

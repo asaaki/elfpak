@@ -253,8 +253,6 @@ impl RuntimePolicy {
                 user.name, user.uid, user.gid, user.name
             ));
         }
-        assert!(out.ends_with('\n'));
-        assert!(out.lines().count() >= 2);
         out.into_bytes()
     }
 
@@ -267,8 +265,6 @@ impl RuntimePolicy {
         {
             out.push_str(&format!("{}:x:{}:\n", user.group, user.gid));
         }
-        assert!(out.ends_with('\n'));
-        assert!(out.lines().count() >= 2);
         out.into_bytes()
     }
 
@@ -284,8 +280,6 @@ impl RuntimePolicy {
         out.push_str("networks:   files\n");
         out.push_str("protocols:  files\n");
         out.push_str("services:   files\n");
-        assert!(out.contains("hosts:"));
-        assert!(out.ends_with('\n'));
         out.into_bytes()
     }
 }

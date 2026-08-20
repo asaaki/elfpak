@@ -197,8 +197,6 @@ impl Resolver {
     /// `binary` is a host path; `install` is where the executable will live in
     /// the generated rootfs. Every other object keeps its original location.
     pub fn closure(&mut self, binary: &Path, install: &Path) -> Result<DependencyGraph> {
-        assert!(install.is_absolute());
-
         let metadata = ElfMetadata::parse_file(binary)?;
         if !metadata.architecture.machine.is_supported_target() {
             return Err(Error::UnsupportedArchitecture {
@@ -230,7 +228,7 @@ impl Resolver {
             size,
             links: Vec::new(),
             dlopen_references: metadata.dlopen_references.clone(),
-        });
+        })?;
         graph.root = root_id;
 
         if metadata.interpreter.is_some() {
@@ -239,9 +237,6 @@ impl Resolver {
 
         self.walk_needed(&mut graph, root_id, metadata, Vec::new())?;
 
-        assert_eq!(graph.root, root_id);
-        assert_eq!(graph.root_node().architecture, architecture);
-        assert!(graph.node_count() >= 1);
         Ok(graph)
     }
 
@@ -274,7 +269,7 @@ impl Resolver {
         let interp_meta = self.elf.require(&resolved.host)?;
         self.check_architecture(&interp_meta, &architecture, interp, &resolved)?;
         let id = self.insert_object(graph, &resolved, &interp_meta, NodeKind::Interpreter)?;
-        graph.connect(root_id, id, DependencyReason::Interpreter);
+        graph.connect(root_id, id, DependencyReason::Interpreter)?;
         Ok(())
     }
 
@@ -296,10 +291,7 @@ impl Resolver {
         let mut queue = vec![(start, metadata, inherited)];
         // Only an object that was not already in the graph is queued, so the
         // walk visits each object once and is bounded by the graph's own limit.
-        let mut visits = 0usize;
         while let Some((id, meta, inherited)) = queue.pop() {
-            visits += 1;
-            assert!(visits <= crate::graph::NODES_MAX);
             assert_eq!(meta.architecture, architecture);
 
             let mut chain = Vec::new();
@@ -332,7 +324,7 @@ impl Resolver {
                     DependencyReason::Needed {
                         soname: soname.clone(),
                     },
-                );
+                )?;
                 if known.is_none() {
                     queue.push((child, library.metadata, chain.clone()));
                 }
@@ -379,7 +371,7 @@ impl Resolver {
             &library.metadata,
             NodeKind::SharedObject,
         )?;
-        graph.connect(from, id, reason);
+        graph.connect(from, id, reason)?;
         if existing.is_none() {
             // A policy-loaded module is opened by `dlopen` from libc, not by the
             // application, so it inherits no RPATH from the loading chain.
@@ -399,7 +391,7 @@ impl Resolver {
         assert_eq!(resolved.kind, EntryKind::File);
 
         let (digest, size) = self.digests.get(&resolved.host)?;
-        Ok(graph.insert(Node {
+        graph.insert(Node {
             source: resolved.host.clone(),
             logical: resolved.logical.clone(),
             destination: resolved.logical.clone(),
@@ -410,7 +402,7 @@ impl Resolver {
             size,
             links: resolved.links.clone(),
             dlopen_references: metadata.dlopen_references.clone(),
-        }))
+        })
     }
 
     fn check_architecture(
@@ -443,7 +435,7 @@ impl Resolver {
 
     /// Candidate directories in glibc's documented order, each tagged with
     /// where it came from so the planner can tell what survives packaging.
-    fn search_directories(&self, request: &LibraryRequest) -> Vec<(PathBuf, SearchOrigin)> {
+    fn search_directories(&self, request: &LibraryRequest) -> Result<Vec<(PathBuf, SearchOrigin)>> {
         let ctx = self.token_context(&request.requester, &request.architecture);
         let mut dirs: Vec<(PathBuf, SearchOrigin)> = Vec::new();
 
@@ -451,24 +443,26 @@ impl Resolver {
         for level in &request.rpath_chain {
             for entry in level {
                 let dir = tokens::expand_search_path(entry, &ctx);
-                push_directory(&mut dirs, dir, SearchOrigin::ObjectPath);
+                push_directory(&mut dirs, dir, SearchOrigin::ObjectPath)?;
             }
         }
         // 2. LD_LIBRARY_PATH equivalent.
         for dir in &self.library_paths {
-            push_directory(&mut dirs, dir.clone(), SearchOrigin::LibraryPath);
+            push_directory(&mut dirs, dir.clone(), SearchOrigin::LibraryPath)?;
         }
         // 3. DT_RUNPATH of the requesting object only.
         for entry in &request.runpath {
             let dir = tokens::expand_search_path(entry, &ctx);
-            push_directory(&mut dirs, dir, SearchOrigin::ObjectPath);
+            push_directory(&mut dirs, dir, SearchOrigin::ObjectPath)?;
         }
 
-        assert!(dirs.len() <= SEARCH_DIRECTORIES_MAX);
-        dirs
+        Ok(dirs)
     }
 
-    fn default_directories(&self, architecture: &Architecture) -> Vec<(PathBuf, SearchOrigin)> {
+    fn default_directories(
+        &self,
+        architecture: &Architecture,
+    ) -> Result<Vec<(PathBuf, SearchOrigin)>> {
         let mut dirs: Vec<(PathBuf, SearchOrigin)> = Vec::new();
         let configured = self
             .conf_paths
@@ -479,15 +473,10 @@ impl Resolver {
             .into_iter()
             .map(|dir| (dir, SearchOrigin::DefaultDirectory));
         for (dir, origin) in configured.chain(builtin) {
-            push_directory(&mut dirs, dir, origin);
+            push_directory(&mut dirs, dir, origin)?;
         }
 
-        assert!(
-            !dirs.is_empty(),
-            "every architecture has default directories"
-        );
-        assert!(dirs.len() <= SEARCH_DIRECTORIES_MAX);
-        dirs
+        Ok(dirs)
     }
 
     /// glibc-hwcaps subdirectories, highest priority first.
@@ -560,25 +549,43 @@ impl Resolver {
 
 /// Append a directory unless it is already listed. The loader probes each
 /// directory once, in first-seen order, and so does this.
-fn push_directory(dirs: &mut Vec<(PathBuf, SearchOrigin)>, dir: PathBuf, origin: SearchOrigin) {
+fn push_directory(
+    dirs: &mut Vec<(PathBuf, SearchOrigin)>,
+    dir: PathBuf,
+    origin: SearchOrigin,
+) -> Result<()> {
     assert!(dir.is_absolute());
 
     if dirs.iter().any(|(known, _)| known == &dir) {
-        return;
+        return Ok(());
     }
-    assert!(
-        dirs.len() < SEARCH_DIRECTORIES_MAX,
-        "search list exceeds {SEARCH_DIRECTORIES_MAX}"
-    );
+    if dirs.len() >= SEARCH_DIRECTORIES_MAX {
+        return Err(Error::LimitExceeded {
+            resource: "library search path",
+            limit: SEARCH_DIRECTORIES_MAX,
+        });
+    }
     dirs.push((dir, origin));
+    Ok(())
 }
 
 impl DynamicLinkerResolver for Resolver {
     /// One `DT_NEEDED` lookup: a soname is either a path or a search, and a
     /// search finds a compatible object, an incompatible one, or nothing.
     fn resolve(&mut self, request: &LibraryRequest) -> Result<ResolvedLibrary> {
-        assert!(!request.soname.is_empty());
-        assert!(request.requester.is_absolute());
+        if request.soname.is_empty() {
+            return Err(Error::Config {
+                message: "library name cannot be empty".to_string(),
+            });
+        }
+        if !request.requester.is_absolute() {
+            return Err(Error::Config {
+                message: format!(
+                    "library requester `{}` is not an absolute logical path",
+                    request.requester.display()
+                ),
+            });
+        }
 
         let mut searched = Vec::new();
         let mut mismatch = None;
@@ -593,15 +600,6 @@ impl DynamicLinkerResolver for Resolver {
         };
 
         if let Some(library) = found {
-            // An object satisfies a request only if its own header says it can
-            // be mapped into the same process. The file name means nothing.
-            assert!(
-                library
-                    .metadata
-                    .architecture
-                    .is_compatible_with(&request.architecture)
-            );
-            assert_eq!(library.resolved.kind, EntryKind::File);
             return Ok(library);
         }
 
@@ -635,7 +633,7 @@ impl Resolver {
         assert!(!request.soname.contains('/'));
 
         // 1-3. DT_RPATH, --library-path, DT_RUNPATH.
-        for (dir, origin) in self.search_directories(request) {
+        for (dir, origin) in self.search_directories(request)? {
             if let Some(found) = self.try_directory(&dir, request, searched, mismatch)? {
                 self.note(request, &dir, origin);
                 return Ok(Some(found));
@@ -649,7 +647,6 @@ impl Resolver {
             .map(|c| c.lookup(&request.soname).to_vec())
             .unwrap_or_default();
         for candidate in cached {
-            assert!(candidate.is_absolute());
             if let Some(found) = self.try_path(&candidate, request, searched, mismatch)? {
                 self.note(request, &logical_parent(&candidate), SearchOrigin::Cache);
                 return Ok(Some(found));
@@ -660,12 +657,48 @@ impl Resolver {
         if request.nodeflib {
             return Ok(None);
         }
-        for (dir, origin) in self.default_directories(&request.architecture) {
+        for (dir, origin) in self.default_directories(&request.architecture)? {
             if let Some(found) = self.try_directory(&dir, request, searched, mismatch)? {
                 self.note(request, &dir, origin);
                 return Ok(Some(found));
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elf::{ElfClass, Endianness, Machine};
+
+    #[test]
+    fn an_oversized_search_path_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = (0..=SEARCH_DIRECTORIES_MAX)
+            .map(|index| PathBuf::from(format!("/search/{index}")))
+            .collect();
+        let resolver = Resolver::new(SourceRoot::new(temp.path())).with_library_paths(paths);
+        let request = LibraryRequest {
+            soname: "libexample.so.1".to_string(),
+            requester: PathBuf::from("/app/server"),
+            rpath_chain: Vec::new(),
+            runpath: Vec::new(),
+            nodeflib: false,
+            architecture: Architecture {
+                machine: Machine::X86_64,
+                class: ElfClass::Elf64,
+                endianness: Endianness::Little,
+            },
+        };
+
+        let error = resolver.search_directories(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "library search path",
+                limit: SEARCH_DIRECTORIES_MAX,
+            }
+        ));
     }
 }

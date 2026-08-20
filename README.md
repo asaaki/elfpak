@@ -100,16 +100,17 @@ cross-architecture packaging and the test suite.
 
 ```console
 $ just check              # fmt, clippy -D warnings, and the whole test suite
-$ just test               # unit, integration, loader-oracle and style tests
+$ just test               # unit, integration and loader-oracle tests
 $ just smoke              # Docker smoke tests (see DOCUMENTATION.md)
 $ just smoke --fresh      # ... with nothing reused from a previous run
 
 $ docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
 ```
 
-The code follows [TigerStyle](https://tigerstyle.dev/); [STYLE.md](STYLE.md)
-records what that means here — assertions as pre- and postconditions, a bound on
-every loop, no recursion, and the 70-line/100-column limits enforced by a test.
+The design is inspired by [TigerStyle](https://tigerstyle.dev/): safety first,
+bounded work, explicit invariants, deterministic output, and performance that
+does not come at the cost of readable Rust. [STYLE.md](STYLE.md) records the
+project's adaptation without imposing mechanical line-count rules.
 
 The distribution image is multi-platform and cross-compiled, so building every
 architecture never needs emulation.

@@ -53,7 +53,6 @@ impl RootFsBuilder {
             .output
             .canonicalize()
             .map_err(|e| io(&self.output, e))?;
-        assert!(output.is_absolute());
 
         let mut report = RootFsReport::default();
         // Entries are sorted by destination, so parents always precede children.
@@ -135,10 +134,9 @@ fn write_directory(target: &Path, mode: u32) -> Result<()> {
     set_mode(target, mode)
 }
 
-/// Recreate a symlink verbatim. A planned symlink always has a target; `/` is a
-/// harmless fallback for one that somehow does not.
+/// Recreate a symlink verbatim. Plan validation guarantees a target is present.
 fn write_symlink(target: &Path, link_target: Option<&Path>) -> Result<()> {
-    let link_target = link_target.unwrap_or(Path::new("/"));
+    let link_target = link_target.expect("validated symlinks have a target");
     remove_existing(target)?;
     std::os::unix::fs::symlink(link_target, target).map_err(|e| io(target, e))
 }
@@ -148,19 +146,14 @@ fn write_symlink(target: &Path, link_target: Option<&Path>) -> Result<()> {
 /// Source-backed files are copied rather than read into memory, so an
 /// `--include` of an arbitrarily large file costs no more than a buffer.
 fn write_file(target: &Path, file: &PlannedFile) -> Result<u64> {
-    assert!(file.link_target.is_none());
-
     match (&file.content, &file.source) {
-        (Some(content), _) => {
+        (Some(content), None) => {
             assert_eq!(content.len() as u64, file.size);
             std::fs::write(target, content).map_err(|e| io(target, e))?;
             Ok(content.len() as u64)
         }
         (None, Some(source)) => std::fs::copy(source, target).map_err(|e| io(source, e)),
-        (None, None) => {
-            std::fs::write(target, b"").map_err(|e| io(target, e))?;
-            Ok(0)
-        }
+        _ => unreachable!("validated regular files have exactly one content source"),
     }
 }
 
