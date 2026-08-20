@@ -11,13 +11,16 @@
 # toolchain never moves under us. Refresh a digest with:
 #   docker buildx imagetools inspect <tag> --format '{{.Manifest.Digest}}'
 ARG ELFPAK_IMAGE=elfpak:local
-ARG ALPINE_IMAGE=alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+# The Rust Alpine image, which the elfpak image is built from as well, already
+# ships Alpine's gcc and musl headers. Using it here keeps the pinning promise
+# honest: `apk add` would fetch whatever the mirror holds today, so a digest
+# would no longer describe the build. It also drops the only step in this test
+# that needed the network, and reuses a layer the suite has already pulled.
+ARG RUST_IMAGE=rust:1.97.1-alpine3.24@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900
 
 FROM ${ELFPAK_IMAGE} AS elfpak
 
-FROM ${ALPINE_IMAGE} AS build
-
-RUN apk add --no-cache build-base
+FROM ${RUST_IMAGE} AS build
 
 COPY fixtures/musl-hello/main.c /src/main.c
 

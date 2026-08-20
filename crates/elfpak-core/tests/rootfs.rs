@@ -449,3 +449,120 @@ fn manifests_without_a_policy_section_still_load() {
     assert!(manifest.policy.preset.is_none());
     assert!(!manifest.policy.tmp);
 }
+
+#[test]
+fn a_leftover_symlink_never_redirects_a_write() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+    let outside = output.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("victim"), b"untouched").unwrap();
+
+    // A previous run — or anything else — may have left a symlink where an
+    // entry is about to be written. Writing onto it would follow it out of the
+    // output root, which the guarantee "writes only beneath --output" forbids.
+    std::fs::create_dir_all(rootfs.join("app")).unwrap();
+    std::os::unix::fs::symlink(outside.join("victim"), rootfs.join("app/server")).unwrap();
+    std::fs::create_dir_all(rootfs.join("usr")).unwrap();
+    std::os::unix::fs::symlink(&outside, rootfs.join("usr/lib")).unwrap();
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
+
+    assert_eq!(
+        std::fs::read(outside.join("victim")).unwrap(),
+        b"untouched",
+        "the write escaped the output root"
+    );
+    assert!(
+        !std::fs::symlink_metadata(rootfs.join("app/server"))
+            .unwrap()
+            .is_symlink(),
+        "the stale link was replaced by the real file"
+    );
+    assert!(rootfs.join("usr/lib/libtop.so.1").is_file());
+    assert!(
+        !outside.join("libtop.so.1").exists(),
+        "a symlinked directory must not become a write channel"
+    );
+
+    // Everything written is exactly what a run into a fresh directory produces.
+    let fresh = output.path().join("fresh");
+    RootFsBuilder::new(&fresh).apply(&plan).unwrap();
+    assert_eq!(snapshot(&rootfs), snapshot(&fresh));
+}
+
+#[test]
+fn timestamps_are_pinned_for_files_and_directories() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
+
+    for entry in [rootfs.join("app/server"), rootfs.join("app"), rootfs.join("usr/lib")] {
+        let modified = std::fs::metadata(&entry).unwrap().modified().unwrap();
+        assert_eq!(
+            modified,
+            std::time::UNIX_EPOCH,
+            "{} keeps a build-time timestamp",
+            entry.display()
+        );
+    }
+}
+
+#[test]
+fn strict_verification_detects_a_changed_mode() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
+    let manifest = Manifest::from_plan(&plan, &sysroot.root, Some(&rootfs));
+    let strict = VerifyOptions { strict: true };
+    assert!(manifest.verify(&rootfs, &strict).is_ok());
+
+    // setuid is invisible to a content digest.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        rootfs.join("app/server"),
+        std::fs::Permissions::from_mode(0o4755),
+    )
+    .unwrap();
+
+    assert!(
+        manifest.verify(&rootfs, &VerifyOptions::default()).is_ok(),
+        "the default mode only covers content"
+    );
+    let report = manifest.verify(&rootfs, &strict);
+    assert!(!report.is_ok());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.path == "/app/server" && p.detail.contains("4755")),
+        "{:?}",
+        report.problems
+    );
+}

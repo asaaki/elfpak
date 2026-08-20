@@ -46,6 +46,7 @@ pub enum RuntimeFeature {
     PasswdGroup,
     Nsswitch,
     Tzdata,
+    LdSoCache,
 }
 
 impl RuntimeFeature {
@@ -56,7 +57,57 @@ impl RuntimeFeature {
             RuntimeFeature::PasswdGroup => "passwd-group",
             RuntimeFeature::Nsswitch => "nsswitch",
             RuntimeFeature::Tzdata => "tzdata",
+            RuntimeFeature::LdSoCache => "ld-so-cache",
         }
+    }
+}
+
+/// Whether the bundle gets a generated `/etc/ld.so.cache`.
+///
+/// The loader searches a fixed set of directories plus whatever the objects
+/// themselves declare; everything else it knows comes from the cache, and a
+/// bundle has no `ldconfig` to build one. [`CachePolicy::Auto`] therefore
+/// writes a cache exactly when the plan contains something the loader would
+/// otherwise fail to find.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CachePolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl CachePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CachePolicy::Auto => "auto",
+            CachePolicy::Always => "always",
+            CachePolicy::Never => "never",
+        }
+    }
+
+    /// `--ld-so-cache[=BOOL]`: absent leaves the decision to the planner.
+    pub fn from_flag(value: Option<bool>) -> CachePolicy {
+        match value {
+            None => CachePolicy::Auto,
+            Some(true) => CachePolicy::Always,
+            Some(false) => CachePolicy::Never,
+        }
+    }
+
+    /// Whether to write a cache, given whether the plan needs one.
+    pub fn applies(&self, needed: bool) -> bool {
+        match self {
+            CachePolicy::Auto => needed,
+            CachePolicy::Always => true,
+            CachePolicy::Never => false,
+        }
+    }
+}
+
+impl std::fmt::Display for CachePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -125,6 +176,9 @@ pub struct RuntimePolicy {
     pub passwd_group: bool,
     pub nsswitch: bool,
     pub tzdata: bool,
+    /// Generated `/etc/ld.so.cache`. Not a preset choice: the planner decides
+    /// from the closure unless the caller overrides it.
+    pub ld_so_cache: CachePolicy,
     pub user: Option<UserSpec>,
     pub includes: Vec<PathBuf>,
 }
@@ -144,6 +198,7 @@ impl RuntimePolicy {
                 passwd_group: false,
                 nsswitch: false,
                 tzdata: false,
+                ld_so_cache: CachePolicy::Auto,
                 user: None,
                 includes: Vec::new(),
             },
@@ -154,6 +209,7 @@ impl RuntimePolicy {
                 passwd_group: true,
                 nsswitch: true,
                 tzdata: false,
+                ld_so_cache: CachePolicy::Auto,
                 user: None,
                 includes: Vec::new(),
             },
@@ -294,6 +350,19 @@ mod tests {
         policy.user = Some(UserSpec::parse("65534:65534").unwrap());
         let passwd = String::from_utf8(policy.passwd_contents()).unwrap();
         assert_eq!(passwd.lines().count(), 2);
+    }
+
+    #[test]
+    fn the_cache_is_written_when_the_plan_needs_one() {
+        assert!(!CachePolicy::Auto.applies(false));
+        assert!(CachePolicy::Auto.applies(true));
+        assert!(CachePolicy::Always.applies(false));
+        assert!(!CachePolicy::Never.applies(true));
+
+        assert_eq!(CachePolicy::from_flag(None), CachePolicy::Auto);
+        assert_eq!(CachePolicy::from_flag(Some(true)), CachePolicy::Always);
+        assert_eq!(CachePolicy::from_flag(Some(false)), CachePolicy::Never);
+        assert_eq!(RuntimePolicy::default().ld_so_cache, CachePolicy::Auto);
     }
 
     #[test]

@@ -22,8 +22,12 @@ pub enum Error {
     #[error("`{path}` is not an ELF file")]
     NotElf { path: PathBuf },
 
-    #[error("`{path}` targets an unsupported architecture (e_machine = {machine:#x})")]
-    UnsupportedArchitecture { path: PathBuf, machine: u16 },
+    #[error("`{path}` targets an unsupported architecture: {architecture} (e_machine = {machine:#x})")]
+    UnsupportedArchitecture {
+        path: PathBuf,
+        architecture: String,
+        machine: u16,
+    },
 
     #[error("unable to resolve shared library `{soname}`")]
     UnresolvedLibrary {
@@ -127,6 +131,9 @@ impl Error {
                 format!("requested:\n  {soname} for {expected}"),
                 format!("found:\n  {} ({found_architecture})", found.display()),
             ],
+            Error::UnsupportedArchitecture { .. } => {
+                vec!["supported:\n  x86_64\n  aarch64".to_string()]
+            }
             Error::MissingRuntimeFile { searched, .. } if !searched.is_empty() => {
                 let list = searched
                     .iter()

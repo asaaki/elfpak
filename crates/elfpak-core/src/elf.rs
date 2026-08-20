@@ -54,7 +54,7 @@ pub enum ObjectType {
 }
 
 impl Machine {
-    fn from_e_machine(machine: u16) -> Machine {
+    pub(crate) fn from_e_machine(machine: u16) -> Machine {
         match machine {
             3 => Machine::I386,
             40 => Machine::Arm,
@@ -102,7 +102,7 @@ impl std::fmt::Display for Machine {
             Machine::I386 => f.write_str("i386"),
             Machine::Arm => f.write_str("arm"),
             Machine::RiscV64 => f.write_str("riscv64"),
-            Machine::Other(m) => write!(f, "unknown(e_machine={m:#x})"),
+            Machine::Other(_) => f.write_str("unknown"),
         }
     }
 }
@@ -145,6 +145,9 @@ pub struct ElfMetadata {
     /// Path the metadata was read from (host path, not logical rootfs path).
     pub path: PathBuf,
     pub architecture: Architecture,
+    /// Raw `e_machine`, kept so diagnostics can name what was actually found
+    /// even for architectures [`Machine`] does not model.
+    pub e_machine: u16,
     pub object_type: ObjectType,
     pub interpreter: Option<PathBuf>,
     pub needed: Vec<String>,
@@ -234,6 +237,7 @@ impl ElfMetadata {
         Ok(ElfMetadata {
             path: path.to_path_buf(),
             architecture,
+            e_machine: elf.header.e_machine,
             object_type,
             interpreter: elf.interpreter.map(PathBuf::from),
             needed: elf.libraries.iter().map(|s| s.to_string()).collect(),
@@ -347,5 +351,17 @@ mod tests {
         assert!(Machine::Aarch64.is_supported_target());
         assert!(!Machine::I386.is_supported_target());
         assert!(!Machine::Other(0xbeef).is_supported_target());
+    }
+
+    #[test]
+    fn the_raw_machine_is_kept_for_diagnostics() {
+        let exe = std::env::current_exe().unwrap();
+        let metadata = ElfMetadata::parse_file(&exe).unwrap();
+        assert_eq!(
+            Machine::from_e_machine(metadata.e_machine),
+            metadata.architecture.machine
+        );
+        assert_eq!(Machine::from_e_machine(243), Machine::RiscV64);
+        assert_eq!(Machine::Other(0xbeef).to_string(), "unknown");
     }
 }

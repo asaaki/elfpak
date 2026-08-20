@@ -43,6 +43,9 @@ pub struct RuntimeConfig {
     pub passwd_group: Option<bool>,
     pub nsswitch: Option<bool>,
     pub tzdata: Option<bool>,
+    /// `true` always writes a cache, `false` never does; left out, the planner
+    /// writes one exactly when the closure needs it.
+    pub ld_so_cache: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,6 +120,7 @@ allow = ["libc.so.6", "libgcc_s.so.1"]
         assert_eq!(config.package.install, Some(PathBuf::from("/app/server")));
         assert_eq!(config.runtime.preset, Some(Preset::Web));
         assert_eq!(config.runtime.tzdata, Some(false));
+        assert_eq!(config.runtime.ld_so_cache, None);
         assert_eq!(config.include.paths, vec![PathBuf::from("/app/templates")]);
         assert_eq!(config.dependencies.allow.unwrap().len(), 2);
     }

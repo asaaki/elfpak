@@ -14,8 +14,8 @@ use clap::Parser;
 use elfpak_core::config::Config;
 use elfpak_core::manifest::{DEFAULT_MANIFEST_NAME, Manifest, VerifyOptions};
 use elfpak_core::{
-    DependencyPolicy, Error, Planner, Preset, RootFsBuilder, RootFsReport, RuntimePolicy,
-    SourceRoot, TarBuilder, TarReport, UserSpec,
+    CachePolicy, DependencyPolicy, Error, Planner, Preset, RootFsBuilder, RootFsReport,
+    RuntimePolicy, SourceRoot, TarBuilder, TarReport, UserSpec,
 };
 
 use cli::{BundleArgs, Cli, Command, InspectArgs, VerifyArgs};
@@ -145,6 +145,7 @@ fn bundle(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()> {
             }
         }
     }
+    policy.ld_so_cache = CachePolicy::from_flag(args.ld_so_cache.or(config.runtime.ld_so_cache));
     if let Some(user) = args.user.clone().or_else(|| config.runtime.user.clone()) {
         policy.user = Some(UserSpec::parse(&user)?);
     }

@@ -10,10 +10,15 @@ use crate::elf::Architecture;
 use crate::error::{Error, Result, io};
 use crate::graph::{DependencyGraph, DependencyReason, Digest, NodeKind};
 use crate::hash::{DigestCache, sha256_bytes};
-use crate::paths::{ancestor_dirs, normalize_absolute};
+use crate::paths::{ancestor_dirs, logical_parent, normalize_absolute};
 use crate::resolver::Resolver;
+use crate::resolver::cache::{self, CacheEntry};
 use crate::rootfs::policy::{DependencyPolicy, Preset, RuntimeFeature, RuntimePolicy};
 use crate::source::{EntryKind, SourceRoot};
+
+/// Where the loader looks for its cache, and therefore where a generated one
+/// has to go.
+pub const LD_SO_CACHE: &str = "/etc/ld.so.cache";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PlannedFileKind {
@@ -163,6 +168,14 @@ impl Planner {
     }
 
     pub fn plan(&self) -> Result<BundlePlan> {
+        if self.install_path.file_name().is_none() {
+            return Err(Error::Config {
+                message: format!(
+                    "install path `{}` does not name a file",
+                    self.install_path.display()
+                ),
+            });
+        }
         let mut resolver =
             Resolver::new(self.source_root.clone()).with_library_paths(self.library_paths.clone());
         let mut graph = resolver.closure(&self.binary, &self.install_path)?;
@@ -192,7 +205,7 @@ impl Planner {
                         &library,
                         root_id,
                         DependencyReason::RuntimePolicy {
-                            feature: "nsswitch",
+                            feature: RuntimeFeature::Nsswitch,
                         },
                     )?;
                 }
@@ -200,6 +213,101 @@ impl Planner {
         }
 
         self.validate_dependencies(&graph)?;
+        self.check_install_collision(&graph)?;
+
+        // Two things can leave a bundle unable to load a library it contains:
+        // a library outside the directories the loader searches, and an
+        // executable whose $ORIGIN-relative search paths no longer point where
+        // they did once it is installed somewhere else. Both are cured by the
+        // one thing the loader consults besides those directories — a cache —
+        // and a bundle can only have one if `elfpak` writes it.
+        let unreachable: Vec<String> = resolver
+            .notes()
+            .iter()
+            .map(|note| {
+                format!(
+                    "{} in {} (found through {})",
+                    note.soname,
+                    note.directory.display(),
+                    note.origin.as_str()
+                )
+            })
+            .collect();
+
+        let source_dir = logical_parent(&graph.root_node().logical);
+        let install_dir = logical_parent(&graph.root_node().destination);
+        let relocated: Vec<String> = if install_dir == source_dir {
+            Vec::new()
+        } else {
+            graph
+                .executable_search_paths
+                .iter()
+                .filter(|entry| entry.contains("$ORIGIN") || entry.contains("${ORIGIN}"))
+                .cloned()
+                .collect()
+        };
+
+        let needs_cache = !unreachable.is_empty() || !relocated.is_empty();
+        let cache = self
+            .runtime_policy
+            .ld_so_cache
+            .applies(needs_cache)
+            .then(|| self.ld_so_cache(&graph))
+            .flatten();
+
+        match cache {
+            Some(bytes) => builder.push_generated(
+                Path::new(LD_SO_CACHE),
+                bytes,
+                InclusionReason::RuntimePolicy {
+                    feature: RuntimeFeature::LdSoCache,
+                },
+            ),
+            None => {
+                if !unreachable.is_empty() {
+                    warnings.push(Warning {
+                        code: "E2005",
+                        message: match unreachable.len() {
+                            1 => "a library lives outside the directories the loader searches"
+                                .to_string(),
+                            n => format!(
+                                "{n} libraries live outside the directories the loader searches"
+                            ),
+                        },
+                        details: unreachable
+                            .into_iter()
+                            .chain([if uses_glibc_loader(&graph) {
+                                format!(
+                                    "Without {LD_SO_CACHE} the packaged application finds these \
+                                     only if its DT_RPATH/DT_RUNPATH covers them."
+                                )
+                            } else {
+                                "This loader does not read an ld.so.cache, so the paths have to \
+                                 come from the objects themselves."
+                                    .to_string()
+                            }])
+                            .collect(),
+                    });
+                }
+                if !relocated.is_empty() {
+                    warnings.push(Warning {
+                        code: "E2006",
+                        message: format!(
+                            "the executable declares $ORIGIN-relative search paths and moves from {} to {}",
+                            source_dir.display(),
+                            install_dir.display()
+                        ),
+                        details: relocated
+                            .into_iter()
+                            .chain([format!(
+                                "Install it at {} to keep those paths pointing where they did.",
+                                graph.root_node().logical.display()
+                            )])
+                            .collect(),
+                    });
+                }
+            }
+        }
 
         // ELF closure.
         for (id, node) in graph.nodes.iter().enumerate() {
@@ -215,9 +323,9 @@ impl Planner {
                             soname: soname.clone(),
                         },
                         DependencyReason::Interpreter => InclusionReason::Interpreter,
-                        DependencyReason::RuntimePolicy { .. } => InclusionReason::RuntimePolicy {
-                            feature: RuntimeFeature::Nsswitch,
-                        },
+                        DependencyReason::RuntimePolicy { feature } => {
+                            InclusionReason::RuntimePolicy { feature: *feature }
+                        }
                     },
                     None => InclusionReason::Application,
                 }
@@ -291,12 +399,74 @@ impl Planner {
         })
     }
 
+    /// A `/etc/ld.so.cache` describing every shared object in the bundle.
+    ///
+    /// `None` when there is nothing to record, or when the target is one the
+    /// cache format cannot describe — the caller then reports the problem
+    /// instead of writing a cache the loader would reject.
+    fn ld_so_cache(&self, graph: &DependencyGraph) -> Option<Vec<u8>> {
+        if !uses_glibc_loader(graph) {
+            // musl resolves libraries through /etc/ld-musl-<arch>.path and
+            // ignores ld.so.cache entirely. Writing one would look like a fix
+            // and change nothing, so the caller reports the problem instead.
+            return None;
+        }
+        let architecture = graph.root_node().architecture;
+        let entries: Vec<CacheEntry> = graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::SharedObject | NodeKind::Interpreter))
+            .map(|node| CacheEntry {
+                // A library without DT_SONAME is looked up by file name, which
+                // is also what its dependents will have recorded.
+                soname: node.soname.clone().unwrap_or_else(|| {
+                    node.destination
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                }),
+                path: node.destination.clone(),
+            })
+            .filter(|entry| !entry.soname.is_empty())
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        cache::build(&architecture, &entries)
+    }
+
+    /// The executable would otherwise displace a library that has to keep its
+    /// own path, leaving the bundle with a dependency it cannot load.
+    fn check_install_collision(&self, graph: &DependencyGraph) -> Result<()> {
+        let install = &graph.root_node().destination;
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if id != graph.root && &node.destination == install {
+                return Err(Error::Config {
+                    message: format!(
+                        "install path `{}` collides with `{}`, which the closure needs at that exact path",
+                        self.install_path.display(),
+                        node.logical.display()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce the dependency allow-list.
+    ///
+    /// Only the application's own ELF closure is policed. The interpreter is
+    /// exempt because it is not a `DT_NEEDED` dependency, and so is anything
+    /// runtime policy pulled in — the caller asked for those by name, and could
+    /// not predict the sonames of, say, the NSS modules a source root happens to
+    /// still ship.
     fn validate_dependencies(&self, graph: &DependencyGraph) -> Result<()> {
         if self.dependency_policy.allow.is_none() {
             return Ok(());
         }
+        let application = graph.application_closure();
         for (id, node) in graph.nodes.iter().enumerate() {
-            if node.kind != NodeKind::SharedObject {
+            if node.kind != NodeKind::SharedObject || !application.contains(&id) {
                 continue;
             }
             let soname = node
@@ -638,6 +808,19 @@ impl<'a> PlanBuilder<'a> {
     }
 }
 
+/// Whether `PT_INTERP` is a glibc loader, and therefore whether an
+/// `ld.so.cache` means anything to the packaged application.
+fn uses_glibc_loader(graph: &DependencyGraph) -> bool {
+    match &graph.declared_interpreter {
+        Some(interpreter) => !interpreter
+            .file_name()
+            .map(|name| name.to_string_lossy().contains("ld-musl"))
+            .unwrap_or(false),
+        // A static binary has no loader, and no libraries for a cache to name.
+        None => false,
+    }
+}
+
 /// Normalized permissions: executables and directories are `0755`, everything
 /// else `0644`. Deterministic output matters more than exotic source modes.
 fn mode_of(path: &Path) -> Result<u32> {
@@ -649,4 +832,79 @@ fn mode_of(path: &Path) -> Result<u32> {
     } else {
         0o644
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elf::{ElfClass, Endianness, Machine};
+    use crate::graph::{Digest, Node};
+
+    fn graph_with_interpreter(interpreter: Option<&str>) -> DependencyGraph {
+        let architecture = Architecture {
+            machine: Machine::X86_64,
+            class: ElfClass::Elf64,
+            endianness: Endianness::Little,
+        };
+        let node = |kind, logical: &str, soname: Option<&str>| Node {
+            source: PathBuf::from(logical),
+            logical: PathBuf::from(logical),
+            destination: PathBuf::from(logical),
+            kind,
+            soname: soname.map(str::to_string),
+            architecture,
+            sha256: Digest(String::new()),
+            size: 0,
+            links: Vec::new(),
+            dlopen_references: Vec::new(),
+        };
+
+        let mut graph = DependencyGraph::new();
+        graph.root = graph.insert(node(NodeKind::Executable, "/app/server", None));
+        graph.declared_interpreter = interpreter.map(PathBuf::from);
+        if let Some(interpreter) = interpreter {
+            graph.insert(node(NodeKind::Interpreter, interpreter, Some("ld.so")));
+        }
+        graph.insert(node(
+            NodeKind::SharedObject,
+            "/opt/vendor/lib/libvendor.so.1",
+            Some("libvendor.so.1"),
+        ));
+        graph
+    }
+
+    fn planner() -> Planner {
+        Planner::new(SourceRoot::new("/"), "/app/server")
+    }
+
+    #[test]
+    fn a_glibc_bundle_gets_a_cache_naming_its_libraries() {
+        let graph = graph_with_interpreter(Some("/lib64/ld-linux-x86-64.so.2"));
+        let bytes = planner().ld_so_cache(&graph).expect("a cache is built");
+
+        let cache = crate::resolver::LdCache::parse(&bytes);
+        assert_eq!(
+            cache.lookup("libvendor.so.1"),
+            [PathBuf::from("/opt/vendor/lib/libvendor.so.1")]
+        );
+        assert!(
+            !cache.lookup("ld.so").is_empty(),
+            "the interpreter is listed too, as ldconfig lists it"
+        );
+    }
+
+    /// musl ignores `ld.so.cache`, so writing one would only look like a fix.
+    #[test]
+    fn a_musl_bundle_gets_no_cache() {
+        let graph = graph_with_interpreter(Some("/lib/ld-musl-x86_64.so.1"));
+        assert!(planner().ld_so_cache(&graph).is_none());
+        assert!(!uses_glibc_loader(&graph));
+    }
+
+    #[test]
+    fn a_static_binary_gets_no_cache() {
+        let mut graph = graph_with_interpreter(None);
+        graph.nodes.retain(|node| node.kind == NodeKind::Executable);
+        assert!(planner().ld_so_cache(&graph).is_none());
+    }
 }

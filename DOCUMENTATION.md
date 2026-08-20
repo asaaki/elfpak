@@ -8,6 +8,7 @@ Reference for `elfpak`. See [README.md](README.md) for the short version.
 - [Dependency policy](#dependency-policy)
 - [Manifest and `verify`](#manifest-and-verify)
 - [How dependencies are resolved](#how-dependencies-are-resolved)
+  - [The generated loader cache](#the-generated-loader-cache)
 - [Cross-architecture packaging](#cross-architecture-packaging)
 - [Guarantees and determinism](#guarantees-and-determinism)
 - [Repository layout](#repository-layout)
@@ -30,7 +31,7 @@ elfpak bundle <binary>
     --user <uid[:gid]>        identity the application runs as
     --library-path <dir>      extra search directory, like LD_LIBRARY_PATH
     --ca-certificates[=BOOL] --tmp[=BOOL] --passwd-group[=BOOL]
-    --nsswitch[=BOOL] --tzdata[=BOOL]
+    --nsswitch[=BOOL] --tzdata[=BOOL] --ld-so-cache[=BOOL]
     --manifest <path> | --no-manifest
     --dry-run --clean --config <file> --no-config
 
@@ -143,6 +144,11 @@ $ elfpak bundle ./server -o /rootfs --preset web --tzdata --tmp=false
 * `--include <path>` — any other file or directory, copied to the same absolute
   path. Directories are copied recursively and symlinks inside them are
   reproduced as symlinks.
+* `--ld-so-cache` — a generated `/etc/ld.so.cache`. Unlike the others this one
+  defaults to *automatic*: a cache is written exactly when the closure contains
+  something the loader could not otherwise find (see
+  [The generated loader cache](#the-generated-loader-cache)). `--ld-so-cache`
+  always writes one, `--ld-so-cache=false` never does.
 
 With `web`, an application that performs outbound HTTPS needs no CA-specific
 code: the system trust store is exactly where the TLS stack already looks.
@@ -169,6 +175,7 @@ root = "/"
 preset = "web"
 user = "65532:65532"
 tzdata = false
+# ld_so_cache = true   # force a loader cache; omit to let the closure decide
 
 [include]
 paths = ["/app/templates"]
@@ -196,8 +203,13 @@ add:
   --allow-library libssl.so.3
 ```
 
-Libraries match on `DT_SONAME` or on file name. The ELF interpreter is always
-allowed; it is not a `DT_NEEDED` dependency.
+Libraries match on `DT_SONAME` or on file name.
+
+The allow-list covers the application's *own* ELF closure — what a new `use` or
+`#include` in the source would add. Two things are deliberately outside it,
+because no caller could name them up front: the ELF interpreter, which is not a
+`DT_NEEDED` dependency, and anything runtime policy pulled in, such as the NSS
+modules `--nsswitch` adds when the source root still ships them.
 
 ## Manifest and `verify`
 
@@ -216,6 +228,7 @@ file, its digest, its mode, and why it is there:
     "passwd_group": true,
     "nsswitch": true,
     "tzdata": false,
+    "ld_so_cache": "auto",
     "user": "app:65532:65532"
   },
   "files": [
@@ -250,7 +263,9 @@ and that symlinks still point where they did. It needs no Docker. Pass
 
 By default that proves nothing was **removed or altered**. `--strict` also walks
 the rootfs and fails on anything the manifest does not list, which is what
-catches files that were *added* after the bundle was built:
+catches files that were *added* after the bundle was built, and compares
+permission bits, which a content digest cannot see (a file that became setuid
+still hashes the same):
 
 ```console
 $ elfpak verify /out/elfpak-manifest.json --strict
@@ -284,6 +299,64 @@ libraries are never relocated into a private directory with a compensating
 `dlopen` cannot be followed statically. When an object references it, `elfpak`
 warns and continues; use `--include` for anything loaded at runtime.
 
+### The generated loader cache
+
+The loader finds a library in one of three ways: a directory the object itself
+names (`DT_RPATH`/`DT_RUNPATH`), a directory built into the loader
+(`/lib`, `/usr/lib` and the architecture variants), or `/etc/ld.so.cache`. On a
+normal system `ldconfig` maintains that cache, and it is how a library in
+`/usr/local/lib` or `/opt/…/lib` is found at all.
+
+A bundle has no `ldconfig` — and copying the build host's cache would describe
+the host's filesystem, not the bundle's. So `elfpak` writes the cache itself,
+straight from the plan:
+
+```console
+$ elfpak bundle ./server -o /rootfs --install /app/server --library-path /opt/vendor/lib -v
+    - /etc/ld.so.cache                       runtime policy: ld-so-cache
+    ...
+```
+
+It is a real `glibc-ld.so.cache1.1` image: every shared object in the bundle,
+mapped from its `DT_SONAME` to the path it occupies in the rootfs, with the
+architecture's cache flags, in the descending order glibc's binary search
+expects. The test suite checks it against the real loader rather than against
+`elfpak`'s own reading of it — a fixture whose library sits outside every
+default directory is packaged, `chroot`ed into, and run.
+
+Because the cache is generated rather than copied it stays deterministic, it is
+recorded in the manifest like any other file, and it only lists libraries that
+are actually in the bundle.
+
+By default one is written only when it is needed, so a service whose libraries
+all live in `/usr/lib/<tuple>` — the common case — gets exactly the same image
+as before. `--ld-so-cache` forces one; `--ld-so-cache=false` suppresses it and
+turns the situation back into the warnings below.
+
+A musl program never gets one, whatever the flag says: musl reads
+`/etc/ld-musl-<arch>.path` and ignores `ld.so.cache` entirely, so a cache would
+look like a fix and change nothing. Such a bundle is reported instead.
+
+### Warnings
+
+A warning never fails a build. It reports something static analysis found that
+the bundle cannot express, and it is recorded in the manifest.
+
+| Code    | Meaning |
+|---------|---------|
+| `E1004` | An object references `dlopen`, so its runtime closure is not fully knowable. |
+| `E1006` | `--user` was given without `passwd`/`group` files. |
+| `E2005` | A library was found somewhere the loader will not look inside the bundle. |
+| `E2006` | `--install` moves an executable that declares `$ORIGIN`-relative search paths. |
+
+`E2005` and `E2006` describe the two ways a bundle can end up unable to load a
+library it contains: one where the library is in a directory the loader does not
+search, and one where the executable's own `$ORIGIN`-relative search paths stop
+pointing at anything once it is installed elsewhere. Both are fixed rather than
+merely reported — they are exactly the conditions under which a loader cache is
+generated — so they only appear when `--ld-so-cache=false` rules that out, or
+for a target whose cache format `elfpak` cannot write.
+
 ## Cross-architecture packaging
 
 The source filesystem is abstracted behind `--root`, which the resolver treats
@@ -297,14 +370,16 @@ $ elfpak bundle /sysroot/app/server \
     --install /app/server
 ```
 
-Supported target architectures are x86_64 and aarch64.
+Supported target architectures are x86_64 and aarch64. Anything else fails with
+`E1003`, which names the architecture it found and the raw `e_machine` value.
 
 ## Guarantees and determinism
 
 `elfpak bundle`:
 
 * does not execute the target
-* does not call `ldd` or `ldconfig`
+* does not call `ldd` or `ldconfig` (a loader cache, when one is needed, is
+  generated directly from the plan)
 * does not execute shell commands
 * does not contact the network
 * does not invoke Docker
@@ -314,12 +389,17 @@ Supported target architectures are x86_64 and aarch64.
 
 Output is deterministic for the same application binary, source root,
 configuration and `elfpak` version: entries are ordered by destination, file
-modes are normalized to `0755`/`0644`, and timestamps are pinned to
-`SOURCE_DATE_EPOCH` (default: the Unix epoch).
+modes are normalized to `0755`/`0644`, and file *and directory* timestamps are
+pinned to `SOURCE_DATE_EPOCH` (default: the Unix epoch), so an image layer built
+from the directory output does not change from run to run either. Symlink
+timestamps are the one thing that cannot be pinned portably; the tar backend has
+no such limitation and is byte-identical.
 
 Path handling is defensive throughout: destinations are normalized lexically,
-`..` can never escape the output root, and writes through a symlinked parent are
-refused.
+`..` can never escape the output root, writes through a symlinked parent are
+refused, and anything already occupying a destination is unlinked before it is
+written — a leftover symlink is never followed out of the output root.
+`--clean` refuses to delete a filesystem root.
 
 ## Repository layout
 
@@ -327,14 +407,16 @@ refused.
 crates/elfpak/        CLI: argument parsing, config loading, rendering
 crates/elfpak-core/   library: elf, graph, resolver, plan, rootfs, manifest
 fixtures/axum-server/ integration fixture: a real Axum service
+fixtures/vendor-lib/  integration fixture: a library outside the loader's path
 tests/docker/         Docker smoke tests
 Dockerfile            static elfpak distribution image (FROM scratch)
 ```
 
 `elfpak-core` holds the reusable implementation; no resolution logic lives in
-the CLI crate. Base images are pinned by tag and digest, and every image the
-tests build is produced for all architectures under test in one buildx
-invocation.
+the CLI crate. Base images are pinned by tag and digest, and no build step
+installs packages from a distribution mirror, so a digest really does describe
+what was built. Every image the tests build is produced for all architectures
+under test in one buildx invocation.
 
 ## Building the elfpak image
 
@@ -372,6 +454,7 @@ $ tests/docker/smoke.sh axum       # Axum on scratch, host architecture
 $ tests/docker/smoke.sh axum-arm64 # Axum on scratch, linux/arm64
 $ tests/docker/smoke.sh ca         # CA roots come from the bundle, not the binary
 $ tests/docker/smoke.sh musl       # a dynamically linked musl program
+$ tests/docker/smoke.sh ldcache    # a library the loader only finds through a cache
 $ tests/docker/smoke.sh tar        # tar output consumed by docker ADD
 $ tests/docker/smoke.sh cross      # non-Rust cross-architecture packaging
 ```
@@ -394,9 +477,16 @@ them too, and then:
   inherited (`ldd` reports `not found`, `elfpak` reports `E2001`);
 * `$ORIGIN`-relative search must produce the same closure as the loader.
 
-`ldd` is a test oracle only; the tool itself never runs it. The interpreter is
-excluded from the comparison, because `ldd` only prints it when `libc.so.6`
-declares it as `DT_NEEDED`.
+The generated loader cache is checked against glibc the same way: `ldconfig -p`
+must be able to read it, and — where unprivileged user namespaces are available
+— the real loader must resolve a library through it, including one bundle that
+is `chroot`ed into and executed to prove a rootfs whose library lives outside
+every default directory actually starts. Both are skipped rather than failed
+where the environment cannot support them.
+
+`ldd` and `ldconfig -p` are test oracles only; the tool itself never runs them.
+The interpreter is excluded from the `ldd` comparison, because `ldd` only prints
+it when `libc.so.6` declares it as `DT_NEEDED`.
 
 ### Fuzzing
 
@@ -430,8 +520,16 @@ The Docker smoke tests:
   application is deliberately *not* cross-compiled, so that the arm64 run
   exercises a natively built binary; on an x86_64 host that compile runs under
   qemu and is the slowest part of the suite.
-* `musl` — compiles a dynamically linked C program on alpine and packages it,
-  on every architecture under test. musl-specific behaviour is a non-goal, but
+* `ldcache` — packages a program whose library lives in `/opt/vendor/lib`,
+  which the loader never searches and which no `DT_RPATH` names. On the build
+  image `ldconfig` makes it work; in the scratch image only the cache `elfpak`
+  generated can. The same bundle is then built with `--ld-so-cache=false` and
+  must fail to start, which is what makes the cache load-bearing rather than
+  decorative.
+* `musl` — compiles a dynamically linked C program with Alpine's toolchain and
+  packages it, on every architecture under test. It compiles inside the pinned
+  Rust Alpine image, which already carries that toolchain, so the test installs
+  no packages and needs no network of its own. musl-specific behaviour is a non-goal, but
   generic ELF handling has to work: the loader *is* libc
   (`libc.musl-x86_64.so.1` is a symlink to `ld-musl-x86_64.so.1`), there is no
   `ld.so.cache`, and name resolution needs no NSS modules. Each scratch image
@@ -454,4 +552,6 @@ including strict mode, deterministic directory and tar output, loader-oracle
 tests, parser fuzzing, and x86_64 + aarch64 support.
 
 Not implemented yet, by design: OCI output, runtime tracing (`elfpak trace`),
-SBOM generation, and musl-specific behaviour beyond generic ELF parsing.
+SBOM generation, and musl-specific behaviour beyond generic ELF parsing — which
+includes `/etc/ld-musl-<arch>.path`, the musl counterpart of the generated
+loader cache.

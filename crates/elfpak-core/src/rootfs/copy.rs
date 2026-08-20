@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result, io};
 use crate::plan::{BundlePlan, PlannedFile, PlannedFileKind};
 
-/// Fixed mtime for every regular file, so repeated runs are byte-identical.
+/// Fixed mtime for every entry, so repeated runs are byte-identical.
 /// Overridable through `SOURCE_DATE_EPOCH`.
 fn source_date_epoch() -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_secs(source_date_epoch_secs())
@@ -42,6 +42,7 @@ impl RootFsBuilder {
 
     pub fn apply(&self, plan: &BundlePlan) -> Result<RootFsReport> {
         if self.clean && self.output.exists() {
+            guard_clean(&self.output)?;
             std::fs::remove_dir_all(&self.output).map_err(|e| io(&self.output, e))?;
         }
         std::fs::create_dir_all(&self.output).map_err(|e| io(&self.output, e))?;
@@ -56,7 +57,11 @@ impl RootFsBuilder {
             let target = self.target_path(&output, file)?;
             match file.kind {
                 PlannedFileKind::Directory => {
-                    if !target.exists() {
+                    // Anything else occupying the path — including a symlink,
+                    // which a later write would silently follow — is replaced.
+                    let existing = std::fs::symlink_metadata(&target).ok();
+                    if !existing.is_some_and(|metadata| metadata.is_dir()) {
+                        remove_existing(&target)?;
                         std::fs::create_dir_all(&target).map_err(|e| io(&target, e))?;
                     }
                     set_mode(&target, file.mode)?;
@@ -67,26 +72,32 @@ impl RootFsBuilder {
                         .link_target
                         .clone()
                         .unwrap_or_else(|| PathBuf::from("/"));
-                    if std::fs::symlink_metadata(&target).is_ok() {
-                        std::fs::remove_file(&target).map_err(|e| io(&target, e))?;
-                    }
+                    remove_existing(&target)?;
                     std::os::unix::fs::symlink(&link_target, &target)
                         .map_err(|e| io(&target, e))?;
                     report.symlinks += 1;
                 }
                 _ => {
-                    let bytes = match (&file.content, &file.source) {
-                        (Some(content), _) => content.clone(),
-                        (None, Some(source)) => std::fs::read(source).map_err(|e| io(source, e))?,
-                        (None, None) => Vec::new(),
-                    };
-                    std::fs::write(&target, &bytes).map_err(|e| io(&target, e))?;
+                    // Removing first is what keeps the write inside the output
+                    // root: writing onto a pre-existing symlink would follow it.
+                    remove_existing(&target)?;
+                    report.bytes += write_file(&target, file)?;
                     set_mode(&target, file.mode)?;
-                    set_mtime(&target)?;
+                    pin_times(&target);
                     report.files += 1;
-                    report.bytes += bytes.len() as u64;
                 }
             }
+        }
+
+        // Directory timestamps are pinned last: writing children updates them.
+        // Deepest first, so a parent is not touched again after it is pinned.
+        for file in plan
+            .files
+            .iter()
+            .rev()
+            .filter(|f| f.kind == PlannedFileKind::Directory)
+        {
+            pin_times(&crate::paths::join_under(&output, &file.destination));
         }
 
         Ok(report)
@@ -112,6 +123,50 @@ impl RootFsBuilder {
             std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
         }
         Ok(target)
+    }
+}
+
+/// Write the contents of a planned entry, returning the number of bytes.
+///
+/// Source-backed files are copied rather than read into memory, so an
+/// `--include` of an arbitrarily large file costs no more than a buffer.
+fn write_file(target: &Path, file: &PlannedFile) -> Result<u64> {
+    match (&file.content, &file.source) {
+        (Some(content), _) => {
+            std::fs::write(target, content).map_err(|e| io(target, e))?;
+            Ok(content.len() as u64)
+        }
+        (None, Some(source)) => std::fs::copy(source, target).map_err(|e| io(source, e)),
+        (None, None) => {
+            std::fs::write(target, b"").map_err(|e| io(target, e))?;
+            Ok(0)
+        }
+    }
+}
+
+/// Refuse to delete something that is obviously not a previous bundle: `--clean`
+/// is meant to replace an output directory, not to wipe a filesystem.
+fn guard_clean(output: &Path) -> Result<()> {
+    let resolved = output.canonicalize().unwrap_or_else(|_| output.to_path_buf());
+    if resolved.parent().is_none() {
+        return Err(Error::Config {
+            message: format!("refusing to --clean `{}`", resolved.display()),
+        });
+    }
+    Ok(())
+}
+
+/// Remove whatever currently occupies `path`, without following symlinks.
+fn remove_existing(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        // `is_dir` is false for a symlink to a directory, so the link itself is
+        // unlinked and its target is left alone.
+        Ok(metadata) if metadata.is_dir() => {
+            std::fs::remove_dir_all(path).map_err(|e| io(path, e))
+        }
+        Ok(_) => std::fs::remove_file(path).map_err(|e| io(path, e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io(path, e)),
     }
 }
 
@@ -146,23 +201,25 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| io(path, e))
 }
 
-fn set_mtime(path: &Path) -> Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|e| io(path, e))?;
+/// Pin access and modification times. Not every filesystem supports this, and
+/// symlink timestamps cannot be set through `std` at all, so this is
+/// best-effort: the tar backend is the byte-reproducible artifact.
+fn pin_times(path: &Path) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
     let time = source_date_epoch();
-    let times = std::fs::FileTimes::new()
-        .set_accessed(time)
-        .set_modified(time);
-    // Not every filesystem supports this; reproducibility is best-effort.
-    let _ = file.set_times(times);
-    Ok(())
+    let _ = file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(time)
+            .set_modified(time),
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::has_symlinked_ancestor;
+    use super::{guard_clean, has_symlinked_ancestor, remove_existing};
+    use std::path::Path;
 
     #[test]
     fn detects_a_symlink_above_a_missing_parent() {
@@ -177,5 +234,29 @@ mod tests {
             &output,
             &output.join("nested/deeper")
         ));
+    }
+
+    #[test]
+    fn removing_a_symlink_leaves_its_target_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::fs::write(&target, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        remove_existing(&link).unwrap();
+        assert!(!link.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+
+        // Removing something that is not there is not an error.
+        remove_existing(&link).unwrap();
+    }
+
+    #[test]
+    fn clean_refuses_to_delete_a_filesystem_root() {
+        let err = guard_clean(Path::new("/")).unwrap_err();
+        assert_eq!(err.code(), "E4001");
+        let temp = tempfile::tempdir().unwrap();
+        guard_clean(&temp.path().join("rootfs")).unwrap();
     }
 }

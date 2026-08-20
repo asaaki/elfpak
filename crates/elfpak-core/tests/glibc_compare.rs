@@ -11,7 +11,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use common::{HostFixtures, have_cc, ldd_closure, ldd_raw};
+use common::{HostFixtures, cc, have_cc, ldd_closure, ldd_raw};
 use elfpak_core::{ElfMetadata, Error, NodeKind, Planner, SourceRoot};
 
 /// Shared objects `elfpak` resolves, excluding the executable and `PT_INTERP`.
@@ -142,5 +142,261 @@ fn agrees_with_the_loader_that_rpath_is_inherited() {
             .iter()
             .any(|p| p.file_name().unwrap() == "libbase.so.1.4.2"),
         "the transitive dependency must be part of the closure: {closure:?}"
+    );
+}
+
+/// Whether a private mount namespace can be set up unprivileged, which is what
+/// lets a test put a generated cache where the loader looks for it.
+fn can_bind_mount() -> bool {
+    std::process::Command::new("unshare")
+        .args(["-Urm", "true"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The one test that proves the point: a cache `elfpak` generated is read by
+/// the real glibc loader, not merely by `elfpak`'s own parser.
+///
+/// A library is placed somewhere the loader does not search, so the program
+/// cannot start; the generated cache is then bind-mounted over
+/// `/etc/ld.so.cache` inside a private mount namespace, and the same program
+/// must run. Nothing outside the namespace is touched.
+#[test]
+fn glibc_loads_a_library_through_a_generated_cache() {
+    if !have_cc() || !can_bind_mount() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let hidden = tmp.path().join("hidden");
+    std::fs::create_dir_all(&hidden).unwrap();
+
+    let source = tmp.path().join("hidden.c");
+    std::fs::write(&source, "int hidden_value(void) { return 42; }\n").unwrap();
+    let library = hidden.join("libhidden.so.1");
+    cc(&[
+        "-shared",
+        "-fPIC",
+        "-Wl,-soname,libhidden.so.1",
+        "-o",
+        library.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+
+    let main = tmp.path().join("main.c");
+    std::fs::write(
+        &main,
+        "#include <stdio.h>\nint hidden_value(void);\n\
+         int main(void) { printf(\"value=%d\\n\", hidden_value()); return 0; }\n",
+    )
+    .unwrap();
+    let program = tmp.path().join("app");
+    cc(&[
+        "-o",
+        program.to_str().unwrap(),
+        main.to_str().unwrap(),
+        library.to_str().unwrap(),
+        &format!("-Wl,-rpath-link,{}", hidden.display()),
+    ]);
+
+    // Without help, the loader cannot find the library at all.
+    let bare = std::process::Command::new(&program).output().unwrap();
+    assert!(
+        !bare.status.success(),
+        "the fixture is only meaningful if the loader fails first"
+    );
+
+    let architecture = ElfMetadata::parse_file(&program).unwrap().architecture;
+    // Decoys on both sides of the real entry: with a single entry the loader's
+    // binary search finds it whatever order the table is in, so a table that is
+    // sorted the wrong way round would still pass.
+    let mut entries: Vec<elfpak_core::resolver::cache::CacheEntry> = [
+        "libaaa.so.1",
+        "libccc.so.1",
+        "libmmm.so.1",
+        "libppp.so.1",
+        "libyyy.so.1",
+        "libzzz.so.1",
+    ]
+    .iter()
+    .map(|soname| elfpak_core::resolver::cache::CacheEntry {
+        soname: (*soname).to_string(),
+        path: PathBuf::from("/nonexistent").join(soname),
+    })
+    .collect();
+    entries.push(elfpak_core::resolver::cache::CacheEntry {
+        soname: "libhidden.so.1".to_string(),
+        path: library.clone(),
+    });
+
+    let Some(image) = elfpak_core::resolver::cache::build(&architecture, &entries) else {
+        return; // an architecture the cache format cannot describe
+    };
+    let cache = tmp.path().join("ld.so.cache");
+    std::fs::write(&cache, &image).unwrap();
+
+    let output = std::process::Command::new("unshare")
+        .args(["-Urm", "sh", "-c"])
+        .arg(format!(
+            "mount --bind {} /etc/ld.so.cache && {}",
+            cache.display(),
+            program.display()
+        ))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("value=42"),
+        "the glibc loader rejected the generated cache:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `ldconfig -p` is glibc's own cache reader, and a second opinion that does
+/// not need a mount namespace.
+#[test]
+fn ldconfig_reads_a_generated_cache() {
+    let architecture = match std::env::current_exe()
+        .ok()
+        .and_then(|exe| ElfMetadata::parse_file(&exe).ok())
+    {
+        Some(metadata) => metadata.architecture,
+        None => return,
+    };
+    let Some(image) = elfpak_core::resolver::cache::build(
+        &architecture,
+        &[
+            elfpak_core::resolver::cache::CacheEntry {
+                soname: "libcached.so.1".to_string(),
+                path: PathBuf::from("/opt/cached/libcached.so.1"),
+            },
+            elfpak_core::resolver::cache::CacheEntry {
+                soname: "libc.so.6".to_string(),
+                path: PathBuf::from("/usr/lib/libc.so.6"),
+            },
+        ],
+    ) else {
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("ld.so.cache");
+    std::fs::write(&cache, &image).unwrap();
+
+    let Ok(output) = std::process::Command::new("ldconfig")
+        .args(["-p", "-C"])
+        .arg(&cache)
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        // ldconfig refuses to read a cache it does not understand, and says so.
+        panic!(
+            "ldconfig rejected the generated cache: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        listing.contains("libcached.so.1") && listing.contains("/opt/cached/libcached.so.1"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("2 libs found"),
+        "both entries are readable: {listing}"
+    );
+}
+
+/// End to end: a bundle whose library lives outside every directory the loader
+/// searches must still start, and must stop starting when the cache is taken
+/// away. That is the whole point of generating one.
+///
+/// The rootfs is entered with `chroot` inside a private user and mount
+/// namespace, which needs no privileges and touches nothing outside it.
+#[test]
+fn a_bundled_rootfs_starts_from_a_directory_the_loader_never_searches() {
+    if !have_cc() || !can_bind_mount() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let hidden = tmp.path().join("elsewhere/lib");
+    std::fs::create_dir_all(&hidden).unwrap();
+
+    let source = tmp.path().join("hidden.c");
+    std::fs::write(&source, "int hidden_value(void) { return 42; }\n").unwrap();
+    cc(&[
+        "-shared",
+        "-fPIC",
+        "-Wl,-soname,libhidden.so.1",
+        "-o",
+        hidden.join("libhidden.so.1").to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+
+    let main = tmp.path().join("main.c");
+    std::fs::write(
+        &main,
+        "#include <stdio.h>\nint hidden_value(void);\n\
+         int main(void) { printf(\"value=%d\\n\", hidden_value()); return 0; }\n",
+    )
+    .unwrap();
+    let program = tmp.path().join("app");
+    cc(&[
+        "-o",
+        program.to_str().unwrap(),
+        main.to_str().unwrap(),
+        hidden.join("libhidden.so.1").to_str().unwrap(),
+        &format!("-Wl,-rpath-link,{}", hidden.display()),
+    ]);
+
+    let run = |rootfs: &std::path::Path| {
+        std::process::Command::new("unshare")
+            .args(["-Urm", "sh", "-c"])
+            .arg(format!("chroot {} /app/server", rootfs.display()))
+            .output()
+            .unwrap()
+    };
+
+    let plan = |policy: elfpak_core::CachePolicy| {
+        let runtime = elfpak_core::RuntimePolicy {
+            ld_so_cache: policy,
+            ..elfpak_core::RuntimePolicy::default()
+        };
+        Planner::new(SourceRoot::new("/"), &program)
+            .install_as("/app/server")
+            .library_paths(vec![hidden.clone()])
+            .runtime_policy(runtime)
+            .plan()
+            .unwrap()
+    };
+
+    let with_cache = tmp.path().join("rootfs");
+    elfpak_core::RootFsBuilder::new(&with_cache)
+        .apply(&plan(elfpak_core::CachePolicy::Auto))
+        .unwrap();
+    assert!(
+        with_cache.join("etc/ld.so.cache").is_file(),
+        "the closure needs a cache, so one is generated"
+    );
+    let output = run(&with_cache);
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("value=42"),
+        "the packaged application did not start:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Without the cache the same tree cannot resolve the library, which is what
+    // makes the generated one load-bearing rather than decorative.
+    let without = tmp.path().join("rootfs-no-cache");
+    elfpak_core::RootFsBuilder::new(&without)
+        .apply(&plan(elfpak_core::CachePolicy::Never))
+        .unwrap();
+    assert!(!without.join("etc/ld.so.cache").exists());
+    let output = run(&without);
+    assert!(
+        !output.status.success(),
+        "expected the loader to fail without a cache, got: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }

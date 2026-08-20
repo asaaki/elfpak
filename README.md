@@ -68,10 +68,13 @@ CA-specific code in the application: the system trust store is simply there.
   validation of every candidate.
 * **Original paths and symlinks preserved.** `libfoo.so.1 -> libfoo.so.1.4.2`
   stays a symlink; nothing is relocated into a private directory with a
-  compensating `LD_LIBRARY_PATH`.
+  compensating `LD_LIBRARY_PATH`. Where a library sits outside the directories
+  the loader searches, the bundle gets a generated `/etc/ld.so.cache` instead —
+  a real one, written from the plan, because `ldconfig` is never run.
 * **Every file has a recorded reason.** The manifest beside the rootfs says what
   was included and why, along with the policy it was built with; `elfpak verify`
-  re-checks it, and `--strict` also rejects anything that was added afterwards.
+  re-checks it, and `--strict` also rejects anything that was added afterwards
+  or whose permissions changed.
 * **An allow-list turns dependencies into a contract.** A new native dependency
   fails the build instead of silently growing the image.
 * **Cross-architecture.** `--root` abstracts the source filesystem, so an x86_64

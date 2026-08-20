@@ -29,8 +29,8 @@ pub use manifest::{Manifest, VerifyReport};
 pub use plan::{BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Planner, Warning};
 pub use resolver::{DynamicLinkerResolver, LdCache, LibraryRequest, Resolver};
 pub use rootfs::{
-    DependencyPolicy, Preset, RootFsBuilder, RootFsReport, RuntimeFeature, RuntimePolicy,
-    TarBuilder, TarReport, UserSpec,
+    CachePolicy, DependencyPolicy, Preset, RootFsBuilder, RootFsReport, RuntimeFeature,
+    RuntimePolicy, TarBuilder, TarReport, UserSpec,
 };
 pub use source::SourceRoot;
 

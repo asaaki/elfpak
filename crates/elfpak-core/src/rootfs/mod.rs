@@ -6,4 +6,4 @@ pub mod policy;
 
 pub use archive::{TarBuilder, TarReport};
 pub use copy::{RootFsBuilder, RootFsReport};
-pub use policy::{DependencyPolicy, Preset, RuntimeFeature, RuntimePolicy, UserSpec};
+pub use policy::{CachePolicy, DependencyPolicy, Preset, RuntimeFeature, RuntimePolicy, UserSpec};

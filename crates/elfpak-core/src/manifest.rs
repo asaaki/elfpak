@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, io};
-use crate::hash::sha256_bytes;
+use crate::hash::sha256_file;
 use crate::plan::{BundlePlan, InclusionReason, PlannedFileKind};
 
 pub const MANIFEST_VERSION: u32 = 2;
@@ -45,6 +45,10 @@ pub struct ManifestPolicy {
     pub passwd_group: bool,
     pub nsswitch: bool,
     pub tzdata: bool,
+    /// `auto`, `always` or `never`; absent in manifests written before the
+    /// bundle could carry a generated loader cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ld_so_cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -134,6 +138,7 @@ impl Manifest {
                 passwd_group: plan.runtime_policy.passwd_group,
                 nsswitch: plan.runtime_policy.nsswitch,
                 tzdata: plan.runtime_policy.tzdata,
+                ld_so_cache: Some(plan.runtime_policy.ld_so_cache.to_string()),
                 user: plan.runtime_policy.user.as_ref().map(|u| u.to_string()),
                 includes: plan
                     .runtime_policy
@@ -230,9 +235,8 @@ impl Manifest {
                     let Some(expected) = &file.sha256 else {
                         continue;
                     };
-                    match std::fs::read(&target) {
-                        Ok(bytes) => {
-                            let actual = sha256_bytes(&bytes);
+                    match sha256_file(&target) {
+                        Ok((actual, _)) => {
                             if &actual.0 != expected {
                                 report.problems.push(Problem {
                                     path: file.path.clone(),
@@ -249,6 +253,15 @@ impl Manifest {
                         }),
                     }
                 }
+            }
+
+            // Permission bits are part of the record, and a mode change is a
+            // change the digests cannot see. Symlink modes are not meaningful.
+            if options.strict
+                && file.kind != "symlink"
+                && let Some(problem) = mode_problem(file, &metadata)
+            {
+                report.problems.push(problem);
             }
         }
 
@@ -305,10 +318,22 @@ impl Manifest {
     }
 }
 
+/// Compare recorded and actual permission bits.
+fn mode_problem(file: &ManifestFile, metadata: &std::fs::Metadata) -> Option<Problem> {
+    use std::os::unix::fs::PermissionsExt;
+    let expected = u32::from_str_radix(&file.mode, 8).ok()?;
+    let actual = metadata.permissions().mode() & 0o7777;
+    (actual != expected).then(|| Problem {
+        path: file.path.clone(),
+        detail: format!("mode is {actual:04o}, expected {expected:04o}"),
+    })
+}
+
 /// What `verify` should check beyond "every recorded entry still matches".
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VerifyOptions {
-    /// Also fail on files present in the rootfs but absent from the manifest.
+    /// Also fail on files present in the rootfs but absent from the manifest,
+    /// and on entries whose permission bits changed.
     pub strict: bool,
 }
 

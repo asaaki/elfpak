@@ -1,11 +1,12 @@
 //! The dependency graph records both *what* is included and *why*.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::elf::Architecture;
+use crate::rootfs::policy::RuntimeFeature;
 use crate::source::SymlinkEntry;
 
 pub type NodeId = usize;
@@ -51,7 +52,7 @@ pub struct Node {
 pub enum DependencyReason {
     Interpreter,
     Needed { soname: String },
-    RuntimePolicy { feature: &'static str },
+    RuntimePolicy { feature: RuntimeFeature },
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +70,10 @@ pub struct DependencyGraph {
     /// `PT_INTERP` exactly as declared by the executable, before symlinks are
     /// followed. This is the path the kernel will use at runtime.
     pub declared_interpreter: Option<PathBuf>,
+    /// `DT_RPATH` and `DT_RUNPATH` of the executable, verbatim and unexpanded.
+    /// They travel with the binary, so they matter when it is installed
+    /// somewhere other than where it was built.
+    pub executable_search_paths: Vec<String>,
     by_logical: HashMap<PathBuf, NodeId>,
 }
 
@@ -146,5 +151,26 @@ impl DependencyGraph {
 
     pub fn total_size(&self) -> u64 {
         self.nodes.iter().map(|n| n.size).sum()
+    }
+
+    /// Nodes reachable from the executable through its own ELF dependencies.
+    ///
+    /// Objects that only runtime policy asked for — NSS modules and whatever
+    /// *they* need — are deliberately outside this set: they are part of the
+    /// image, but not part of the application's declared dependency contract.
+    pub fn application_closure(&self) -> HashSet<NodeId> {
+        let mut reached = HashSet::from([self.root]);
+        let mut queue = vec![self.root];
+        while let Some(id) = queue.pop() {
+            for edge in self.edges.iter().filter(|e| e.from == id) {
+                if matches!(edge.reason, DependencyReason::RuntimePolicy { .. }) {
+                    continue;
+                }
+                if reached.insert(edge.to) {
+                    queue.push(edge.to);
+                }
+            }
+        }
+        reached
     }
 }

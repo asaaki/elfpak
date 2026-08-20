@@ -109,6 +109,10 @@ pub struct BundleArgs {
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub tzdata: Option<bool>,
 
+    /// Generate /etc/ld.so.cache (default: only when the closure needs one)
+    #[arg(long = "ld-so-cache", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub ld_so_cache: Option<bool>,
+
     /// Extra library search directory (like LD_LIBRARY_PATH)
     #[arg(long = "library-path", value_name = "DIR")]
     pub library_paths: Vec<PathBuf>,

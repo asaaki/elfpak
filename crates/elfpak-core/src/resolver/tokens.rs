@@ -21,8 +21,11 @@ pub fn expand(input: &str, ctx: &TokenContext) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'$' {
-            out.push(bytes[i] as char);
-            i += 1;
+            // Copy verbatim up to the next `$`. Copying byte by byte would
+            // re-encode every non-ASCII character in the path.
+            let next = input[i..].find('$').map_or(input.len(), |at| i + at);
+            out.push_str(&input[i..next]);
+            i = next;
             continue;
         }
         let (name, consumed) = read_token(&input[i + 1..]);
@@ -105,6 +108,22 @@ mod tests {
     #[test]
     fn unknown_tokens_stay_literal() {
         assert_eq!(expand("/usr/$NOPE/lib", &ctx()), "/usr/$NOPE/lib");
+        assert_eq!(expand("/usr/$", &ctx()), "/usr/$");
+        assert_eq!(expand("/usr/${unterminated", &ctx()), "/usr/${unterminated");
+    }
+
+    #[test]
+    fn non_ascii_path_components_survive_expansion() {
+        let ctx = TokenContext {
+            origin: PathBuf::from("/opt/café/bin"),
+            ..ctx()
+        };
+        assert_eq!(expand("/opt/café/lib", &ctx), "/opt/café/lib");
+        assert_eq!(expand("$ORIGIN/../lib", &ctx), "/opt/café/bin/../lib");
+        assert_eq!(
+            expand_search_path("$ORIGIN/../lib", &ctx),
+            PathBuf::from("/opt/café/lib")
+        );
     }
 
     #[test]

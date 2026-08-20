@@ -41,6 +41,57 @@ pub struct ResolvedLibrary {
     pub metadata: ElfMetadata,
 }
 
+/// Where a lookup succeeded. Only some of these survive into the bundle: the
+/// generated rootfs has no `ld.so.cache`, and `--library-path` is a hint to
+/// `elfpak`, not something the packaged application inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOrigin {
+    /// `DT_RPATH`/`DT_RUNPATH` of the requesting object, or an absolute soname.
+    ObjectPath,
+    /// `--library-path`, the `LD_LIBRARY_PATH` equivalent.
+    LibraryPath,
+    /// `/etc/ld.so.cache`.
+    Cache,
+    /// A directory the loader searches without being told to.
+    DefaultDirectory,
+    /// A directory that only `/etc/ld.so.conf` named.
+    ConfiguredDirectory,
+}
+
+/// A library the loader inside the bundle would not find on its own.
+///
+/// `elfpak` never runs `ldconfig`, so a bundle carries no `ld.so.cache`; a
+/// library that was only reachable through the build host's cache, its
+/// `ld.so.conf` or `--library-path` keeps its original path but nothing points
+/// the loader at it any more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionNote {
+    pub soname: String,
+    pub directory: PathBuf,
+    pub origin: SearchOrigin,
+}
+
+impl SearchOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchOrigin::ObjectPath => "DT_RPATH/DT_RUNPATH",
+            SearchOrigin::LibraryPath => "--library-path",
+            SearchOrigin::Cache => "/etc/ld.so.cache",
+            SearchOrigin::DefaultDirectory => "a default directory",
+            SearchOrigin::ConfiguredDirectory => "/etc/ld.so.conf",
+        }
+    }
+
+    /// Whether the packaged application can still find a library that was
+    /// located this way.
+    fn survives_packaging(&self) -> bool {
+        matches!(
+            self,
+            SearchOrigin::ObjectPath | SearchOrigin::DefaultDirectory
+        )
+    }
+}
+
 /// Loader-specific resolution, kept behind a trait so the implementation can be
 /// replaced (or wrapped for tracing) without touching the planner.
 pub trait DynamicLinkerResolver {
@@ -56,7 +107,7 @@ pub struct Resolver {
     cache: Option<LdCache>,
     elf: ElfCache,
     digests: DigestCache,
-    warnings: Vec<String>,
+    notes: Vec<ResolutionNote>,
 }
 
 impl Resolver {
@@ -75,7 +126,7 @@ impl Resolver {
             cache,
             elf: ElfCache::new(),
             digests: DigestCache::new(),
-            warnings: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -92,8 +143,27 @@ impl Resolver {
         self.cache.as_ref()
     }
 
-    pub fn warnings(&self) -> &[String] {
-        &self.warnings
+    /// Libraries that resolved through something the bundle does not reproduce.
+    pub fn notes(&self) -> &[ResolutionNote] {
+        &self.notes
+    }
+
+    fn note(&mut self, request: &LibraryRequest, directory: &Path, origin: SearchOrigin) {
+        if origin.survives_packaging()
+            || search::default_library_paths(&request.architecture)
+                .iter()
+                .any(|default| default == directory)
+        {
+            return;
+        }
+        let note = ResolutionNote {
+            soname: request.soname.clone(),
+            directory: directory.to_path_buf(),
+            origin,
+        };
+        if !self.notes.contains(&note) {
+            self.notes.push(note);
+        }
     }
 
     /// Map a host path to its logical path inside the source root.
@@ -117,10 +187,8 @@ impl Resolver {
         if !metadata.architecture.machine.is_supported_target() {
             return Err(Error::UnsupportedArchitecture {
                 path: binary.to_path_buf(),
-                machine: match metadata.architecture.machine {
-                    crate::elf::Machine::Other(m) => m,
-                    _ => 0,
-                },
+                architecture: metadata.architecture.to_string(),
+                machine: metadata.e_machine,
             });
         }
         let architecture = metadata.architecture;
@@ -130,6 +198,12 @@ impl Resolver {
             .interpreter
             .as_deref()
             .map(crate::paths::normalize_absolute);
+        graph.executable_search_paths = metadata
+            .rpath
+            .iter()
+            .chain(metadata.runpath.iter())
+            .cloned()
+            .collect();
 
         let (digest, size) = self.digests.get(binary)?;
         let root_id = graph.insert(Node {
@@ -174,15 +248,31 @@ impl Resolver {
             }
         }
 
-        // Breadth-first over DT_NEEDED, carrying the inherited RPATH chain.
-        let mut queue: Vec<(NodeId, ElfMetadata, Vec<Vec<String>>)> =
-            vec![(root_id, metadata, Vec::new())];
+        self.walk_needed(&mut graph, root_id, metadata, Vec::new())?;
+
+        Ok(graph)
+    }
+
+    /// Add everything reachable from `start` through `DT_NEEDED`, depth first.
+    ///
+    /// `inherited` is the `DT_RPATH` chain of the objects that loaded `start`,
+    /// nearest first; the loader consults it for every lookup further down the
+    /// chain, which is the whole difference between `DT_RPATH` and `DT_RUNPATH`.
+    fn walk_needed(
+        &mut self,
+        graph: &mut DependencyGraph,
+        start: NodeId,
+        metadata: ElfMetadata,
+        inherited: Vec<Vec<String>>,
+    ) -> Result<()> {
+        let architecture = metadata.architecture;
+        let mut queue = vec![(start, metadata, inherited)];
         while let Some((id, meta, inherited)) = queue.pop() {
             let mut chain = Vec::new();
             if !meta.runpath_is_authoritative() && !meta.rpath.is_empty() {
                 chain.push(meta.rpath.clone());
             }
-            chain.extend(inherited.iter().cloned());
+            chain.extend(inherited);
 
             let requester = graph.node(id).logical.clone();
             for soname in &meta.needed {
@@ -195,9 +285,9 @@ impl Resolver {
                     architecture,
                 };
                 let library = self.resolve(&request)?;
-                let existing = graph.find(&library.resolved.logical);
+                let known = graph.find(&library.resolved.logical);
                 let child = self.insert_object(
-                    &mut graph,
+                    graph,
                     &library.resolved,
                     &library.metadata,
                     NodeKind::SharedObject,
@@ -209,13 +299,12 @@ impl Resolver {
                         soname: soname.clone(),
                     },
                 );
-                if existing.is_none() {
+                if known.is_none() {
                     queue.push((child, library.metadata, chain.clone()));
                 }
             }
         }
-
-        Ok(graph)
+        Ok(())
     }
 
     /// Resolve a soname that is already known to be a library the policy wants,
@@ -258,44 +347,9 @@ impl Resolver {
         )?;
         graph.connect(from, id, reason);
         if existing.is_none() {
-            let architecture = library.metadata.architecture;
-            let mut queue = vec![(id, library.metadata.clone())];
-            while let Some((current, meta)) = queue.pop() {
-                let requester = graph.node(current).logical.clone();
-                let chain = if !meta.runpath_is_authoritative() && !meta.rpath.is_empty() {
-                    vec![meta.rpath.clone()]
-                } else {
-                    Vec::new()
-                };
-                for soname in &meta.needed {
-                    let request = LibraryRequest {
-                        soname: soname.clone(),
-                        requester: requester.clone(),
-                        rpath_chain: chain.clone(),
-                        runpath: meta.runpath.clone(),
-                        nodeflib: meta.nodeflib,
-                        architecture,
-                    };
-                    let child_lib = self.resolve(&request)?;
-                    let known = graph.find(&child_lib.resolved.logical);
-                    let child = self.insert_object(
-                        graph,
-                        &child_lib.resolved,
-                        &child_lib.metadata,
-                        NodeKind::SharedObject,
-                    )?;
-                    graph.connect(
-                        current,
-                        child,
-                        DependencyReason::Needed {
-                            soname: soname.clone(),
-                        },
-                    );
-                    if known.is_none() {
-                        queue.push((child, child_lib.metadata));
-                    }
-                }
-            }
+            // A policy-loaded module is opened by `dlopen` from libc, not by the
+            // application, so it inherits no RPATH from the loading chain.
+            self.walk_needed(graph, id, library.metadata.clone(), Vec::new())?;
         }
         Ok(id)
     }
@@ -348,43 +402,55 @@ impl Resolver {
         }
     }
 
-    /// Candidate directories in glibc's documented order.
-    fn search_directories(&self, request: &LibraryRequest) -> Vec<PathBuf> {
+    /// Candidate directories in glibc's documented order, each tagged with
+    /// where it came from so the planner can tell what survives packaging.
+    fn search_directories(&self, request: &LibraryRequest) -> Vec<(PathBuf, SearchOrigin)> {
         let ctx = self.token_context(&request.requester, &request.architecture);
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        let push = |dirs: &mut Vec<PathBuf>, dir: PathBuf| {
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
+        let mut dirs: Vec<(PathBuf, SearchOrigin)> = Vec::new();
+        let push = |dirs: &mut Vec<(PathBuf, SearchOrigin)>, dir: PathBuf, origin| {
+            if !dirs.iter().any(|(known, _)| known == &dir) {
+                dirs.push((dir, origin));
             }
         };
 
         // 1. DT_RPATH of the object and, transitively, of its loaders.
         for level in &request.rpath_chain {
             for entry in level {
-                push(&mut dirs, tokens::expand_search_path(entry, &ctx));
+                push(
+                    &mut dirs,
+                    tokens::expand_search_path(entry, &ctx),
+                    SearchOrigin::ObjectPath,
+                );
             }
         }
         // 2. LD_LIBRARY_PATH equivalent.
         for dir in &self.library_paths {
-            push(&mut dirs, dir.clone());
+            push(&mut dirs, dir.clone(), SearchOrigin::LibraryPath);
         }
         // 3. DT_RUNPATH of the requesting object only.
         for entry in &request.runpath {
-            push(&mut dirs, tokens::expand_search_path(entry, &ctx));
+            push(
+                &mut dirs,
+                tokens::expand_search_path(entry, &ctx),
+                SearchOrigin::ObjectPath,
+            );
         }
         dirs
     }
 
-    fn default_directories(&self, architecture: &Architecture) -> Vec<PathBuf> {
-        let mut dirs = Vec::new();
-        for dir in self
+    fn default_directories(&self, architecture: &Architecture) -> Vec<(PathBuf, SearchOrigin)> {
+        let mut dirs: Vec<(PathBuf, SearchOrigin)> = Vec::new();
+        let configured = self
             .conf_paths
             .iter()
             .cloned()
-            .chain(search::default_library_paths(architecture))
-        {
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
+            .map(|dir| (dir, SearchOrigin::ConfiguredDirectory));
+        let builtin = search::default_library_paths(architecture)
+            .into_iter()
+            .map(|dir| (dir, SearchOrigin::DefaultDirectory));
+        for (dir, origin) in configured.chain(builtin) {
+            if !dirs.iter().any(|(known, _)| known == &dir) {
+                dirs.push((dir, origin));
             }
         }
         dirs
@@ -471,10 +537,11 @@ impl DynamicLinkerResolver for Resolver {
                 return Ok(found);
             }
         } else {
-            for dir in self.search_directories(request) {
+            for (dir, origin) in self.search_directories(request) {
                 if let Some(found) =
                     self.try_directory(&dir, request, &mut searched, &mut mismatch)?
                 {
+                    self.note(request, &dir, origin);
                     return Ok(found);
                 }
             }
@@ -489,16 +556,18 @@ impl DynamicLinkerResolver for Resolver {
                 if let Some(found) =
                     self.try_path(&candidate, request, &mut searched, &mut mismatch)?
                 {
+                    self.note(request, &logical_parent(&candidate), SearchOrigin::Cache);
                     return Ok(found);
                 }
             }
 
             // 5. Default directories, unless the object opted out.
             if !request.nodeflib {
-                for dir in self.default_directories(&request.architecture) {
+                for (dir, origin) in self.default_directories(&request.architecture) {
                     if let Some(found) =
                         self.try_directory(&dir, request, &mut searched, &mut mismatch)?
                     {
+                        self.note(request, &dir, origin);
                         return Ok(found);
                     }
                 }

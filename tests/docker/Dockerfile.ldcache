@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+
+# Loader-cache smoke test.
+#
+# The library lives in /opt/vendor/lib, which the loader never searches, and the
+# program declares no DT_RPATH. On the build image it resolves only through
+# /etc/ld.so.cache, which `ldconfig` maintains -- and which a `FROM scratch`
+# image does not have unless elfpak generates one.
+#
+# Built twice: once normally, and once with --ld-so-cache=false, which must
+# produce an image that cannot start. That is what makes the generated cache
+# load-bearing rather than decorative.
+
+# Base images are pinned by tag *and* digest so a build is reproducible and the
+# toolchain never moves under us. Refresh a digest with:
+#   docker buildx imagetools inspect <tag> --format '{{.Manifest.Digest}}'
+ARG ELFPAK_IMAGE=elfpak:local
+ARG RUST_IMAGE=rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c
+
+FROM ${ELFPAK_IMAGE} AS elfpak
+
+FROM ${RUST_IMAGE} AS build
+
+COPY fixtures/vendor-lib/vendor.c fixtures/vendor-lib/main.c /src/
+
+RUN mkdir -p /opt/vendor/lib \
+    && cc -shared -fPIC -Wl,-soname,libvendor.so.1 \
+        -o /opt/vendor/lib/libvendor.so.1 /src/vendor.c \
+    # -rpath-link is a link-time hint only: nothing is recorded in the binary.
+    && cc -o /vendor-app /src/main.c /opt/vendor/lib/libvendor.so.1 \
+        -Wl,-rpath-link,/opt/vendor/lib \
+    && ldconfig /opt/vendor/lib \
+    && /vendor-app
+
+COPY --from=elfpak /elfpak /usr/local/bin/elfpak
+
+# The smoke test builds this twice: `true` is the default behaviour, `false`
+# proves the image stops working without the cache.
+ARG ELFPAK_LD_SO_CACHE=true
+
+RUN elfpak bundle /vendor-app \
+    --output /rootfs \
+    --install /app/vendor \
+    --preset minimal \
+    --ld-so-cache="${ELFPAK_LD_SO_CACHE}" \
+    -v
+
+FROM scratch
+
+COPY --from=build /rootfs /
+
+ENTRYPOINT ["/app/vendor"]

@@ -244,6 +244,15 @@ impl Sysroot {
             &[],
         );
 
+        // An NSS module: glibc dlopen()s these, so runtime policy adds them
+        // rather than DT_NEEDED. Nothing in the fixtures links against it.
+        self.dso(
+            "/usr/lib/libnss_files.so.2",
+            "libnss_files.so.2",
+            "int _nss_files_getpwnam_r(void) { return 0; }\n",
+            &[],
+        );
+
         // A dependency that is simply not there.
         let missing_main = "int base_value(void);\nvoid _start(void) { base_value(); }\n";
         self.exe(
@@ -499,7 +508,7 @@ impl HostFixtures {
     }
 }
 
-fn cc(args: &[&str]) {
+pub fn cc(args: &[&str]) {
     let output = Command::new("cc").args(args).output().expect("cc runs");
     assert!(
         output.status.success(),

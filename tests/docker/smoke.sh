@@ -6,6 +6,7 @@
 #   tests/docker/smoke.sh axum-arm64   # Axum on scratch, linux/arm64
 #   tests/docker/smoke.sh ca           # CA roots come from the bundle, not the binary
 #   tests/docker/smoke.sh musl         # a dynamically linked musl program
+#   tests/docker/smoke.sh ldcache      # a library the loader only finds through a cache
 #   tests/docker/smoke.sh tar          # tar output consumed by docker ADD
 #   tests/docker/smoke.sh cross        # non-Rust cross-architecture packaging
 #
@@ -34,6 +35,7 @@ debian_image="debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcb
 elfpak_image="elfpak:local"
 axum_image="elfpak-axum:local"
 musl_image="elfpak-musl:local"
+ldcache_image="elfpak-ldcache:local"
 cross_image="elfpak-cross:local"
 port="${ELFPAK_SMOKE_PORT:-18080}"
 
@@ -301,6 +303,38 @@ test_musl() {
     done
 }
 
+# A library in a directory the loader never searches. On the build image it is
+# found through /etc/ld.so.cache; a scratch image has one only if elfpak wrote
+# it, so this is what proves the generated cache actually works.
+test_ld_so_cache() {
+    local elfpak_tag image output
+    elfpak_tag="$(elfpak_image_for "$host_platform")"
+
+    log "packaging a program whose library lives in /opt/vendor/lib"
+    image="$(tag_for "$ldcache_image" "$host_platform")"
+    build_image tests/docker/Dockerfile.ldcache "$host_platform" "$ldcache_image" \
+        --build-arg "ELFPAK_IMAGE=$elfpak_tag"
+
+    output="$(docker run --rm --platform "$host_platform" "$image")"
+    grep -q "vendor value=7" <<<"$output" \
+        || fail "the scratch image did not run: $output"
+    ok "a library outside every loader directory is found from scratch"
+
+    # The same bundle without the cache must fail, or the cache proves nothing.
+    log "building the same bundle with --ld-so-cache=false"
+    local without="elfpak-ldcache:local-nocache"
+    build_image tests/docker/Dockerfile.ldcache "$host_platform" "$without" \
+        --build-arg "ELFPAK_IMAGE=$elfpak_tag" \
+        --build-arg "ELFPAK_LD_SO_CACHE=false"
+
+    if docker run --rm --platform "$host_platform" \
+        "$(tag_for "$without" "$host_platform")" >/dev/null 2>&1
+    then
+        fail "the image without a cache should not have started"
+    fi
+    ok "without the generated cache the same image cannot start"
+}
+
 # The tar backend, consumed the way a container build would consume it.
 test_tar() {
     local elfpak_tag image work
@@ -413,12 +447,14 @@ case "${1:-all}" in
     axum-arm64) test_axum_arm64 ;;
     ca)         test_ca_policy ;;
     musl)       test_musl ;;
+    ldcache)    test_ld_so_cache ;;
     tar)        test_tar ;;
     cross)      test_cross ;;
     all)
         test_axum "$(all_platforms)"
         test_ca_policy
         test_musl
+        test_ld_so_cache
         test_tar
         test_cross
         ;;
