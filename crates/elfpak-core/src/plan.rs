@@ -541,6 +541,28 @@ impl<'a> PlanBuilder<'a> {
         });
     }
 
+    fn push_source_file(
+        &mut self,
+        source: PathBuf,
+        destination: PathBuf,
+        kind: PlannedFileKind,
+        reason: InclusionReason,
+    ) -> Result<()> {
+        let (digest, size) = self.digests.get(&source)?;
+        self.push_file(PlannedFile {
+            source: Some(source.clone()),
+            destination,
+            kind,
+            reason,
+            mode: mode_of(&source)?,
+            size,
+            sha256: Some(digest),
+            link_target: None,
+            content: None,
+        });
+        Ok(())
+    }
+
     /// Copy a logical path from the source root, preserving its location and the
     /// symlinks leading to it. Returns `false` if the path does not exist.
     fn copy_path(
@@ -558,18 +580,7 @@ impl<'a> PlanBuilder<'a> {
         }
         match resolved.kind {
             EntryKind::File => {
-                let (digest, size) = self.digests.get(&resolved.host)?;
-                self.push_file(PlannedFile {
-                    source: Some(resolved.host.clone()),
-                    destination: resolved.logical.clone(),
-                    kind,
-                    reason,
-                    mode: mode_of(&resolved.host)?,
-                    size,
-                    sha256: Some(digest),
-                    link_target: None,
-                    content: None,
-                });
+                self.push_source_file(resolved.host, resolved.logical, kind, reason)?;
                 Ok(true)
             }
             EntryKind::Directory if recursive => {
@@ -615,18 +626,7 @@ impl<'a> PlanBuilder<'a> {
                     self.push_dir_with_mode(&child_logical, mode_of(&child_host)?, reason.clone());
                     stack.push((child_logical, child_host));
                 } else if metadata.is_file() {
-                    let (digest, size) = self.digests.get(&child_host)?;
-                    self.push_file(PlannedFile {
-                        source: Some(child_host.clone()),
-                        destination: child_logical,
-                        kind,
-                        reason: reason.clone(),
-                        mode: mode_of(&child_host)?,
-                        size,
-                        sha256: Some(digest),
-                        link_target: None,
-                        content: None,
-                    });
+                    self.push_source_file(child_host, child_logical, kind, reason.clone())?;
                 }
             }
         }
