@@ -1,13 +1,13 @@
 //! Content hashing and a small per-run cache.
 
 use crate::{
-    error::{Result, io},
+    error::{Error, Result, io},
     graph::Digest,
 };
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
-    io::BufRead,
+    io::{BufRead, Read},
     path::{Path, PathBuf},
 };
 
@@ -37,6 +37,63 @@ pub fn sha256_file(path: &Path) -> Result<(Digest, u64)> {
         reader.consume(consumed);
     }
     Ok((Digest(crate::paths::hex(&hasher.finalize())), size))
+}
+
+/// A reader which records the digest and number of bytes it has yielded.
+///
+/// Output backends use this while copying planned source files so the bytes
+/// that were actually written are checked against the immutable plan.
+#[derive(Debug)]
+pub struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+    size: u64,
+}
+
+impl<R> HashingReader<R> {
+    pub fn new(inner: R) -> HashingReader<R> {
+        HashingReader {
+            inner,
+            hasher: Sha256::new(),
+            size: 0,
+        }
+    }
+
+    pub fn finish(self) -> (Digest, u64) {
+        (
+            Digest(crate::paths::hex(&self.hasher.finalize())),
+            self.size,
+        )
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        self.size += read as u64;
+        Ok(read)
+    }
+}
+
+/// Fail when bytes copied from a source no longer match the plan.
+pub fn ensure_matches_plan(
+    path: &Path,
+    expected_digest: &Digest,
+    expected_size: u64,
+    actual_digest: Digest,
+    actual_size: u64,
+) -> Result<()> {
+    if actual_digest == *expected_digest && actual_size == expected_size {
+        return Ok(());
+    }
+    Err(Error::SourceChanged {
+        path: path.to_path_buf(),
+        expected_digest: expected_digest.0.clone(),
+        expected_size,
+        actual_digest: actual_digest.0,
+        actual_size,
+    })
 }
 
 /// Hashes a path once per run.

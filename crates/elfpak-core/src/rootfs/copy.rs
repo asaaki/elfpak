@@ -5,6 +5,7 @@
 
 use crate::{
     error::{Error, Result, io},
+    hash::{HashingReader, ensure_matches_plan},
     plan::{BundlePlan, PlannedFile, PlannedFileKind},
 };
 use std::path::{Path, PathBuf};
@@ -152,7 +153,28 @@ fn write_file(target: &Path, file: &PlannedFile) -> Result<u64> {
             std::fs::write(target, content).map_err(|e| io(target, e))?;
             Ok(content.len() as u64)
         }
-        (None, Some(source)) => std::fs::copy(source, target).map_err(|e| io(source, e)),
+        (None, Some(source)) => {
+            let input = std::fs::File::open(source).map_err(|e| io(source, e))?;
+            let mut input = HashingReader::new(std::io::BufReader::new(input));
+            let mut output = std::fs::File::create(target).map_err(|e| io(target, e))?;
+            let copy_result = std::io::copy(&mut input, &mut output).map_err(|e| io(source, e));
+            drop(output);
+            let (digest, size) = input.finish();
+
+            if let Err(error) = copy_result {
+                let _ = remove_existing(target);
+                return Err(error);
+            }
+            let expected = file
+                .sha256
+                .as_ref()
+                .expect("validated regular files have a digest");
+            if let Err(error) = ensure_matches_plan(source, expected, file.size, digest, size) {
+                let _ = remove_existing(target);
+                return Err(error);
+            }
+            Ok(size)
+        }
         _ => unreachable!("validated regular files have exactly one content source"),
     }
 }

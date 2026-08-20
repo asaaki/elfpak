@@ -64,6 +64,17 @@ pub enum Error {
         limit: usize,
     },
 
+    #[error(
+        "source file `{path}` changed after it was added to the bundle plan (expected {expected_size} bytes with sha256 {expected_digest}, found {actual_size} bytes with sha256 {actual_digest})"
+    )]
+    SourceChanged {
+        path: PathBuf,
+        expected_digest: String,
+        expected_size: u64,
+        actual_digest: String,
+        actual_size: u64,
+    },
+
     #[error("path `{path}` escapes the {kind} root")]
     PathEscape { path: PathBuf, kind: &'static str },
 
@@ -96,6 +107,7 @@ impl Error {
             Error::NotElf { .. } => "E1002",
             Error::UnsupportedArchitecture { .. } => "E1003",
             Error::LimitExceeded { .. } => "E1005",
+            Error::SourceChanged { .. } => "E1006",
             Error::UnresolvedLibrary { .. } => "E2001",
             Error::DisallowedLibrary { .. } => "E2002",
             Error::IncompatibleArchitecture { .. } => "E2003",

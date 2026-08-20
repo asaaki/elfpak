@@ -8,6 +8,7 @@
 
 use crate::{
     error::{Error, Result, io},
+    hash::{HashingReader, ensure_matches_plan},
     plan::{BundlePlan, PlannedFile, PlannedFileKind},
 };
 use std::{
@@ -77,8 +78,7 @@ impl TarBuilder {
                 }
                 _ => {
                     header.set_entry_type(EntryType::Regular);
-                    append_regular(&mut writer, &mut header, &name, entry)
-                        .map_err(|e| io(&self.path, e))?;
+                    append_regular(&mut writer, &mut header, &name, entry, &self.path)?;
                     report.files += 1;
                     report.bytes += entry.size;
                 }
@@ -117,17 +117,37 @@ fn append_regular<W: Write>(
     header: &mut Header,
     name: &str,
     entry: &PlannedFile,
-) -> std::io::Result<()> {
+    archive: &Path,
+) -> Result<()> {
     match (&entry.content, &entry.source) {
         (Some(content), None) => {
             assert_eq!(content.len() as u64, entry.size);
             header.set_size(content.len() as u64);
-            writer.append_data(header, name, content.as_slice())
+            writer
+                .append_data(header, name, content.as_slice())
+                .map_err(|e| io(archive, e))
         }
         (None, Some(source)) => {
-            let file = std::fs::File::open(source)?;
-            header.set_size(file.metadata()?.len());
-            writer.append_data(header, name, file)
+            let file = std::fs::File::open(source).map_err(|e| io(source, e))?;
+            let mut reader = HashingReader::new(std::io::BufReader::new(file));
+            header.set_size(entry.size);
+            let append_result = writer
+                .append_data(header, name, &mut reader)
+                .map_err(|e| io(archive, e));
+            // `tar` stops after the header's declared size. Continue reading
+            // so a source that grew is detected too, rather than silently
+            // accepting its original-size prefix.
+            let drain_result =
+                std::io::copy(&mut reader, &mut std::io::sink()).map_err(|e| io(source, e));
+            let (digest, size) = reader.finish();
+            let expected = entry
+                .sha256
+                .as_ref()
+                .expect("validated regular files have a digest");
+            ensure_matches_plan(source, expected, entry.size, digest, size)?;
+            append_result?;
+            drain_result?;
+            Ok(())
         }
         _ => unreachable!("validated regular files have exactly one content source"),
     }

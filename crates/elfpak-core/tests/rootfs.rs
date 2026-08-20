@@ -500,6 +500,32 @@ fn a_leftover_symlink_never_redirects_a_write() {
 }
 
 #[test]
+fn materialization_rejects_a_source_file_changed_after_planning() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+    let binary = sysroot.path("/bin/app-default");
+    let plan = Planner::new(SourceRoot::new(&sysroot.root), &binary)
+        .install_as("/app/server")
+        .plan()
+        .unwrap();
+
+    std::fs::write(&binary, b"changed after planning").unwrap();
+    let error = RootFsBuilder::new(&rootfs).apply(&plan).unwrap_err();
+    assert!(matches!(error, elfpak_core::Error::SourceChanged { .. }));
+    assert!(
+        !rootfs.join("app/server").exists(),
+        "the mismatched file must not be left in the rootfs"
+    );
+
+    let archive = output.path().join("bundle.tar");
+    let error = elfpak_core::TarBuilder::new(&archive)
+        .apply(&plan)
+        .unwrap_err();
+    assert!(matches!(error, elfpak_core::Error::SourceChanged { .. }));
+}
+
+#[test]
 fn timestamps_are_pinned_for_files_and_directories() {
     let Some(sysroot) = sysroot() else { return };
     let output = tempfile::tempdir().unwrap();
