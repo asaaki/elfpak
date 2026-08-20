@@ -12,7 +12,14 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-# Warnings are bugs that have not happened yet.
+# Reflow the `use` blocks: one sorted block per file, merged per crate. Both
+# options are nightly-only, which is why they are not in rustfmt.toml.
+imports:
+    cargo +nightly fmt --all -- --config group_imports=One,imports_granularity=Crate
+    cargo +nightly fmt --manifest-path fuzz/Cargo.toml --all -- \
+        --config group_imports=One,imports_granularity=Crate
+
+# Clippy at its strictest; a warning fails the recipe.
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 

@@ -4,12 +4,15 @@
 //! the target system. Symlinks are followed *logically* (inside the root) so a
 //! sysroot can be analyzed without any chance of escaping to the host.
 
-use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
-
-use crate::elf::ElfMetadata;
-use crate::error::{Error, Result, io};
-use crate::paths::normalize_absolute;
+use crate::{
+    elf::ElfMetadata,
+    error::{Error, Result, io},
+    paths::normalize_absolute,
+};
+use std::{
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+};
 
 /// How many symlinks may be traversed while resolving one logical path.
 ///
@@ -78,8 +81,7 @@ impl SourceRoot {
     /// Resolve a logical path, following symlinks within the root.
     ///
     /// Returns `Ok(None)` when the path does not exist. Symlinks are recorded so
-    /// that the bundle can reproduce the original link structure. All control
-    /// flow lives here; the helpers below only compute.
+    /// that the bundle can reproduce the original link structure.
     pub fn resolve(&self, logical: &Path) -> Result<Option<Resolved>> {
         let mut pending = components_reversed(&normalize_absolute(logical));
         let mut current = PathBuf::from("/");
@@ -108,8 +110,8 @@ impl SourceRoot {
                 continue;
             }
 
-            // A link is a hop: bounded above, and each hop makes progress by
-            // consuming one component, so the walk always terminates.
+            // Each hop consumes a component and is counted, so a chain of links
+            // cannot walk forever.
             if hops == SYMLINK_HOPS_MAX || pending.len() > PENDING_COMPONENTS_MAX {
                 return Err(Error::SymlinkLoop {
                     path: logical.to_path_buf(),
@@ -186,8 +188,8 @@ impl SourceRoot {
             let entry = entry.map_err(|e| io(&host, e))?;
             names.push(entry.file_name());
         }
-        // Directory order is whatever the filesystem feels like; sorted order
-        // is what makes two runs on the same tree produce the same bundle.
+        // Readdir order differs between filesystems; sorting is what makes two
+        // runs over the same tree produce the same bundle.
         names.sort();
         assert!(names.is_sorted());
         Ok(names)
@@ -207,8 +209,8 @@ fn components_reversed(path: &Path) -> Vec<std::ffi::OsString> {
         .collect()
 }
 
-/// `None` means "not there", which is an ordinary outcome when probing search
-/// directories; any other `io::Error` is a real failure and is propagated.
+/// `None` means the path is not there, which is ordinary when probing search
+/// directories. Any other error is propagated.
 fn symlink_metadata_optional(host: &Path) -> Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(host) {
         Ok(metadata) => Ok(Some(metadata)),
@@ -237,8 +239,8 @@ impl ElfCache {
         ElfCache::default()
     }
 
-    /// Parse `host` as ELF. `Ok(None)` means "exists but is not a usable ELF
-    /// object", which is a normal outcome when probing search directories.
+    /// Parse `host` as ELF. `Ok(None)` means the file exists but is not a usable
+    /// ELF object.
     pub fn get(&mut self, host: &Path) -> Result<Option<ElfMetadata>> {
         if let Some(cached) = self.entries.get(host) {
             assert!(cached.as_ref().is_none_or(|m| m.path == host));

@@ -62,6 +62,9 @@ established, and its message says which one.
   decisions. Push `if`s up and `for`s down.
 * **Order matters.** A file reads top-down: types, then the entry point, then
   the helpers it calls, in call order.
+* **One block of imports per file**, sorted, with each crate merged into a
+  single `use`. `just imports` reflows them; the two rustfmt options that do it
+  are nightly-only, so they live in the recipe rather than in `rustfmt.toml`.
 * **Names carry units and qualifiers last**, most significant word first, so
   related names line up: `MANIFEST_NAME_DEFAULT`, `CONFIG_NAME_DEFAULT`,
   `SYMLINK_HOPS_MAX`, `HASH_BUFFER_SIZE_BYTES`.
@@ -85,6 +88,7 @@ One toolbox, driven by `just`:
 ```console
 $ just check   # fmt-check + clippy -D warnings + the whole test suite
 $ just style   # the numeric limits on their own
+$ just imports # reflow the use blocks (needs nightly rustfmt)
 $ just smoke   # Docker smoke tests
 ```
 
@@ -92,8 +96,8 @@ $ just smoke   # Docker smoke tests
 
 * **Static allocation.** TigerBeetle allocates everything up front. `elfpak`
   cannot: the size of a closure is discovered by reading the binary. Instead,
-  every structure that grows has an asserted upper bound, which is what the rule
-  is protecting against.
+  every structure that grows has an asserted upper bound, which is what the
+  rule is really after.
 * **`snake_case` file and function names** are Rust's convention already; type
   names stay `CamelCase` rather than following Zig.
 * **Assertion density.** TigerStyle asks for an average of two assertions per

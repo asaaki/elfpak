@@ -15,8 +15,8 @@
 #
 # `--fresh` removes the images the suite owns and passes `--no-cache` to every
 # build, so a rerun cannot be explained by a layer that was already there. It
-# does not discard BuildKit cache mounts, which is what keeps cargo from
-# recompiling the fixtures from scratch; clear those too with:
+# does not discard BuildKit cache mounts, which keep cargo from recompiling the
+# fixtures every time; clear those too with:
 #
 #   docker builder prune --filter type=exec.cachemount
 #
@@ -260,8 +260,8 @@ test_axum_arm64() {
 }
 
 # The same application, bundled with `minimal` instead of `web`, must fail to
-# make an HTTPS request: that is what proves the CA roots come from the bundle
-# and not from something baked into the binary.
+# make an HTTPS request: the CA roots come from the bundle, not from something
+# baked into the binary.
 test_ca_policy() {
     local image id base http_port
     image="elfpak-axum:local-minimal"
@@ -362,9 +362,9 @@ test_ld_so_cache() {
 #
 # The same service as the axum test, packaged with `--tar` and delivered by
 # `ADD rootfs.tar /`. `ADD` extracts from the build context only, so the
-# archive is exported from the first build and is the context of the second —
-# which is what a pipeline does, and what makes this a test of the archive
-# rather than of a directory that happens to be tarred.
+# archive is exported from the first build and is the context of the second,
+# the way a pipeline would do it, so this tests the archive itself and not a
+# directory that happens to be tarred.
 test_tar() {
     local elfpak_tag work listing
     elfpak_tag="$(elfpak_image_for "$host_platform")"

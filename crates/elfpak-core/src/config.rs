@@ -1,12 +1,12 @@
 //! Optional `elfpak.toml`. CLI arguments always override the file, and the tool
 //! stays fully usable without one.
 
-use std::path::{Path, PathBuf};
-
+use crate::{
+    error::{Error, Result, io},
+    rootfs::policy::Preset,
+};
 use serde::{Deserialize, Serialize};
-
-use crate::error::{Error, Result, io};
-use crate::rootfs::policy::Preset;
+use std::path::{Path, PathBuf};
 
 /// Name of the configuration file discovered beside the working directory.
 pub const CONFIG_NAME_DEFAULT: &str = "elfpak.toml";
@@ -81,8 +81,7 @@ impl Config {
         })
     }
 
-    /// Load `elfpak.toml` from `dir` if it exists. A missing file is not an
-    /// error: the tool is fully usable without one.
+    /// Load `elfpak.toml` from `dir` if it exists. A missing file is not an error.
     pub fn discover(dir: &Path) -> Result<Option<(PathBuf, Config)>> {
         let candidate = dir.join(CONFIG_NAME_DEFAULT);
         assert!(candidate.ends_with(CONFIG_NAME_DEFAULT));

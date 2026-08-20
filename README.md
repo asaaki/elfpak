@@ -39,8 +39,8 @@ WORKDIR /app
 ENTRYPOINT ["/app/server"]
 ```
 
-The resulting image contains the application, its ELF closure, and nothing else
-except what the runtime policy explicitly asked for.
+The resulting image contains the application, its ELF closure, and whatever the
+runtime policy asked for.
 
 ## Commands
 
@@ -57,8 +57,8 @@ Two presets: `minimal` is the ELF closure alone, `web` adds CA certificates,
 `/tmp`, `passwd`/`group` and `nsswitch.conf`. Every feature is also switchable
 on its own, and an optional `elfpak.toml` can supply defaults.
 
-A service packaged with `--preset web` does DNS and outbound HTTPS with no
-CA-specific code in the application: the system trust store is simply there.
+A service packaged with `--preset web` does DNS and outbound HTTPS without any
+CA-specific code in the application; the system trust store comes along.
 
 ## What makes it different
 
@@ -118,4 +118,4 @@ architecture never needs emulation.
 
 Roadmap 0.1/0.2 is implemented for x86_64 and aarch64, along with tar output,
 loader-oracle tests against real glibc, and parser fuzzing. OCI output, runtime
-tracing (`elfpak trace`) and SBOM generation are not implemented yet, by design.
+tracing (`elfpak trace`) and SBOM generation are not implemented yet.

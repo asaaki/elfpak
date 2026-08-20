@@ -8,8 +8,7 @@
 # image does not have unless elfpak generates one.
 #
 # Built twice: once normally, and once with --ld-so-cache=false, which must
-# produce an image that cannot start. That is what makes the generated cache
-# load-bearing rather than decorative.
+# produce an image that cannot start.
 
 # Base images are pinned by tag *and* digest so a build is reproducible and the
 # toolchain never moves under us. Refresh a digest with:

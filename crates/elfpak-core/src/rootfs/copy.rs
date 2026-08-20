@@ -3,10 +3,11 @@
 //! Nothing is written outside the output root, the source filesystem is only
 //! ever read, and no file appears that the plan did not list.
 
+use crate::{
+    error::{Error, Result, io},
+    plan::{BundlePlan, PlannedFile, PlannedFileKind},
+};
 use std::path::{Path, PathBuf};
-
-use crate::error::{Error, Result, io};
-use crate::plan::{BundlePlan, PlannedFile, PlannedFileKind};
 
 /// Fixed mtime for every entry, so repeated runs are byte-identical.
 /// Overridable through `SOURCE_DATE_EPOCH`.
@@ -41,8 +42,7 @@ impl RootFsBuilder {
         self
     }
 
-    /// Materialize a plan. All control flow lives here; the helpers below each
-    /// write one kind of entry and nothing else.
+    /// Materialize a plan: create, link and copy, in plan order.
     pub fn apply(&self, plan: &BundlePlan) -> Result<RootFsReport> {
         if self.clean && self.output.exists() {
             guard_clean(&self.output)?;
@@ -135,8 +135,8 @@ fn write_directory(target: &Path, mode: u32) -> Result<()> {
     set_mode(target, mode)
 }
 
-/// Recreate a symlink verbatim. A planned symlink always has a target; `/` is
-/// the one link target that cannot mean anything else if it somehow does not.
+/// Recreate a symlink verbatim. A planned symlink always has a target; `/` is a
+/// harmless fallback for one that somehow does not.
 fn write_symlink(target: &Path, link_target: Option<&Path>) -> Result<()> {
     let link_target = link_target.unwrap_or(Path::new("/"));
     remove_existing(target)?;
@@ -214,8 +214,7 @@ fn has_symlinked_ancestor(output: &Path, path: &Path) -> bool {
     false
 }
 
-/// What was written, counted as it was written. Explicitly sized: a rootfs with
-/// more than four billion entries is not a rootfs.
+/// What was written, counted as it was written.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RootFsReport {
     pub files: u32,

@@ -5,16 +5,16 @@
 //! the common case where a new-format cache is appended after an old-format one.
 //!
 //! On the way out, [`build`] emits a `glibc-ld.so.cache1.1` image for the
-//! bundle. That is the only way a packaged application can find a library that
-//! does not live in a directory the loader searches by default: the rootfs
-//! carries no `ldconfig` to generate one, and copying the build host's cache
-//! would describe the host's filesystem rather than the bundle's.
-
-use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+//! bundle. Without one, a packaged application cannot find a library outside
+//! the directories the loader searches by default: the rootfs carries no
+//! `ldconfig`, and the build host's cache describes the host's filesystem.
 
 use crate::elf::{Architecture, ElfClass, Endianness, Machine};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 const OLD_MAGIC: &[u8] = b"ld.so-1.7.0";
 const NEW_MAGIC: &[u8] = b"glibc-ld.so.cache";
@@ -29,8 +29,8 @@ const NEW_ENTRY_LEN: usize = 24;
 
 /// Upper bound on the entries taken from a cache image.
 ///
-/// A distribution cache holds a few thousand libraries. The bound is on what is
-/// read, not on what exists: `nlibs` comes out of the file and is never trusted.
+/// A distribution cache holds a few thousand libraries. `nlibs` comes out of
+/// the file and is never trusted, so this bounds what is read.
 const CACHE_ENTRIES_MAX: usize = 65_536;
 
 #[derive(Debug, Clone, Default)]
@@ -41,8 +41,8 @@ pub struct LdCache {
 }
 
 impl LdCache {
-    /// Parse a cache image. Malformed caches degrade to "no entries" rather than
-    /// failing the build: the cache is only a hint, the search paths remain.
+    /// Parse a cache image. A malformed cache yields no entries instead of
+    /// failing the build; the cache is a hint and the search paths remain.
     pub fn parse(bytes: &[u8]) -> LdCache {
         let mut cache = LdCache::default();
         let pairs = if starts_with(bytes, 0, NEW_MAGIC) {
@@ -70,10 +70,8 @@ impl LdCache {
 
         cache.len = pairs.len();
         for (soname, path) in pairs {
-            // ldconfig only ever records absolute paths. A relative one would
-            // be interpreted against the working directory further downstream,
-            // which is exactly the kind of ambient state a packaging tool must
-            // not depend on.
+            // ldconfig only records absolute paths. A relative one would be
+            // resolved against this process's working directory downstream.
             if !path.is_absolute() {
                 continue;
             }
@@ -133,9 +131,8 @@ fn read_string(bytes: &[u8], base: usize, offset: u32) -> Option<String> {
 
 /// How many entries `bytes` can actually hold from `base` on.
 ///
-/// `nlibs` comes straight out of the file, so it is never trusted for sizing:
-/// a 48-byte header claiming four billion entries must not reserve memory for
-/// four billion entries.
+/// `nlibs` comes straight out of the file, so it is never trusted for sizing;
+/// the size of the image is the only bound worth allocating against.
 fn entry_capacity(bytes: &[u8], base: usize, header: usize, entry: usize) -> usize {
     bytes
         .len()
@@ -326,9 +323,8 @@ pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<
     out.extend_from_slice(&strings);
     assert_eq!(out.len(), base + strings.len());
 
-    // Pair assertion: what was just written is read back with the same reader
-    // the loader's format is modelled on. A cache the bundle cannot use is
-    // worse than no cache, because it looks like the problem was solved.
+    // Read the image back with the same reader the loader's format is modelled
+    // on. A cache the bundle cannot use would be worse than none.
     let written = LdCache::parse(&out);
     assert_eq!(written.entry_count(), entries.len());
     assert!(
@@ -343,8 +339,8 @@ pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<
 /// numerically, so `libfoo.so.9` sorts before `libfoo.so.10`.
 ///
 /// Bytes are compared unsigned. glibc compares them as `char`, whose signedness
-/// is architecture-dependent, so the two can only disagree about sonames that
-/// are not ASCII — which no toolchain produces.
+/// is architecture-dependent, so the two can only disagree about non-ASCII
+/// sonames.
 fn libcmp(left: &str, right: &str) -> Ordering {
     let (p1, p2) = (left.as_bytes(), right.as_bytes());
     let (mut i, mut j) = (0usize, 0usize);
@@ -389,8 +385,6 @@ fn libcmp(left: &str, right: &str) -> Ordering {
 mod tests {
     use super::*;
 
-    /// Offsets in the cache format are `u32`; a fixture that did not fit would
-    /// be a broken fixture, not a truncated one.
     fn offset(value: usize) -> u32 {
         u32::try_from(value).expect("fixture offsets fit in u32")
     }
@@ -615,8 +609,6 @@ mod tests {
         assert!(LdCache::parse(&[]).is_empty());
     }
 
-    /// A header may claim any entry count at all; the file size is the only
-    /// bound that can be trusted for allocation.
     #[test]
     fn an_absurd_entry_count_allocates_nothing() {
         assert_eq!(

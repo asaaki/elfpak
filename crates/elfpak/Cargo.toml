@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 description.workspace = true
 
+[lib]
+name = "elfpak"
+path = "src/lib.rs"
+
+# A wrapper around the library, so the command line is testable and readable as
+# ordinary code rather than as one long `main`.
 [[bin]]
 name = "elfpak"
 path = "src/main.rs"

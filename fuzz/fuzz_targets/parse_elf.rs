@@ -6,10 +6,9 @@
 
 #![no_main]
 
-use std::path::Path;
-
 use elfpak_core::ElfMetadata;
 use libfuzzer_sys::fuzz_target;
+use std::path::Path;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(metadata) = ElfMetadata::parse_bytes(Path::new("<fuzz>"), data) {

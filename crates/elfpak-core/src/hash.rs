@@ -1,17 +1,19 @@
 //! Content hashing. Every included file is hashed exactly once.
 //!
-//! A digest is the only thing that ties a planned entry, a manifest line and a
-//! materialized file together, so digests are asserted well-formed on the way
-//! out of this module and again on the way into the graph.
+//! A digest ties a planned entry, a manifest line and a materialized file
+//! together, so it is checked on the way out of here and again on the way into
+//! the graph.
 
-use std::collections::HashMap;
-use std::io::BufRead;
-use std::path::{Path, PathBuf};
-
+use crate::{
+    error::{Result, io},
+    graph::Digest,
+};
 use sha2::{Digest as _, Sha256};
-
-use crate::error::{Result, io};
-use crate::graph::Digest;
+use std::{
+    collections::HashMap,
+    io::BufRead,
+    path::{Path, PathBuf},
+};
 
 pub fn sha256_bytes(bytes: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
@@ -21,12 +23,12 @@ pub fn sha256_bytes(bytes: &[u8]) -> Digest {
     digest
 }
 
-/// Read buffer for streamed hashing. Large enough to amortize the syscall over
-/// a whole page cluster, small enough that it stays a rounding error in RSS.
+/// Read buffer for streamed hashing: large enough to amortize the read
+/// syscalls, small enough to not show up in RSS.
 const HASH_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 
-/// Hash a file in chunks: an `--include`d file may be arbitrarily large, and
-/// nothing here ever needs its contents in memory.
+/// Hash a file in chunks. An `--include`d file can be arbitrarily large and
+/// nothing here needs its contents in memory.
 pub fn sha256_file(path: &Path) -> Result<(Digest, u64)> {
     let file = std::fs::File::open(path).map_err(|e| io(path, e))?;
     let mut reader = std::io::BufReader::with_capacity(HASH_BUFFER_SIZE_BYTES, file);
@@ -37,8 +39,8 @@ pub fn sha256_file(path: &Path) -> Result<(Digest, u64)> {
         if chunk.is_empty() {
             break;
         }
-        // Every iteration consumes at least one byte, so the loop is bounded by
-        // the length of the file and a short read cannot turn into a spin.
+        // Bounded by the length of the file: every iteration consumes at least
+        // one byte, so a short read cannot turn into a spin.
         let consumed = chunk.len();
         assert!(consumed > 0);
         assert!(consumed <= HASH_BUFFER_SIZE_BYTES);
@@ -51,8 +53,7 @@ pub fn sha256_file(path: &Path) -> Result<(Digest, u64)> {
     Ok((digest, size))
 }
 
-/// Every included file is hashed exactly once, however many plan entries and
-/// graph nodes end up referring to it.
+/// Hashes each path once, however many plan entries and graph nodes refer to it.
 #[derive(Debug, Default)]
 pub struct DigestCache {
     entries: HashMap<PathBuf, (Digest, u64)>,
@@ -71,7 +72,7 @@ impl DigestCache {
         let value = sha256_file(path)?;
         assert!(value.0.is_well_formed());
         let previous = self.entries.insert(path.to_path_buf(), value.clone());
-        assert!(previous.is_none(), "a miss cannot have had an entry");
+        assert!(previous.is_none());
         Ok(value)
     }
 

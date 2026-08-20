@@ -1,8 +1,8 @@
 //! Integration fixture: a production-shaped Axum service.
 //!
-//! It exercises everything the `web` preset promises: DNS resolution through
-//! glibc, outbound HTTPS with no application-side CA configuration, a writable
-//! `/tmp`, and running as a non-root user.
+//! It exercises what the `web` preset provides: DNS resolution through glibc,
+//! outbound HTTPS with no application-side CA configuration, a writable `/tmp`,
+//! and running as a non-root user.
 
 use axum::{Json, Router, routing::get};
 use serde_json::{Value, json};
@@ -19,7 +19,9 @@ async fn main() {
         .route("/outbound/pinned", get(outbound_pinned));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind 8080");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind 8080");
     eprintln!("listening on {addr}");
     axum::serve(listener, app).await.expect("serve");
 }
@@ -63,12 +65,11 @@ async fn dns() -> Json<Value> {
     }
 }
 
-/// Outbound HTTPS the way an ordinary application writes it: no CA
-/// configuration whatsoever.
+/// Outbound HTTPS without any CA configuration in the application.
 ///
-/// The client trusts the platform store, and no roots are compiled into the
-/// binary, so this succeeds only because the bundle placed the system CA
-/// certificates in the image. Applications should not have to think about it.
+/// The client trusts the platform store and no roots are compiled into the
+/// binary, so this only succeeds because the bundle carries the system CA
+/// certificates.
 async fn outbound() -> Json<Value> {
     match reqwest::get("https://example.com").await {
         Ok(response) => Json(json!({ "ok": true, "status": response.status().as_u16() })),
@@ -78,8 +79,8 @@ async fn outbound() -> Json<Value> {
 
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
-/// The opt-in variant, for applications that want to trust exactly one bundle
-/// and nothing else. Shown here to prove the bundled file is usable directly.
+/// The opt-in variant, for an application that wants to trust one bundle and
+/// nothing else. Here it also shows the bundled file is usable directly.
 async fn outbound_pinned() -> Json<Value> {
     match pinned_get("https://example.com").await {
         Ok(status) => Json(json!({ "ok": true, "status": status })),

@@ -6,13 +6,15 @@
 //! machines is pinned: ownership is root:root, timestamps come from
 //! `SOURCE_DATE_EPOCH`, and entries are emitted in plan order.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
-
+use crate::{
+    error::{Error, Result, io},
+    plan::{BundlePlan, PlannedFile, PlannedFileKind},
+};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 use tar::{EntryType, Header};
-
-use crate::error::{Error, Result, io};
-use crate::plan::{BundlePlan, PlannedFile, PlannedFileKind};
 
 #[derive(Debug)]
 pub struct TarBuilder {
@@ -101,8 +103,7 @@ impl TarBuilder {
     }
 }
 
-/// A header with everything that could vary between machines already pinned:
-/// ownership is root:root and the timestamp comes from `SOURCE_DATE_EPOCH`.
+/// A header with ownership and timestamp pinned.
 fn pinned_header(mode: u32, mtime: u64) -> Header {
     let mut header = Header::new_gnu();
     header.set_uid(0);

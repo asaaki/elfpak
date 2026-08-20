@@ -190,7 +190,7 @@ Unknown keys are rejected rather than ignored, so typos surface immediately.
 
 `[dependencies].allow` (or `--allow-library`, repeatable) turns the runtime
 closure into a contract. A new native dependency then fails the build instead of
-silently growing the image, which is what makes it useful in CI:
+silently growing the image, which is why it belongs in CI:
 
 ```text
 error[E2002]:
@@ -262,10 +262,9 @@ and that symlinks still point where they did. It needs no Docker. Pass
 `--rootfs` to check a tree other than the one recorded in the manifest.
 
 By default that proves nothing was **removed or altered**. `--strict` also walks
-the rootfs and fails on anything the manifest does not list, which is what
-catches files that were *added* after the bundle was built, and compares
-permission bits, which a content digest cannot see (a file that became setuid
-still hashes the same):
+the rootfs and fails on anything the manifest does not list, so files *added*
+after the bundle was built are caught too, and compares permission bits, which a
+content digest cannot see (a file that became setuid still hashes the same):
 
 ```console
 $ elfpak verify /out/elfpak-manifest.json --strict
@@ -413,7 +412,8 @@ Dockerfile            static elfpak distribution image (FROM scratch)
 ```
 
 `elfpak-core` holds the reusable implementation; no resolution logic lives in
-the CLI crate. Base images are pinned by tag and digest, and no build step
+the CLI crate. `crates/elfpak` is itself a library with a six-line `main.rs`
+around it: `lib.rs` dispatches, one module per subcommand does the work. Base images are pinned by tag and digest, and no build step
 installs packages from a distribution mirror, so a digest really does describe
 what was built. Every image the tests build is produced for all architectures
 under test in one buildx invocation.
@@ -465,9 +465,9 @@ $ tests/docker/smoke.sh --fresh    # remove the suite's images, build with --no-
 
 `--fresh` exists so that a rerun cannot be explained by a layer that was already
 there: it removes every `elfpak:local*` and `elfpak-*:local*` image and passes
-`--no-cache` to each build. BuildKit cache mounts survive it — that is what keeps
-cargo from recompiling the fixtures from scratch — and are cleared separately
-with `docker builder prune --filter type=exec.cachemount`.
+`--no-cache` to each build. BuildKit cache mounts survive it, which keeps cargo
+from recompiling the fixtures every time; clear those separately with
+`docker builder prune --filter type=exec.cachemount`.
 
 The code follows [TigerStyle](https://tigerstyle.dev/); [STYLE.md](STYLE.md)
 records how, and `crates/elfpak-core/tests/style.rs` enforces the two numeric
@@ -528,8 +528,8 @@ The Docker smoke tests:
   shell. The HTTPS check uses a plain client with no CA configuration in the
   application at all.
 * `ca` — bundles the same binary with `--preset minimal` and asserts that it
-  still starts but can no longer make an HTTPS request, which is what proves the
-  trust roots come from the bundle rather than from the application.
+  still starts but can no longer make an HTTPS request: the trust roots come
+  from the bundle, not from the application.
 * `axum-arm64` — the same end-to-end test on `linux/arm64`: the service, the
   `elfpak` that packages it, and the resulting scratch image are all aarch64.
   The full run builds both architectures in a single buildx invocation. The
@@ -540,8 +540,7 @@ The Docker smoke tests:
   which the loader never searches and which no `DT_RPATH` names. On the build
   image `ldconfig` makes it work; in the scratch image only the cache `elfpak`
   generated can. The same bundle is then built with `--ld-so-cache=false` and
-  must fail to start, which is what makes the cache load-bearing rather than
-  decorative.
+  must fail to start.
 * `musl` — compiles a dynamically linked C program with Alpine's toolchain and
   packages it, on every architecture under test. It compiles inside the pinned
   Rust Alpine image, which already carries that toolchain, so the test installs

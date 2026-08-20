@@ -1,8 +1,7 @@
 //! Argument definitions. All real work happens in `elfpak-core`.
 
-use std::path::PathBuf;
-
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(

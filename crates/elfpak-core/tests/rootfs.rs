@@ -2,12 +2,12 @@
 
 mod common;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
 use common::{Sysroot, have_cc};
-use elfpak_core::manifest::VerifyOptions;
-use elfpak_core::{Manifest, Planner, RootFsBuilder, SourceRoot};
+use elfpak_core::{Manifest, Planner, RootFsBuilder, SourceRoot, manifest::VerifyOptions};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 fn sysroot() -> Option<Sysroot> {
     have_cc().then(Sysroot::build)

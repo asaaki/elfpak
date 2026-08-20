@@ -40,7 +40,7 @@ pub fn expand(input: &str, ctx: &TokenContext) -> String {
                 i += 1 + consumed;
             }
             None => {
-                // An unknown token is not a token: the loader leaves it alone.
+                // Not a token the loader knows, so copy the `$` and move on.
                 out.push('$');
                 i += 1;
             }

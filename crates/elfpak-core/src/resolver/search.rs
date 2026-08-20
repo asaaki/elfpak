@@ -1,16 +1,16 @@
 //! Library search directories: `ld.so.conf` and the architecture defaults.
 
+use crate::{
+    elf::{Architecture, ElfClass},
+    paths::{logical_parent, normalize_absolute},
+    source::SourceRoot,
+};
 use std::path::{Path, PathBuf};
-
-use crate::elf::{Architecture, ElfClass};
-use crate::paths::{logical_parent, normalize_absolute};
-use crate::source::SourceRoot;
 
 /// How deeply `include` directives may nest.
 ///
-/// `ld.so.conf` files include a directory of fragments, and those fragments do
-/// not include further ones in any distribution; eight levels is generous and
-/// finite, which is what matters.
+/// `ld.so.conf` files include a directory of fragments, and no distribution
+/// nests those any further. Eight levels is generous.
 const CONF_DEPTH_MAX: usize = 8;
 
 /// Upper bound on the files one `ld.so.conf` may pull in, and on the
@@ -49,10 +49,8 @@ enum Directive {
 
 /// Read `/etc/ld.so.conf`, following `include` directives (with `*` globs).
 ///
-/// Iterative rather than recursive, so the depth of the walk is a number in
-/// this function rather than a property of the stack. Directives are pushed in
-/// reverse and popped in order, which reproduces exactly the depth-first,
-/// in-file-order traversal that the loader's own reader performs.
+/// Directives are pushed in reverse and popped in order, which reproduces the
+/// depth-first, in-file-order traversal of the loader's own reader.
 pub fn parse_ld_so_conf(root: &SourceRoot) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut visited: Vec<PathBuf> = Vec::new();
@@ -73,8 +71,7 @@ pub fn parse_ld_so_conf(root: &SourceRoot) -> Vec<PathBuf> {
             Directive::Include(file) => file,
         };
 
-        // A file is read once: an include cycle is a configuration error, not a
-        // reason to keep reading.
+        // A file is read once, so an include cycle cannot become a loop.
         if depth > CONF_DEPTH_MAX || visited.contains(&file) || visited.len() == CONF_FILES_MAX {
             continue;
         }

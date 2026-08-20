@@ -8,16 +8,16 @@ pub mod cache;
 pub mod search;
 pub mod tokens;
 
-use std::path::{Path, PathBuf};
-
-use crate::elf::{Architecture, ElfMetadata, ObjectType};
-use crate::error::{Error, Result};
-use crate::graph::{DependencyGraph, DependencyReason, Node, NodeId, NodeKind};
-use crate::hash::DigestCache;
-use crate::paths::{logical_parent, normalize_absolute};
-use crate::source::{ElfCache, EntryKind, Resolved, SourceRoot};
-
+use crate::{
+    elf::{Architecture, ElfMetadata, ObjectType},
+    error::{Error, Result},
+    graph::{DependencyGraph, DependencyReason, Node, NodeId, NodeKind},
+    hash::DigestCache,
+    paths::{logical_parent, normalize_absolute},
+    source::{ElfCache, EntryKind, Resolved, SourceRoot},
+};
 pub use cache::LdCache;
+use std::path::{Path, PathBuf};
 pub use tokens::TokenContext;
 
 /// A single `DT_NEEDED` lookup, with all loader state it depends on.
@@ -41,9 +41,9 @@ pub struct ResolvedLibrary {
     pub metadata: ElfMetadata,
 }
 
-/// Where a lookup succeeded. Only some of these survive into the bundle: the
-/// generated rootfs has no `ld.so.cache`, and `--library-path` is a hint to
-/// `elfpak`, not something the packaged application inherits.
+/// Where a lookup succeeded. Only some of these survive into the bundle:
+/// `--library-path` is a hint to `elfpak` and the packaged application never
+/// sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchOrigin {
     /// `DT_RPATH`/`DT_RUNPATH` of the requesting object, or an absolute soname.
@@ -166,8 +166,8 @@ impl Resolver {
             .iter()
             .any(|default| default == directory);
         if is_default {
-            // The loader inside the bundle searches this directory anyway, so
-            // how the library was found here does not survive as a problem.
+            // The packaged loader searches this directory anyway, so it does not
+            // matter how the library was found here.
             return;
         }
         let note = ResolutionNote {
@@ -574,9 +574,8 @@ fn push_directory(dirs: &mut Vec<(PathBuf, SearchOrigin)>, dir: PathBuf, origin:
 }
 
 impl DynamicLinkerResolver for Resolver {
-    /// One `DT_NEEDED` lookup. All the control flow of a lookup lives here: a
-    /// soname is either a path or a search, and a search either finds a
-    /// compatible object, finds an incompatible one, or finds nothing.
+    /// One `DT_NEEDED` lookup: a soname is either a path or a search, and a
+    /// search finds a compatible object, an incompatible one, or nothing.
     fn resolve(&mut self, request: &LibraryRequest) -> Result<ResolvedLibrary> {
         assert!(!request.soname.is_empty());
         assert!(request.requester.is_absolute());
@@ -594,8 +593,8 @@ impl DynamicLinkerResolver for Resolver {
         };
 
         if let Some(library) = found {
-            // Never trust the file name: an object only satisfies a request if
-            // its own header says it can be mapped into the same process.
+            // An object satisfies a request only if its own header says it can
+            // be mapped into the same process. The file name means nothing.
             assert!(
                 library
                     .metadata
@@ -606,8 +605,8 @@ impl DynamicLinkerResolver for Resolver {
             return Ok(library);
         }
 
-        // Nothing was found. Reporting the incompatible candidate is more
-        // useful than reporting the absence, because it names the real problem.
+        // Nothing was found. An incompatible candidate is worth reporting over
+        // the plain absence, because it names what went wrong.
         if let Some((found, architecture)) = mismatch {
             return Err(Error::IncompatibleArchitecture {
                 soname: request.soname.clone(),

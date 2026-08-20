@@ -1,17 +1,49 @@
 //! Human-facing rendering of plans, diagnostics and errors.
 //!
-//! Nothing here decides anything: every function takes a finished plan and
-//! writes it out. The two entry points, [`inspect`] and [`bundle_summary`],
-//! hold the structure; the helpers below each render one section.
+//! Every function here takes a finished plan and writes it out; the two entry
+//! points are [`inspect`] and [`bundle_summary`]. [`Verbosity`] decides whether
+//! any of it is written at all.
 
-use std::io::Write;
-use std::path::Path;
+use crate::bundle::Outputs;
+use elfpak_core::{
+    Error,
+    graph::{DependencyGraph, NodeKind},
+    plan::{BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Warning},
+};
+use std::{io::Write, path::Path};
 
-use elfpak_core::Error;
-use elfpak_core::graph::{DependencyGraph, NodeKind};
-use elfpak_core::plan::{BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Warning};
+/// How much of the above reaches the terminal: `-q` silences everything except
+/// errors, `-v` adds notes about how the run was configured.
+#[derive(Clone, Copy)]
+pub(crate) struct Verbosity {
+    quiet: bool,
+    level: u8,
+}
 
-use crate::Outputs;
+impl Verbosity {
+    pub(crate) fn new(quiet: bool, level: u8) -> Verbosity {
+        Verbosity { quiet, level }
+    }
+
+    pub(crate) fn level(&self) -> u8 {
+        self.level
+    }
+
+    pub(crate) fn print(&self, render: impl FnOnce(&mut dyn Write) -> std::io::Result<()>) {
+        if self.quiet {
+            return;
+        }
+        let mut stdout = std::io::stdout();
+        let _ = render(&mut stdout);
+    }
+
+    pub(crate) fn note(&self, message: impl std::fmt::Display) {
+        if self.quiet || self.level == 0 {
+            return;
+        }
+        eprintln!("note: {message}");
+    }
+}
 
 /// Where a bundle was (or would be) written.
 #[derive(Debug, Clone, Copy, Default)]
@@ -21,7 +53,6 @@ pub(crate) struct Destinations<'a> {
     pub(crate) manifest: Option<&'a Path>,
 }
 
-/// Binary units, because that is what a filesystem counts in.
 const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 const UNIT_STEP_BYTES: f64 = 1024.0;
 

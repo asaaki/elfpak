@@ -47,8 +47,8 @@ COPY --from=elfpak /elfpak /usr/local/bin/elfpak
 
 ARG ELFPAK_PRESET=web
 
-# The manifest lands beside the archive, which is what `--tar` on its own means:
-# the record belongs next to the bundle, never inside it.
+# With only `--tar`, the manifest lands beside the archive. The record belongs
+# next to the bundle, never inside it.
 RUN elfpak bundle /axum-server \
     --tar /archive/rootfs.tar \
     --install /app/server \

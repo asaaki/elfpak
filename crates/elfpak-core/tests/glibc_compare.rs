@@ -8,18 +8,19 @@
 
 mod common;
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-
 use common::{HostFixtures, cc, have_cc, ldd_closure, ldd_raw};
 use elfpak_core::{ElfMetadata, Error, NodeKind, Planner, SourceRoot};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 /// Shared objects `elfpak` resolves, excluding the executable and `PT_INTERP`.
 ///
-/// The interpreter is deliberately left out of the comparison: `ldd` only ever
-/// prints it because glibc's `libc.so.6` declares it as `DT_NEEDED`, so a
-/// binary that does not link libc has no loader line at all. `elfpak` always
-/// includes it, which is what the kernel requires; that is covered separately.
+/// The interpreter is left out of the comparison: `ldd` only prints it because
+/// glibc's `libc.so.6` declares it as `DT_NEEDED`, so a binary that does not
+/// link libc has no loader line at all. `elfpak` always includes it, as the
+/// kernel requires; that is covered separately.
 fn elfpak_closure(binary: &Path) -> BTreeSet<PathBuf> {
     let plan = Planner::new(SourceRoot::new("/"), binary)
         .plan()
@@ -155,8 +156,6 @@ fn can_bind_mount() -> bool {
         .unwrap_or(false)
 }
 
-/// The one test that proves the point: a cache `elfpak` generated is read by
-/// the real glibc loader, not merely by `elfpak`'s own parser.
 /// Compile `libhidden.so.1` into `directory` and return its path. Nothing about
 /// the library matters except that it is real and that it says where it is.
 fn build_hidden_library(tmp: &Path, directory: &Path) -> PathBuf {
@@ -333,7 +332,7 @@ fn ldconfig_reads_a_generated_cache() {
 
 /// End to end: a bundle whose library lives outside every directory the loader
 /// searches must still start, and must stop starting when the cache is taken
-/// away. That is the whole point of generating one.
+/// away.
 ///
 /// The rootfs is entered with `chroot` inside a private user and mount
 /// namespace, which needs no privileges and touches nothing outside it.
@@ -385,8 +384,7 @@ fn a_bundled_rootfs_starts_from_a_directory_the_loader_never_searches() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Without the cache the same tree cannot resolve the library, which is what
-    // makes the generated one load-bearing rather than decorative.
+    // Without the cache the same tree cannot resolve the library at all.
     let without = tmp.path().join("rootfs-no-cache");
     elfpak_core::RootFsBuilder::new(&without)
         .apply(&plan(elfpak_core::CachePolicy::Never))

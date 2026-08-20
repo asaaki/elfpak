@@ -1,10 +1,7 @@
-//! Style by the numbers.
+//! Style by the numbers: 100 columns and 70 lines per function.
 //!
-//! TigerStyle's two numeric limits — 100 columns and 70 lines per function —
-//! are the kind of rule that only holds if something checks it, so something
-//! does, in the same tool that runs everything else. Both are hard limits: a
-//! function that no longer fits is a function that wants splitting, and a line
-//! that no longer fits is a line that wants a name for one of its parts.
+//! Both limits are hard, and checked here so that `cargo test` enforces them
+//! instead of code review.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +12,7 @@ const LINE_LEN_MAX: usize = 100;
 const FUNCTION_LINES_MAX: usize = 70;
 
 #[test]
-fn no_line_is_wider_than_the_measure() {
+fn no_line_is_wider_than_the_limit() {
     let mut problems = Vec::new();
     for file in sources() {
         let text = std::fs::read_to_string(&file).expect("a source file is readable");
@@ -63,7 +60,7 @@ fn no_function_is_longer_than_a_screen() {
 /// Every function in a file, as `(line index, name, length in lines)`.
 ///
 /// A function ends at the first closing brace in its own column, which is what
-/// `rustfmt` guarantees and what a reader's eye uses too.
+/// `rustfmt` guarantees.
 fn functions(lines: &[&str]) -> Vec<(usize, String, usize)> {
     let mut found = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -107,8 +104,7 @@ fn signature(line: &str) -> Option<(usize, String)> {
     (!name.is_empty()).then_some((indent, name))
 }
 
-/// Every Rust file in the workspace, tests and fuzz targets included: the rules
-/// are not just for the code that ships.
+/// Every Rust file in the workspace, tests and fuzz targets included.
 fn sources() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()

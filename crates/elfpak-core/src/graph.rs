@@ -1,26 +1,21 @@
 //! The dependency graph records both *what* is included and *why*.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-
+use crate::{elf::Architecture, rootfs::policy::RuntimeFeature, source::SymlinkEntry};
 use serde::{Deserialize, Serialize};
-
-use crate::elf::Architecture;
-use crate::rootfs::policy::RuntimeFeature;
-use crate::source::SymlinkEntry;
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 /// Index of a node in [`DependencyGraph::nodes`].
-///
-/// Explicitly sized rather than `usize`, because the width of an identifier
-/// should describe the domain and not the machine the tool happens to run on.
 pub type NodeId = u32;
 
 /// Upper bound on the objects in one runtime closure.
 ///
 /// A real closure is tens of objects; a thousand would already be remarkable.
-/// The limit is here so that a mistake in the graph-building code fails fast
-/// instead of consuming memory, and it is asserted rather than reported because
-/// exceeding it means `elfpak` is wrong, not that the input is.
+/// The limit catches a mistake in the graph-building code before it eats
+/// memory. It is asserted rather than reported: hitting it is a bug here, not
+/// bad input.
 pub const NODES_MAX: usize = 4096;
 
 /// Upper bound on edges. Every edge is one `DT_NEEDED`, `PT_INTERP` or policy
@@ -35,8 +30,7 @@ pub struct Digest(pub String);
 pub const DIGEST_LEN_HEX: usize = 64;
 
 impl Digest {
-    /// Whether this is a well-formed SHA-256 digest, used by assertions on
-    /// both sides of the graph: digests go in here and come out in manifests.
+    /// Whether this is a well-formed SHA-256 digest.
     pub fn is_well_formed(&self) -> bool {
         self.0.len() == DIGEST_LEN_HEX && self.0.bytes().all(|b| b.is_ascii_hexdigit())
     }
@@ -119,11 +113,8 @@ impl DependencyGraph {
     /// is often reached through several link paths (`/lib64/ld-linux…` and
     /// `/lib/<tuple>/ld-linux…`), and every one of them must be preserved.
     pub fn insert(&mut self, node: Node) -> NodeId {
-        // Every path in the graph is logical and absolute, because it names a
-        // location in the target process's filesystem rather than on this host.
         assert!(node.logical.is_absolute());
         assert!(node.destination.is_absolute());
-        assert!(node.source.is_absolute() || node.source.is_relative());
         assert!(node.sha256.is_well_formed());
 
         if let Some(&id) = self.by_logical.get(&node.logical) {
@@ -227,16 +218,16 @@ impl DependencyGraph {
 
     /// Nodes reachable from the executable through its own ELF dependencies.
     ///
-    /// Objects that only runtime policy asked for — NSS modules and whatever
-    /// *they* need — are deliberately outside this set: they are part of the
-    /// image, but not part of the application's declared dependency contract.
+    /// Objects that only runtime policy asked for (NSS modules and their own
+    /// dependencies) stay out of this set. They are in the image, but the
+    /// application never declared them.
     pub fn application_closure(&self) -> HashSet<NodeId> {
         assert!(self.contains(self.root));
 
         let mut reached = HashSet::from([self.root]);
         let mut queue = vec![self.root];
-        // A node enters the queue only on the visit that first reaches it, so
-        // the walk is bounded by the size of the graph and cannot spin.
+        // A node is queued only when it is first reached, so the walk is
+        // bounded by the size of the graph.
         let mut visits = 0usize;
         while let Some(id) = queue.pop() {
             visits += 1;

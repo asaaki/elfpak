@@ -3,14 +3,12 @@
 //! `goblin` types must not leak past this module: everything downstream works
 //! with [`ElfMetadata`], which is the only domain model of an ELF object.
 
+use crate::error::{Error, Result, io};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
-use crate::error::{Error, Result, io};
-
-/// Machine + ELF class + endianness, i.e. everything needed to decide whether
-/// two objects can be linked into the same process image.
+/// Machine, ELF class and endianness: everything that decides whether two
+/// objects can be linked into the same process image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Architecture {
     pub machine: Machine,
@@ -109,7 +107,7 @@ impl std::fmt::Display for Machine {
 
 impl Architecture {
     /// Whether a candidate shared object can satisfy a request from an object
-    /// of this architecture. Filename matches are never sufficient.
+    /// of this architecture.
     pub fn is_compatible_with(&self, other: &Architecture) -> bool {
         self == other
     }
@@ -187,7 +185,6 @@ impl ElfMetadata {
         bytes.len() >= ELF_MAGIC.len() && &bytes[..ELF_MAGIC.len()] == ELF_MAGIC
     }
 
-    /// The domain model of an ELF object. Every `goblin` type stops here.
     pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ElfMetadata> {
         if !Self::looks_like_elf(bytes) {
             return Err(Error::NotElf {
@@ -206,8 +203,6 @@ impl ElfMetadata {
         };
         let rpath: Vec<String> = elf.rpaths.iter().flat_map(|s| split_paths(s)).collect();
         let runpath: Vec<String> = elf.runpaths.iter().flat_map(|s| split_paths(s)).collect();
-        // Search path lists are consulted entry by entry, so an empty entry
-        // would silently mean "the current directory" further downstream.
         assert!(!rpath.iter().any(String::is_empty));
         assert!(!runpath.iter().any(String::is_empty));
 
@@ -236,8 +231,6 @@ impl ElfMetadata {
     }
 }
 
-/// Machine, class and endianness: what decides whether two objects can share a
-/// process image.
 fn architecture_of(elf: &goblin::elf::Elf<'_>) -> Architecture {
     Architecture {
         machine: Machine::from_e_machine(elf.header.e_machine),
@@ -264,9 +257,8 @@ fn object_type_of(e_type: u16) -> ObjectType {
     }
 }
 
-/// Undefined `dlopen`-family symbols, i.e. calls *out* of this object. A
-/// defined one would be the implementation, which says nothing about what the
-/// object loads at runtime.
+/// Undefined `dlopen`-family symbols, i.e. calls out of this object. A defined
+/// one is the implementation in libdl and says nothing about what gets loaded.
 fn dlopen_references(elf: &goblin::elf::Elf<'_>) -> Vec<String> {
     let mut found = Vec::new();
     for sym in elf.dynsyms.iter() {
@@ -286,9 +278,9 @@ fn dlopen_references(elf: &goblin::elf::Elf<'_>) -> Vec<String> {
 
 /// `DT_RPATH`/`DT_RUNPATH`/`LD_LIBRARY_PATH` are colon separated lists.
 ///
-/// Empty entries are dropped rather than kept: to the loader an empty entry
-/// means the current working directory, which a packaging tool must never
-/// search — the answer would depend on where `elfpak` was invoked from.
+/// Empty entries are dropped. To the loader an empty entry means the current
+/// working directory, which would make the result depend on where `elfpak` was
+/// invoked from.
 pub fn split_paths(value: &str) -> Vec<String> {
     let parts: Vec<String> = value
         .split(':')

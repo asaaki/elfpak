@@ -3,16 +3,17 @@
 //! Everything is compiled with `-nostdlib` so the dependency graph contains
 //! exactly the objects the fixture declares, with no libc noise.
 
-// This module is compiled into each integration test binary, so items that
-// one test uses look unreachable from another. That is the pattern, not a bug.
+// This module is compiled into each integration test binary, so items used by
+// one test look unreachable from another.
 #![allow(unreachable_pub)]
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use elfpak_core::ElfMetadata;
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// Directories the fixture DSOs live in.
 const LIB_DIRS: &[&str] = &[
@@ -146,9 +147,8 @@ impl Sysroot {
         std::os::unix::fs::symlink(target, path).unwrap();
     }
 
-    /// The whole fixture sysroot, in four phases: what can be linked against,
-    /// what links against it, what tells the loader where to look, and what is
-    /// there to be ignored.
+    /// The whole fixture sysroot: libraries, the executables that use them, the
+    /// loader configuration, and a few things that must never be picked up.
     fn populate(&self) {
         self.populate_libraries();
         self.populate_executables();
@@ -231,7 +231,7 @@ impl Sysroot {
 
     /// One executable per way of finding a library: the defaults, an inherited
     /// `DT_RPATH`, a non-inherited `DT_RUNPATH`, `$ORIGIN`, `ld.so.conf`, the
-    /// cache — and one whose dependency is simply not there.
+    /// cache, and one whose dependency is missing.
     fn populate_executables(&self) {
         let main = "int top_value(void);\nvoid _start(void) { top_value(); }\n";
         self.exe("/bin/app-default", main, &["/usr/lib/libtop.so.1"], &[]);
@@ -345,13 +345,11 @@ fn patch_needed(path: &Path, from: &str, to: &str) {
     std::fs::write(path, bytes).unwrap();
 }
 
-/// Minimal `glibc-ld.so.cache1.1` image.
-/// Offsets in the cache format are `u32`; a fixture that did not fit would be
-/// a broken fixture, not a truncated one.
 fn offset(value: usize) -> u32 {
     u32::try_from(value).expect("fixture offsets fit in u32")
 }
 
+/// Minimal `glibc-ld.so.cache1.1` image.
 pub fn ld_cache(entries: &[(&str, &str)]) -> Vec<u8> {
     const HEADER: usize = 48;
     const ENTRY: usize = 24;

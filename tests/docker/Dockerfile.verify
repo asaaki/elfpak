@@ -14,7 +14,7 @@
 # all", so the cases that only `--strict` catches are checked both ways.
 #
 # Build with `--build-arg ELFPAK_TAMPER=1` to corrupt the rootfs before it is
-# verified: that build must fail, which is what proves the gate is load-bearing.
+# verified; that build must fail.
 
 # Base images are pinned by tag *and* digest so a build is reproducible and the
 # toolchain never moves under us. Refresh a digest with:

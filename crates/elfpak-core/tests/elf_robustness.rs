@@ -5,9 +5,8 @@
 //! regression that makes the parser panic fails the build rather than waiting
 //! for someone to start a fuzzing session.
 
-use std::path::Path;
-
 use elfpak_core::ElfMetadata;
+use std::path::Path;
 
 /// Deterministic pseudo-random source, so a failure is always reproducible.
 struct Rng(u64);

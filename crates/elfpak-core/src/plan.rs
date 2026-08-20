@@ -3,18 +3,23 @@
 //! A [`BundlePlan`] is immutable once built and fully describes the output, so
 //! `inspect`, `--dry-run`, manifests and tests all share one code path.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use crate::elf::Architecture;
-use crate::error::{Error, Result, io};
-use crate::graph::{DependencyGraph, DependencyReason, Digest, Node, NodeId, NodeKind};
-use crate::hash::{DigestCache, sha256_bytes};
-use crate::paths::{ancestor_dirs, logical_parent, normalize_absolute};
-use crate::resolver::Resolver;
-use crate::resolver::cache::{self, CacheEntry};
-use crate::rootfs::policy::{DependencyPolicy, Preset, RuntimeFeature, RuntimePolicy};
-use crate::source::{EntryKind, SourceRoot};
+use crate::{
+    elf::Architecture,
+    error::{Error, Result, io},
+    graph::{DependencyGraph, DependencyReason, Digest, Node, NodeId, NodeKind},
+    hash::{DigestCache, sha256_bytes},
+    paths::{ancestor_dirs, logical_parent, normalize_absolute},
+    resolver::{
+        Resolver,
+        cache::{self, CacheEntry},
+    },
+    rootfs::policy::{DependencyPolicy, Preset, RuntimeFeature, RuntimePolicy},
+    source::{EntryKind, SourceRoot},
+};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 /// Where the loader looks for its cache, and therefore where a generated one
 /// has to go.
@@ -22,10 +27,9 @@ pub const LD_SO_CACHE: &str = "/etc/ld.so.cache";
 
 /// Upper bound on the entries in one plan.
 ///
-/// A minimal rootfs is tens of entries, and the timezone database — the largest
-/// thing any preset contributes — is a few thousand. A plan past this bound is
-/// an `--include` that named far more than it meant to, and the bound turns
-/// that into an error before it turns into a full disk.
+/// A minimal rootfs is tens of entries, and the timezone database, the largest
+/// thing any preset contributes, is a few thousand. A plan past this bound is an
+/// `--include` that named far more than it meant to.
 pub const PLAN_ENTRIES_MAX: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,8 +88,7 @@ pub struct PlannedFile {
 
 impl PlannedFile {
     /// Invariants every entry holds, checked when it enters a plan and again
-    /// before it is written. Two code paths, one property: a plan that could
-    /// not be materialized faithfully never gets as far as being materialized.
+    /// before it is written.
     pub fn assert_well_formed(&self) {
         assert!(self.destination.is_absolute());
         assert!(self.mode <= 0o7777);
@@ -206,8 +209,9 @@ impl Planner {
         self
     }
 
-    /// Two-phase packaging, phase one. All control flow of a plan lives here:
-    /// resolve, validate, then describe the output. Nothing is written.
+    /// Phase one: resolve, validate, then describe the output. Nothing is
+    /// written until [`crate::RootFsBuilder`] or [`crate::TarBuilder`] gets the
+    /// plan.
     pub fn plan(&self) -> Result<BundlePlan> {
         self.check_install_path()?;
 
@@ -306,12 +310,10 @@ impl Planner {
     /// Decide whether the bundle needs a generated `/etc/ld.so.cache`, and warn
     /// about what it cannot load when it does not get one.
     ///
-    /// Two things can leave a bundle unable to load a library it contains: a
-    /// library outside the directories the loader searches, and an executable
-    /// whose `$ORIGIN`-relative search paths no longer point where they did once
-    /// it is installed somewhere else. Both are cured by the one thing the
-    /// loader consults besides those directories — a cache — and a bundle can
-    /// only have one if `elfpak` writes it.
+    /// Two things leave a bundle unable to load a library it contains: a library
+    /// outside the directories the loader searches, and an executable whose
+    /// `$ORIGIN`-relative search paths point elsewhere once it is installed
+    /// somewhere else. A cache fixes both, and only `elfpak` can write it.
     fn plan_loader_cache(
         &self,
         graph: &DependencyGraph,
@@ -410,8 +412,7 @@ impl Planner {
     fn ld_so_cache(&self, graph: &DependencyGraph) -> Option<Vec<u8>> {
         if !uses_glibc_loader(graph) {
             // musl resolves libraries through /etc/ld-musl-<arch>.path and
-            // ignores ld.so.cache entirely. Writing one would look like a fix
-            // and change nothing, so the caller reports the problem instead.
+            // ignores ld.so.cache entirely, so the caller reports instead.
             return None;
         }
         let architecture = graph.root_node().architecture;
@@ -468,9 +469,8 @@ impl Planner {
     ///
     /// Only the application's own ELF closure is policed. The interpreter is
     /// exempt because it is not a `DT_NEEDED` dependency, and so is anything
-    /// runtime policy pulled in — the caller asked for those by name, and could
-    /// not predict the sonames of, say, the NSS modules a source root happens to
-    /// still ship.
+    /// runtime policy pulled in: the caller asked for those by name, and cannot
+    /// be expected to know the sonames of the NSS modules a source root ships.
     fn validate_dependencies(&self, graph: &DependencyGraph) -> Result<()> {
         if self.dependency_policy.allow.is_none() {
             // No allow-list means no contract to enforce.
@@ -503,8 +503,7 @@ impl Planner {
         Ok(())
     }
 
-    /// Everything runtime policy contributes, in one place. Each feature is a
-    /// branch here and a leaf below, so what a preset does stays readable.
+    /// Everything runtime policy contributes, in one place.
     fn apply_runtime_policy(
         &self,
         builder: &mut PlanBuilder<'_>,
@@ -838,10 +837,7 @@ impl<'a> PlanBuilder<'a> {
 
     fn push_symlink(&mut self, logical: &Path, target: &Path, reason: InclusionReason) {
         assert!(logical.is_absolute());
-        assert!(
-            !target.as_os_str().is_empty(),
-            "a link needs somewhere to point"
-        );
+        assert!(!target.as_os_str().is_empty());
 
         self.push_parents(logical, &reason);
         self.insert(PlannedFile {
@@ -875,7 +871,7 @@ impl<'a> PlanBuilder<'a> {
     /// An entry whose bytes this process produced rather than copied.
     fn push_generated(&mut self, path: &Path, content: Vec<u8>, reason: InclusionReason) {
         assert!(path.is_absolute());
-        assert!(!content.is_empty(), "an empty generated file says nothing");
+        assert!(!content.is_empty());
 
         self.push_parents(path, &reason);
         let digest = sha256_bytes(&content);
@@ -963,8 +959,8 @@ impl<'a> PlanBuilder<'a> {
         let mut stack = vec![(logical.to_path_buf(), host.to_path_buf())];
         while let Some((logical, host)) = stack.pop() {
             assert!(logical.is_absolute());
-            // The one place a plan can grow without an ELF object behind every
-            // entry, and therefore the one place that needs the bound.
+            // The only place a plan grows without an ELF object behind each
+            // entry, and so the only place that needs the bound.
             if self.entries.len() > PLAN_ENTRIES_MAX {
                 return Err(Error::Config {
                     message: format!(
@@ -1027,7 +1023,7 @@ fn uses_glibc_loader(graph: &DependencyGraph) -> bool {
 }
 
 /// Normalized permissions: executables and directories are `0755`, everything
-/// else `0644`. Deterministic output matters more than exotic source modes.
+/// else `0644`.
 fn mode_of(path: &Path) -> Result<u32> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1038,8 +1034,7 @@ fn mode_of(path: &Path) -> Result<u32> {
     } else {
         0o644
     };
-    // Never wider than what the source had, and never setuid/setgid: a bundle
-    // is not the place to discover a privilege bit came along for the ride.
+    // Never setuid or setgid: a privilege bit must not travel with the bundle.
     assert!(normalized & 0o7000 == 0);
     Ok(normalized)
 }
@@ -1047,8 +1042,10 @@ fn mode_of(path: &Path) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elf::{ElfClass, Endianness, Machine};
-    use crate::graph::Node;
+    use crate::{
+        elf::{ElfClass, Endianness, Machine},
+        graph::Node,
+    };
 
     fn graph_with_interpreter(interpreter: Option<&str>) -> DependencyGraph {
         let architecture = Architecture {
@@ -1104,7 +1101,6 @@ mod tests {
         );
     }
 
-    /// musl ignores `ld.so.cache`, so writing one would only look like a fix.
     #[test]
     fn a_musl_bundle_gets_no_cache() {
         let graph = graph_with_interpreter(Some("/lib/ld-musl-x86_64.so.1"));

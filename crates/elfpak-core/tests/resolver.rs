@@ -2,13 +2,12 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-
 use common::{Sysroot, have_cc};
 use elfpak_core::{
     CachePolicy, DependencyPolicy, Error, NodeKind, PlannedFileKind, Planner, Preset,
     RuntimePolicy, SourceRoot,
 };
+use std::path::{Path, PathBuf};
 
 /// The web preset without the CA bundle, which the fixture sysroot has no
 /// equivalent of.

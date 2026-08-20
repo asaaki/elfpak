@@ -1,7 +1,9 @@
 //! End-to-end CLI tests against the host filesystem.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
 
 fn elfpak(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_elfpak"))

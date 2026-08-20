@@ -80,10 +80,9 @@ pub enum Error {
 impl Error {
     /// Stable diagnostic code, rendered as `error[E1001]` by the CLI.
     ///
-    /// Codes are documented and matched on by scripts, so they are stable in
-    /// the way an API is stable: `E1xxx` reads an object, `E2xxx` resolves a
-    /// dependency, `E3xxx` touches a path, `E4xxx` is configuration, `E5xxx` is
-    /// verification.
+    /// Scripts match on these, so they do not change: `E1xxx` reads an object,
+    /// `E2xxx` resolves a dependency, `E3xxx` touches a path, `E4xxx` is
+    /// configuration, `E5xxx` is verification.
     pub fn code(&self) -> &'static str {
         let code = self.code_inner();
         assert_eq!(code.len(), 5);
@@ -111,8 +110,7 @@ impl Error {
         }
     }
 
-    /// Extra context printed underneath the headline message. Empty when the
-    /// message already says everything there is to say.
+    /// Extra context printed underneath the headline message, if there is any.
     pub fn details(&self) -> Vec<String> {
         match self {
             Error::UnresolvedLibrary {

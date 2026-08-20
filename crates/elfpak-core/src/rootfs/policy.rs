@@ -1,13 +1,11 @@
 //! Runtime policy: everything that ELF analysis cannot prove.
 //!
-//! Presets are pure configuration. They never add hidden behaviour: every file
-//! they contribute shows up in the bundle plan with a policy reason attached.
-
-use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
+//! Presets are configuration only. Every file they contribute shows up in the
+//! bundle plan with a policy reason attached.
 
 use crate::error::Error;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -128,8 +126,7 @@ impl std::fmt::Display for UserSpec {
 }
 
 impl UserSpec {
-    /// Name used when only numeric ids were given. The passwd entry needs a
-    /// name, and one that says what it is beats one that pretends to be real.
+    /// Name used when only numeric ids were given; a passwd entry needs one.
     const NAME_DEFAULT: &'static str = "app";
 
     /// Accepts `uid`, `uid:gid` and `name:uid:gid`.
@@ -256,7 +253,6 @@ impl RuntimePolicy {
                 user.name, user.uid, user.gid, user.name
             ));
         }
-        // Every line is a record; a file not ending in one would lose its last.
         assert!(out.ends_with('\n'));
         assert!(out.lines().count() >= 2);
         out.into_bytes()
@@ -288,17 +284,14 @@ impl RuntimePolicy {
         out.push_str("networks:   files\n");
         out.push_str("protocols:  files\n");
         out.push_str("services:   files\n");
-        assert!(
-            out.contains("hosts:"),
-            "a resolver without hosts resolves nothing"
-        );
+        assert!(out.contains("hosts:"));
         assert!(out.ends_with('\n'));
         out.into_bytes()
     }
 }
 
-// Compile-time sanity checks: a preset that could not find a CA bundle or an
-// NSS module would be a policy with nothing to apply.
+// A preset with no CA bundle candidates or no NSS modules to look for would be
+// a policy with nothing to apply.
 const _: () = assert!(!RuntimePolicy::CA_BUNDLE_CANDIDATES.is_empty());
 const _: () = assert!(!RuntimePolicy::NSS_MODULES.is_empty());
 const _: () = assert!(RuntimePolicy::UID_ROOT != RuntimePolicy::UID_NOBODY);

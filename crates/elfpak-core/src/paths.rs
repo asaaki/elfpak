@@ -36,8 +36,7 @@ pub fn join_under(base: &Path, logical: &Path) -> PathBuf {
         // unreachable; falling back to the base keeps the write inside it.
         Err(_) => base.to_path_buf(),
     };
-    // The whole point of this function: containment is a postcondition, not a
-    // hope. It is checked here, and again by the caller before it writes.
+    // Containment is checked here, and again by the caller before it writes.
     assert!(joined.starts_with(base));
     joined
 }
@@ -66,7 +65,7 @@ pub fn ancestor_dirs(path: &Path) -> Vec<PathBuf> {
             dirs.push(current.clone());
         }
     }
-    // Shallowest first is what lets a caller create directories in list order.
+    // Shallowest first, so a caller can create them in list order.
     if let Some(last) = dirs.last() {
         assert_eq!(last, &parent);
         assert!(dirs[0].parent() == Some(Path::new("/")));

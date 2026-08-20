@@ -1,16 +1,15 @@
 //! Machine-readable record of a bundle: what was included and why.
 
+use crate::{
+    error::{Error, Result, io},
+    hash::sha256_file,
+    plan::{BundlePlan, InclusionReason, PlannedFileKind},
+};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
-use crate::error::{Error, Result, io};
-use crate::hash::sha256_file;
-use crate::plan::{BundlePlan, InclusionReason, PlannedFileKind};
-
 pub const MANIFEST_VERSION: u32 = 2;
-/// Name of the manifest written beside a bundle. Most significant word first,
-/// qualifier last, so related constants sort and read together.
+/// Name of the manifest written beside a bundle.
 pub const MANIFEST_NAME_DEFAULT: &str = "elfpak-manifest.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,10 +179,7 @@ impl Manifest {
         }
         let mut json = self.to_json();
         json.push('\n');
-        assert!(
-            json.ends_with("}\n"),
-            "a manifest is one JSON object per file"
-        );
+        assert!(json.ends_with("}\n"));
         std::fs::write(path, json).map_err(|e| io(path, e))
     }
 
@@ -195,10 +191,9 @@ impl Manifest {
         })
     }
 
-    /// Check a materialized rootfs against this manifest.
-    ///
-    /// All control flow lives here: an entry is missing, or it is of the wrong
-    /// kind or contents, or — under `--strict` — its permissions changed.
+    /// Check a materialized rootfs against this manifest. An entry can be
+    /// missing, of the wrong kind or contents, or, under `--strict`, have
+    /// permissions that changed.
     pub fn verify(&self, rootfs: &Path, options: &VerifyOptions) -> VerifyReport {
         let mut report = VerifyReport::default();
         for file in &self.files {
@@ -265,8 +260,8 @@ impl Manifest {
                 let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
-                // A symlink is never descended into: it is an entry in its own
-                // right, and its target is checked where the target lives.
+                // Never descend into a symlink: it is an entry in its own right,
+                // and its target is checked where the target lives.
                 if metadata.is_dir() && !metadata.is_symlink() {
                     stack.push(path.clone());
                 }
@@ -338,8 +333,7 @@ fn verify_symlink(
     })
 }
 
-/// A regular file is verified by its digest, which is the whole point of
-/// recording one.
+/// A regular file is verified by its digest.
 fn verify_regular(
     file: &ManifestFile,
     target: &Path,
@@ -405,8 +399,7 @@ impl VerifyReport {
         self.problems.is_empty()
     }
 
-    /// Problems found, saturating: a report with four billion problems has
-    /// already made its point.
+    /// Problems found, saturated at `u32::MAX`.
     pub fn failure_count(&self) -> u32 {
         u32::try_from(self.problems.len()).unwrap_or(u32::MAX)
     }
