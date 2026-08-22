@@ -4,6 +4,7 @@
 //! `inspect`, `--dry-run`, manifests and tests all share one code path.
 
 use crate::{
+    diagnostics::warning as code,
     elf::Architecture,
     error::{Error, Result, io},
     graph::{DependencyGraph, DependencyReason, Digest, Node, NodeId, NodeKind},
@@ -28,8 +29,12 @@ pub const LD_SO_CACHE: &str = "/etc/ld.so.cache";
 /// Upper bound on the entries in one plan.
 ///
 /// A minimal rootfs is tens of entries, and the timezone database, the largest
-/// thing any preset contributes, is a few thousand. A plan past this bound is an
-/// `--include` that named far more than it meant to.
+/// thing any preset contributes, is a few thousand. The bound sits far above
+/// both, because an `--include` of a real application tree is legitimate; what
+/// it stops is an `--include` that walked into a filesystem it did not mean to,
+/// before the walk turns into memory growth. Each entry holds its destination,
+/// its source and a digest, so a plan at the bound already costs hundreds of
+/// megabytes.
 pub const PLAN_ENTRIES_MAX: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -397,7 +402,7 @@ impl Planner {
 
         if !dlopen_libraries.is_empty() {
             warnings.push(Warning {
-                code: "E1004",
+                code: code::DLOPEN,
                 message: format!(
                     "{} bundled shared object(s) reference dlopen()",
                     dlopen_libraries.len()
@@ -547,7 +552,7 @@ impl Planner {
 
         if policy.user.is_some() && !policy.passwd_group {
             warnings.push(Warning {
-                code: "E1006",
+                code: code::USER_WITHOUT_PASSWD_GROUP,
                 message: "--user was given without passwd/group files".to_string(),
                 details: vec![
                     "Add --passwd-group (or --preset web) if the application resolves its own uid."
@@ -735,7 +740,7 @@ fn warn_unreachable(libraries: Vec<String>, glibc: bool) -> Warning {
             .to_string()
     };
     Warning {
-        code: "E2005",
+        code: code::LIBRARY_UNREACHABLE,
         message: match libraries.len() {
             1 => "a library lives outside the directories the loader searches".to_string(),
             n => format!("{n} libraries live outside the directories the loader searches"),
@@ -756,7 +761,7 @@ fn warn_relocated(paths: Vec<String>, graph: &DependencyGraph) -> Warning {
         graph.root_node().logical.display()
     );
     Warning {
-        code: "E2006",
+        code: code::EXECUTABLE_RELOCATED,
         message: format!(
             "the executable declares $ORIGIN-relative search paths and moves from {} to {}",
             source_dir.display(),
@@ -770,7 +775,7 @@ fn warn_dlopen_executable(node: &Node) -> Warning {
     assert!(!node.dlopen_references.is_empty());
 
     Warning {
-        code: "E1004",
+        code: code::DLOPEN,
         message: format!("{} references dlopen()", node.destination.display()),
         details: vec![
             "Runtime-loaded libraries cannot be determined using static ELF dependency analysis."
@@ -798,8 +803,15 @@ impl<'a> PlanBuilder<'a> {
         }
     }
 
-    /// Directories never displace real content; anything else wins over a
-    /// previously planned directory placeholder.
+    /// Add an entry, settling a destination that two of them want.
+    ///
+    /// Directories never displace real content, and real content always
+    /// displaces a directory that was only scaffolding. Between two entries
+    /// that both carry content the first one planned wins, and the phases run
+    /// in the order their paths are fixed: the ELF closure, whose objects must
+    /// sit where the loader will look, then runtime policy, then `--include`.
+    /// A generated `/etc/passwd` therefore keeps its place against an
+    /// `--include` of the source root's `/etc`.
     fn insert(&mut self, file: PlannedFile) {
         file.assert_well_formed();
 

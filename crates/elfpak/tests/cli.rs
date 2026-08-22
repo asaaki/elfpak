@@ -149,6 +149,37 @@ fn dependency_policy_failures_are_reported_with_a_code() {
     assert!(text.contains("--allow-library"), "{text}");
 }
 
+/// A warning and an error must never share a code, or matching on one is
+/// meaningless. `E1006` was once both `SourceChanged` and this warning.
+#[test]
+fn warnings_are_reported_with_a_code_no_error_uses() {
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+
+    let output = elfpak(&[
+        "bundle",
+        binary.to_str().unwrap(),
+        "-o",
+        tmp.path().join("rootfs").to_str().unwrap(),
+        "--user",
+        "65532:65532",
+        "--passwd-group=false",
+        "--no-config",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let text = stdout(&output);
+    assert!(text.contains("warning[E4003]"), "{text}");
+    assert!(
+        text.contains("--user was given without passwd/group"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("E1006"),
+        "E1006 belongs to the source-changed error: {text}"
+    );
+}
+
 #[test]
 fn config_file_supplies_defaults_and_cli_overrides_them() {
     let Some(binary) = subject() else { return };

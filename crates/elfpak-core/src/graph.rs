@@ -33,13 +33,14 @@ pub struct Digest(pub String);
 pub const DIGEST_LEN_HEX: usize = 64;
 
 impl Digest {
-    /// Whether this is a well-formed SHA-256 digest.
+    /// Whether this is a well-formed SHA-256 digest: 64 lowercase hex digits,
+    /// which is exactly what [`crate::paths::hex`] produces.
     pub fn is_well_formed(&self) -> bool {
         self.0.len() == DIGEST_LEN_HEX
             && self
                 .0
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 }
 
@@ -94,6 +95,7 @@ pub struct Edge {
 pub struct DependencyGraph {
     pub root: NodeId,
     pub nodes: Vec<Node>,
+    /// Every edge, in insertion order.
     pub edges: Vec<Edge>,
     /// `PT_INTERP` exactly as declared by the executable, before symlinks are
     /// followed. This is the path the kernel will use at runtime.
@@ -103,6 +105,12 @@ pub struct DependencyGraph {
     /// somewhere other than where it was built.
     pub executable_search_paths: Vec<String>,
     by_logical: HashMap<PathBuf, NodeId>,
+    /// Indices into `edges` leaving each node, in insertion order. Without it
+    /// every lookup scans the whole edge list, and the planner asks one
+    /// question per node; that is quadratic in a graph the limits above allow.
+    outgoing: HashMap<NodeId, Vec<usize>>,
+    /// Index into `edges` of the first edge that reaches each node.
+    first_incoming: HashMap<NodeId, usize>,
 }
 
 impl DependencyGraph {
@@ -162,9 +170,8 @@ impl DependencyGraph {
         }
 
         let known = self
-            .edges
-            .iter()
-            .any(|e| e.from == from && e.to == to && e.reason == reason);
+            .edges_from(from)
+            .any(|e| e.to == to && e.reason == reason);
         if known {
             return Ok(());
         }
@@ -174,7 +181,11 @@ impl DependencyGraph {
                 limit: EDGES_MAX,
             });
         }
+        let index = self.edges.len();
         self.edges.push(Edge { from, to, reason });
+        self.outgoing.entry(from).or_default().push(index);
+        // Only the first dependent is recorded; later ones never displace it.
+        self.first_incoming.entry(to).or_insert(index);
         Ok(())
     }
 
@@ -193,23 +204,27 @@ impl DependencyGraph {
         root
     }
 
+    /// Edges leaving a node, in insertion order.
+    pub fn edges_from(&self, id: NodeId) -> impl Iterator<Item = &Edge> {
+        self.outgoing
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|&index| &self.edges[index])
+    }
+
     /// Direct dependencies of a node, in insertion order.
     pub fn dependencies(&self, id: NodeId) -> Vec<(&Edge, &Node)> {
         assert!(self.contains(id));
-        self.edges
-            .iter()
-            .filter(|e| e.from == id)
-            .map(|e| (e, self.node(e.to)))
-            .collect()
+        self.edges_from(id).map(|e| (e, self.node(e.to))).collect()
     }
 
     /// First object that pulled in `id`, used for diagnostics and manifests.
     pub fn first_dependent(&self, id: NodeId) -> Option<(&Edge, &Node)> {
         assert!(self.contains(id));
-        self.edges
-            .iter()
-            .find(|e| e.to == id)
-            .map(|e| (e, self.node(e.from)))
+        let edge = &self.edges[*self.first_incoming.get(&id)?];
+        Some((edge, self.node(edge.from)))
     }
 
     /// Nodes paired with their ids, in insertion order. The only way to obtain
@@ -244,7 +259,7 @@ impl DependencyGraph {
         // A node is queued only when it is first reached, so the walk is
         // bounded by the size of the graph.
         while let Some(id) = queue.pop() {
-            for edge in self.edges.iter().filter(|e| e.from == id) {
+            for edge in self.edges_from(id) {
                 if matches!(edge.reason, DependencyReason::RuntimePolicy { .. }) {
                     continue;
                 }
@@ -304,6 +319,63 @@ mod tests {
             }
         ));
         assert_eq!(error.code(), "E1005");
+    }
+
+    #[test]
+    fn a_digest_is_sixty_four_lowercase_hex_digits() {
+        assert!(sha256_bytes(b"test").is_well_formed());
+        // `z` is a lowercase letter but not a hex digit.
+        assert!(!Digest("z".repeat(DIGEST_LEN_HEX)).is_well_formed());
+        assert!(!Digest("A".repeat(DIGEST_LEN_HEX)).is_well_formed());
+        assert!(!Digest("ab".to_string()).is_well_formed());
+    }
+
+    /// `edges` stays the record of what happened; the indices are only a way
+    /// to reach it without scanning, so both have to give the same answer.
+    #[test]
+    fn the_edge_indices_agree_with_the_edge_list() {
+        let mut graph = DependencyGraph::new();
+        let ids: Vec<NodeId> = (0..4)
+            .map(|index| {
+                graph
+                    .insert(node(PathBuf::from(format!("/lib/lib{index}.so"))))
+                    .unwrap()
+            })
+            .collect();
+
+        let needed = |name: &str| DependencyReason::Needed {
+            soname: name.to_string(),
+        };
+        graph.connect(ids[0], ids[1], needed("one")).unwrap();
+        graph.connect(ids[0], ids[2], needed("two")).unwrap();
+        graph.connect(ids[3], ids[1], needed("one")).unwrap();
+        // Same edge twice, and the same pair under a second reason.
+        graph.connect(ids[0], ids[1], needed("one")).unwrap();
+        graph
+            .connect(ids[0], ids[1], DependencyReason::Interpreter)
+            .unwrap();
+        assert_eq!(graph.edges.len(), 4, "only the repeat was dropped");
+
+        for (id, _) in graph.iter() {
+            let indexed: Vec<NodeId> = graph.edges_from(id).map(|e| e.to).collect();
+            let scanned: Vec<NodeId> = graph
+                .edges
+                .iter()
+                .filter(|e| e.from == id)
+                .map(|e| e.to)
+                .collect();
+            assert_eq!(indexed, scanned, "outgoing edges of {id}");
+
+            let indexed = graph
+                .first_dependent(id)
+                .map(|(_, parent)| parent.logical.clone());
+            let scanned = graph
+                .edges
+                .iter()
+                .find(|e| e.to == id)
+                .map(|e| graph.node(e.from).logical.clone());
+            assert_eq!(indexed, scanned, "first dependent of {id}");
+        }
     }
 
     #[test]

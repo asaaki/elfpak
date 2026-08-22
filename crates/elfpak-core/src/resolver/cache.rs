@@ -37,6 +37,8 @@ const CACHE_ENTRIES_MAX: usize = 65_536;
 pub struct LdCache {
     /// soname -> candidate absolute paths, in cache order.
     entries: HashMap<String, Vec<PathBuf>>,
+    /// Candidates kept, i.e. the total length of the lists above. Relative and
+    /// duplicate entries are dropped on the way in and are not counted.
     len: usize,
 }
 
@@ -66,7 +68,6 @@ impl LdCache {
             Vec::new()
         };
 
-        cache.len = pairs.len();
         for (soname, path) in pairs {
             // ldconfig only records absolute paths. A relative one would be
             // resolved against this process's working directory downstream.
@@ -76,6 +77,7 @@ impl LdCache {
             let list = cache.entries.entry(soname).or_default();
             if !list.contains(&path) {
                 list.push(path);
+                cache.len += 1;
             }
         }
         cache
@@ -95,6 +97,7 @@ impl LdCache {
         self.entries.get(soname).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Candidates the cache holds, counting a soname once per distinct path.
     pub fn entry_count(&self) -> usize {
         self.len
     }
@@ -108,8 +111,13 @@ fn align8(value: usize) -> usize {
     value.saturating_add(7) & !7
 }
 
+/// `offset` comes out of the file by way of [`align8`], so the addition is
+/// checked rather than assumed to fit.
 fn starts_with(bytes: &[u8], offset: usize, magic: &[u8]) -> bool {
-    bytes.len() >= offset + magic.len() && &bytes[offset..offset + magic.len()] == magic
+    let Some(end) = offset.checked_add(magic.len()) else {
+        return false;
+    };
+    bytes.get(offset..end) == Some(magic)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -596,6 +604,24 @@ mod tests {
         assert!(build(&big_endian, &[entry("libc.so.6", "/lib/libc.so.6")]).is_none());
         // An empty cache is still a valid cache.
         assert!(build(&x86_64(), &[]).is_some());
+    }
+
+    #[test]
+    fn dropped_entries_are_not_counted() {
+        // A relative path is not something ldconfig writes, and resolving one
+        // would depend on this process's working directory, so it is dropped.
+        let bytes = new_format(&[
+            ("libc.so.6", "/lib/libc.so.6"),
+            ("librel.so.1", "relative/librel.so.1"),
+            ("libc.so.6", "/lib/libc.so.6"),
+        ]);
+        let cache = LdCache::parse(&bytes);
+        assert!(cache.lookup("librel.so.1").is_empty());
+        assert_eq!(
+            cache.entry_count(),
+            1,
+            "only what the cache kept is counted"
+        );
     }
 
     #[test]

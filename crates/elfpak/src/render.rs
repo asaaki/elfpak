@@ -149,12 +149,7 @@ fn inspect_dependencies(out: &mut dyn Write, graph: &DependencyGraph) -> std::io
 
 /// Everything else in the closure, with the object that pulled it in.
 fn inspect_transitive(out: &mut dyn Write, graph: &DependencyGraph) -> std::io::Result<()> {
-    let direct: Vec<_> = graph
-        .edges
-        .iter()
-        .filter(|e| e.from == graph.root)
-        .map(|e| e.to)
-        .collect();
+    let direct: Vec<_> = graph.edges_from(graph.root).map(|e| e.to).collect();
     let transitive: Vec<_> = graph
         .iter()
         .filter(|(id, node)| {

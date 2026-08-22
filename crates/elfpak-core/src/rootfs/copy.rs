@@ -211,11 +211,12 @@ fn remove_existing(path: &Path) -> Result<()> {
 fn has_symlinked_ancestor(output: &Path, path: &Path) -> bool {
     // Every step drops one component, so the walk is bounded by the depth of
     // the path it starts from.
+    let depth = path.components().count();
     let mut steps = 0usize;
     let mut current = path;
     while current != output {
         steps += 1;
-        assert!(steps <= path.components().count());
+        assert!(steps <= depth);
 
         match std::fs::symlink_metadata(current) {
             Ok(metadata) if metadata.is_symlink() => return true,

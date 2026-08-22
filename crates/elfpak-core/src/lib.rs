@@ -1,6 +1,7 @@
 //! ELF analysis, dependency resolution, bundle planning, and rootfs output.
 
 pub mod config;
+pub mod diagnostics;
 pub mod elf;
 pub mod error;
 pub mod graph;

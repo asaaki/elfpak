@@ -97,27 +97,27 @@ pub enum Error {
 impl Error {
     /// Stable diagnostic code, rendered as `error[E1001]` by the CLI.
     ///
-    /// Scripts match on these, so they do not change: `E1xxx` reads an object,
-    /// `E2xxx` resolves a dependency, `E3xxx` touches a path, `E4xxx` is
-    /// configuration, `E5xxx` is verification.
+    /// The codes live in [`crate::diagnostics`], next to the warning codes, so
+    /// that the whole namespace is visible in one place and checked there.
     pub fn code(&self) -> &'static str {
+        use crate::diagnostics::error as code;
         match self {
-            Error::Io { .. } => "E1000",
-            Error::Elf { .. } => "E1001",
-            Error::NotElf { .. } => "E1002",
-            Error::UnsupportedArchitecture { .. } => "E1003",
-            Error::LimitExceeded { .. } => "E1005",
-            Error::SourceChanged { .. } => "E1006",
-            Error::UnresolvedLibrary { .. } => "E2001",
-            Error::DisallowedLibrary { .. } => "E2002",
-            Error::IncompatibleArchitecture { .. } => "E2003",
-            Error::MissingRuntimeFile { .. } => "E2004",
-            Error::PathEscape { .. } => "E3001",
-            Error::MissingSourcePath { .. } => "E3002",
-            Error::SymlinkLoop { .. } => "E3003",
-            Error::Config { .. } => "E4001",
-            Error::Manifest { .. } => "E4002",
-            Error::VerifyFailed { .. } => "E5001",
+            Error::Io { .. } => code::IO,
+            Error::Elf { .. } => code::ELF,
+            Error::NotElf { .. } => code::NOT_ELF,
+            Error::UnsupportedArchitecture { .. } => code::UNSUPPORTED_ARCHITECTURE,
+            Error::LimitExceeded { .. } => code::LIMIT_EXCEEDED,
+            Error::SourceChanged { .. } => code::SOURCE_CHANGED,
+            Error::UnresolvedLibrary { .. } => code::UNRESOLVED_LIBRARY,
+            Error::DisallowedLibrary { .. } => code::DISALLOWED_LIBRARY,
+            Error::IncompatibleArchitecture { .. } => code::INCOMPATIBLE_ARCHITECTURE,
+            Error::MissingRuntimeFile { .. } => code::MISSING_RUNTIME_FILE,
+            Error::PathEscape { .. } => code::PATH_ESCAPE,
+            Error::MissingSourcePath { .. } => code::MISSING_SOURCE_PATH,
+            Error::SymlinkLoop { .. } => code::SYMLINK_LOOP,
+            Error::Config { .. } => code::CONFIG,
+            Error::Manifest { .. } => code::MANIFEST,
+            Error::VerifyFailed { .. } => code::VERIFY_FAILED,
         }
     }
 

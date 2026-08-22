@@ -158,6 +158,21 @@ opt-in rather than a requirement.
 `--user` only records an identity in `passwd`/`group`. The container runtime
 still decides who the process runs as (`USER 65532:65532` in the Dockerfile).
 
+### When two features want the same path
+
+Every entry is planned before anything is written, so a destination two features
+both claim is settled once, in the plan. Directory scaffolding never displaces
+real content, and content always replaces scaffolding. Between two entries that
+both carry content, the phases decide, in order of how little choice there was
+about the path: the ELF closure first, whose objects must sit exactly where the
+loader will look for them, then runtime policy, then `--include`. A generated
+`/etc/passwd` therefore keeps its place against an `--include` of the source
+root's `/etc`, and `elfpak bundle -v` lists the winner with its reason.
+
+The one case that is an error rather than a precedence is `--install` landing on
+a library the closure needs at that exact path: the bundle would be left unable
+to load it, so `E4001` reports the collision instead.
+
 ## Configuration file
 
 `elfpak.toml` is optional and is picked up from the working directory. CLI
@@ -336,6 +351,41 @@ A musl program never gets one, whatever the flag says: musl reads
 `/etc/ld-musl-<arch>.path` and ignores `ld.so.cache` entirely, so a cache would
 look like a fix and change nothing. Such a bundle is reported instead.
 
+## Diagnostics
+
+Every message `elfpak` prints carries a stable code: `error[E2001]` when the run
+failed and nothing was written, `warning[E2005]` when it succeeded but found
+something worth saying. Scripts match on these, so they do not change, and no
+code ever means two things — errors and warnings share one namespace, declared
+and checked together in `crates/elfpak-core/src/diagnostics.rs`.
+
+The family says what a code is about: `E1xxx` reads an object, `E2xxx` resolves
+a dependency, `E3xxx` touches a path, `E4xxx` is configuration, `E5xxx` is
+verification.
+
+### Errors
+
+An error ends the run with a non-zero exit status.
+
+| Code    | Meaning |
+|---------|---------|
+| `E1000` | An I/O operation on a named path failed. |
+| `E1001` | A file starts with the ELF magic but does not parse. |
+| `E1002` | The input is not an ELF object at all. |
+| `E1003` | The target architecture is not one `elfpak` supports. |
+| `E1005` | A bounded resource — closure size, graph size, search path — was exceeded. |
+| `E1006` | A source file changed between planning and writing. |
+| `E2001` | A `DT_NEEDED` library could not be resolved; the directories searched are listed. |
+| `E2002` | A library is not on the `--allow-library` list. |
+| `E2003` | A candidate was found but targets the wrong architecture. |
+| `E2004` | A runtime policy feature found nothing to include (no CA bundle, no tzdata). |
+| `E3001` | A path would escape the source or output root. |
+| `E3002` | An `--include` names something the source root does not have. |
+| `E3003` | Too many symlink hops while resolving a path. |
+| `E4001` | Invalid configuration: a bad flag value, a missing output, a colliding install path. |
+| `E4002` | A manifest could not be read or does not parse. |
+| `E5001` | `elfpak verify` found at least one problem. |
+
 ### Warnings
 
 A warning never fails a build. It reports something static analysis found that
@@ -344,9 +394,9 @@ the bundle cannot express, and it is recorded in the manifest.
 | Code    | Meaning |
 |---------|---------|
 | `E1004` | An object references `dlopen`, so its runtime closure is not fully knowable. |
-| `E1006` | `--user` was given without `passwd`/`group` files. |
 | `E2005` | A library was found somewhere the loader will not look inside the bundle. |
 | `E2006` | `--install` moves an executable that declares `$ORIGIN`-relative search paths. |
+| `E4003` | `--user` was given without `passwd`/`group` files. |
 
 `E2005` and `E2006` describe the two ways a bundle can end up unable to load a
 library it contains: one where the library is in a directory the loader does not
@@ -406,17 +456,27 @@ written — a leftover symlink is never followed out of the output root.
 crates/elfpak/        CLI: argument parsing, config loading, rendering
 crates/elfpak-core/   library: elf, graph, resolver, plan, rootfs, manifest
 fixtures/axum-server/ integration fixture: a real Axum service
+fixtures/musl-hello/  integration fixture: a musl-linked program
 fixtures/vendor-lib/  integration fixture: a library outside the loader's path
+fuzz/                 cargo-fuzz targets for the parsing boundary
 tests/docker/         Docker smoke tests, one Dockerfile per scenario
 Dockerfile            static elfpak distribution image (FROM scratch)
 ```
 
 `elfpak-core` holds the reusable implementation; no resolution logic lives in
 the CLI crate. `crates/elfpak` is itself a library with a six-line `main.rs`
-around it: `lib.rs` dispatches, one module per subcommand does the work. Base images are pinned by tag and digest, and no build step
-installs packages from a distribution mirror, so a digest really does describe
-what was built. Every image the tests build is produced for all architectures
-under test in one buildx invocation.
+around it: `lib.rs` dispatches, one module per subcommand does the work.
+
+Inside `elfpak-core` the dependencies run one way: `elf` and `source` read the
+world, `resolver` turns a soname into a file, `graph` records what was found and
+why, `plan` turns that into a `BundlePlan`, and `rootfs` writes one. `plan` is
+the only module that decides anything, and nothing downstream of it re-resolves.
+`diagnostics` sits beside them all and owns every code the CLI prints.
+
+Base images are pinned by tag and digest, and no build step installs packages
+from a distribution mirror, so a digest really does describe what was built.
+Every image the tests build is produced for all architectures under test in one
+buildx invocation.
 
 ## Building the elfpak image
 
