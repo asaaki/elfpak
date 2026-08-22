@@ -557,13 +557,16 @@ local build work that Cargo requires; after Cargo reports the executable, the
 same standalone planning and output guarantees apply.
 
 Each directory, tar, and manifest artifact is assembled in a sibling temporary
-path and published only after that artifact is complete. If an individual
-artifact write fails, its previous version remains untouched and no partial
-replacement is exposed. When requesting more than one output, artifacts are
-published sequentially; a later failure can therefore leave already-published
-earlier artifacts new. Re-run the command after correcting the failure rather
-than treating a mixed set as a verified release. With `--clean`, the previous
-rootfs is likewise kept until its replacement is ready.
+path and published only after that artifact is complete. Existing directories
+are exchanged atomically when the filesystem supports it. Filesystems without
+atomic exchange, including WSL's Windows mounts, use a rollback-capable rename
+sequence that briefly removes the visible directory name. If an individual
+artifact write fails, no partial replacement is exposed. When requesting more
+than one output, artifacts are published sequentially; a later failure can
+therefore leave already-published earlier artifacts new. Re-run the command
+after correcting the failure rather than treating a mixed set as a verified
+release. With `--clean`, the previous rootfs is likewise kept until its
+replacement is ready.
 
 ```mermaid
 sequenceDiagram
@@ -587,7 +590,7 @@ sequenceDiagram
         CLI->>Manifest: write in sibling stage
         CLI->>Manifest: publish completed manifest
     end
-    Note over Rootfs,Manifest: Each artifact is atomic, but the set is published sequentially
+    Note over Rootfs,Manifest: Each artifact is staged completely; the set is published sequentially
 ```
 
 Output is deterministic for the same application binaries, source root,

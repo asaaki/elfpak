@@ -239,9 +239,9 @@ fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replace the visible output only after the complete staged tree exists. An
-/// An existing output is atomically exchanged with the staged tree; publishing
-/// a previously absent output is one atomic rename.
+/// Replace the visible output only after the complete staged tree exists.
+/// Existing outputs are atomically exchanged when the filesystem supports it;
+/// otherwise a rollback-capable sequence publishes the staged tree.
 fn publish_directory(stage: tempfile::TempDir, output: &Path) -> Result<()> {
     // Linux can exchange two sibling paths in one rename operation. This
     // retains a continuously visible output for readers, unlike moving the
@@ -263,16 +263,31 @@ fn publish_directory(stage: tempfile::TempDir, output: &Path) -> Result<()> {
 fn publish_by_exchange(stage: tempfile::TempDir, output: &Path) -> Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
 
-    renameat_with(CWD, stage.path(), CWD, output, RenameFlags::EXCHANGE)
-        .map_err(|e| io(output, e.into()))?;
+    let exchange = renameat_with(CWD, stage.path(), CWD, output, RenameFlags::EXCHANGE);
+    finish_exchange(stage, output, exchange)
+}
+
+fn finish_exchange(
+    stage: tempfile::TempDir,
+    output: &Path,
+    exchange: std::result::Result<(), rustix::io::Errno>,
+) -> Result<()> {
+    if let Err(error) = exchange {
+        if matches!(
+            error,
+            rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP
+        ) {
+            return publish_directory_legacy(stage, output);
+        }
+        return Err(io(output, error.into()));
+    }
+
     let old_path = stage.path().to_path_buf();
     stage.close().map_err(|e| io(&old_path, e))
 }
 
-/// Legacy publication path retained only for platforms/filesystems where
-/// `renameat2(RENAME_EXCHANGE)` is unavailable. This is never selected on
-/// supported Linux builds: returning an error is safer than exposing a gap.
-#[allow(dead_code)]
+/// Portable publication path for filesystems where
+/// `renameat2(RENAME_EXCHANGE)` is unavailable, such as WSL's Windows mounts.
 fn publish_directory_legacy(stage: tempfile::TempDir, output: &Path) -> Result<()> {
     let backup = if path_exists(output) {
         let reservation = tempfile::Builder::new()
@@ -490,7 +505,8 @@ fn pin_times(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_directory, guard_clean, guard_output, has_symlinked_ancestor, remove_existing,
+        ensure_directory, finish_exchange, guard_clean, guard_output, has_symlinked_ancestor,
+        remove_existing,
     };
     use std::path::Path;
 
@@ -552,5 +568,43 @@ mod tests {
         std::os::unix::fs::symlink(&target, &output).unwrap();
 
         assert!(ensure_directory(&output).is_err());
+    }
+
+    #[test]
+    fn unsupported_atomic_exchange_falls_back_to_portable_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("old"), b"old").unwrap();
+
+        let stage = tempfile::Builder::new()
+            .prefix(".elfpak-rootfs-")
+            .tempdir_in(temp.path())
+            .unwrap();
+        std::fs::write(stage.path().join("new"), b"new").unwrap();
+
+        finish_exchange(stage, &output, Err(rustix::io::Errno::INVAL)).unwrap();
+
+        assert_eq!(std::fs::read(output.join("new")).unwrap(), b"new");
+        assert!(!output.join("old").exists());
+    }
+
+    #[test]
+    fn unrelated_exchange_errors_leave_the_existing_output_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("old"), b"old").unwrap();
+
+        let stage = tempfile::Builder::new()
+            .prefix(".elfpak-rootfs-")
+            .tempdir_in(temp.path())
+            .unwrap();
+        std::fs::write(stage.path().join("new"), b"new").unwrap();
+
+        assert!(finish_exchange(stage, &output, Err(rustix::io::Errno::PERM)).is_err());
+
+        assert_eq!(std::fs::read(output.join("old")).unwrap(), b"old");
+        assert!(!output.join("new").exists());
     }
 }
