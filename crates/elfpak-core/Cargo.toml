@@ -7,11 +7,8 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 description = "Core library for elfpak: ELF analysis, loader-faithful resolution, and rootfs planning"
-
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.{ archive-format }"
-bin-dir = "{ bin }{ binary-ext }"
-pkg-fmt = "tgz"
+categories = ["development-tools", "filesystem", "parser-implementations", "virtualization"]
+keywords = ["elf", "linux", "glibc", "dynamic-linker", "rootfs"]
 
 [lints]
 workspace = true

@@ -26,9 +26,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# elfpak has no C dependencies, so rust-lld links every supported target and no
-# cross toolchain is needed. `+crt-static` keeps the result a single file with
-# no runtime dependencies of its own.
+# The two command-line tools have no C dependencies, so rust-lld links every
+# supported target and no cross toolchain is needed. `+crt-static` keeps each
+# result a single file with no runtime dependencies of its own.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=elfpak-target-${TARGETARCH},sharing=locked <<'SHELL'
 set -eu
@@ -39,9 +39,18 @@ case "${TARGETARCH}" in
 esac
 rustup target add "$target"
 RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static" \
-    cargo build --release --locked --bin elfpak --target "$target"
+    cargo build --release --locked --bin elfpak --bin cargo-elfpak --target "$target"
 cp "target/$target/release/elfpak" /elfpak
+cp "target/$target/release/cargo-elfpak" /cargo-elfpak
 SHELL
+
+# The release workflow exports this stage as a directory and publishes both
+# binaries as target-specific GitHub release assets. Keep it separate from the
+# final distribution image, whose contract remains one standalone elfpak tool.
+FROM scratch AS release-binaries
+
+COPY --from=build /elfpak /elfpak
+COPY --from=build /cargo-elfpak /cargo-elfpak
 
 FROM scratch
 
