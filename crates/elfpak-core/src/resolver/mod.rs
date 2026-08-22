@@ -26,9 +26,10 @@ pub struct LibraryRequest {
     pub soname: String,
     /// Logical path of the object that needs the library.
     pub requester: PathBuf,
-    /// `DT_RPATH` lists of the requester and its loaders, nearest first.
-    /// Entries whose object declared `DT_RUNPATH` are already filtered out.
-    pub rpath_chain: Vec<Vec<String>>,
+    /// Expanded `DT_RPATH` lists of the requester and its loaders, nearest
+    /// first. Entries are expanded when their owning object is visited: an
+    /// inherited `$ORIGIN` refers to that owner, not the current requester.
+    pub rpath_chain: Vec<Vec<PathBuf>>,
     /// `DT_RUNPATH` of the requester (never inherited).
     pub runpath: Vec<String>,
     pub nodeflib: bool,
@@ -283,7 +284,7 @@ impl Resolver {
         graph: &mut DependencyGraph,
         start: NodeId,
         metadata: ElfMetadata,
-        inherited: Vec<Vec<String>>,
+        inherited: Vec<Vec<PathBuf>>,
     ) -> Result<()> {
         assert!(graph.contains(start));
 
@@ -294,13 +295,18 @@ impl Resolver {
         while let Some((id, meta, inherited)) = queue.pop() {
             assert_eq!(meta.architecture, architecture);
 
-            let mut chain = Vec::new();
+            let requester = graph.node(id).logical.clone();
+            let mut chain: Vec<Vec<PathBuf>> = Vec::new();
             if !meta.runpath_is_authoritative() && !meta.rpath.is_empty() {
-                chain.push(meta.rpath.clone());
+                let ctx = self.token_context(&requester, &architecture);
+                chain.push(
+                    meta.rpath
+                        .iter()
+                        .map(|entry| tokens::expand_search_path(entry, &ctx))
+                        .collect(),
+                );
             }
             chain.extend(inherited);
-
-            let requester = graph.node(id).logical.clone();
             for soname in &meta.needed {
                 let request = LibraryRequest {
                     soname: soname.clone(),
@@ -441,9 +447,8 @@ impl Resolver {
 
         // 1. DT_RPATH of the object and, transitively, of its loaders.
         for level in &request.rpath_chain {
-            for entry in level {
-                let dir = tokens::expand_search_path(entry, &ctx);
-                push_directory(&mut dirs, dir, SearchOrigin::ObjectPath)?;
+            for dir in level {
+                push_directory(&mut dirs, dir.clone(), SearchOrigin::ObjectPath)?;
             }
         }
         // 2. LD_LIBRARY_PATH equivalent.
@@ -479,12 +484,13 @@ impl Resolver {
         Ok(dirs)
     }
 
-    /// glibc-hwcaps subdirectories, highest priority first.
+    /// Optional glibc-hwcaps subdirectories are deliberately not selected.
+    /// Their availability is a property of the deployment CPU, not the ELF
+    /// target or sysroot. Picking the highest variant while planning can make
+    /// an otherwise portable bundle fault on older CPUs.
     fn hwcaps_subdirs(architecture: &Architecture) -> &'static [&'static str] {
-        match architecture.machine {
-            crate::elf::Machine::X86_64 => &["x86-64-v4", "x86-64-v3", "x86-64-v2"],
-            _ => &[],
-        }
+        let _ = architecture;
+        &[]
     }
 
     fn try_directory(
@@ -528,10 +534,7 @@ impl Resolver {
         let Some(metadata) = self.elf.get(&resolved.host)? else {
             return Ok(None);
         };
-        if !matches!(
-            metadata.object_type,
-            ObjectType::SharedObject | ObjectType::Executable
-        ) {
+        if metadata.object_type != ObjectType::SharedObject {
             return Ok(None);
         }
         if !metadata
@@ -593,7 +596,17 @@ impl DynamicLinkerResolver for Resolver {
         // A soname containing a slash is a path, not a search request.
         let found = if request.soname.contains('/') {
             let ctx = self.token_context(&request.requester, &request.architecture);
-            let path = tokens::expand_search_path(&request.soname, &ctx);
+            let expanded = tokens::expand(&request.soname, &ctx);
+            let path = Path::new(&expanded);
+            if !path.is_absolute() {
+                return Err(Error::Config {
+                    message: format!(
+                        "relative DT_NEEDED path `{}` depends on the runtime working directory",
+                        request.soname
+                    ),
+                });
+            }
+            let path = normalize_absolute(path);
             self.try_path(&path, request, &mut searched, &mut mismatch)?
         } else {
             self.search(request, &mut searched, &mut mismatch)?
@@ -644,9 +657,19 @@ impl Resolver {
         let cached: Vec<PathBuf> = self
             .cache
             .as_ref()
-            .map(|c| c.lookup(&request.soname).to_vec())
+            .map(|c| c.lookup_compatible(&request.soname, &request.architecture))
             .unwrap_or_default();
+        let default_dirs = if request.nodeflib {
+            // `DF_1_NODEFLIB` suppresses glibc's built-in trusted directories,
+            // not directories that `/etc/ld.so.conf` added to the cache.
+            search::default_library_paths(&request.architecture)
+        } else {
+            Vec::new()
+        };
         for candidate in cached {
+            if default_dirs.iter().any(|dir| candidate.starts_with(dir)) {
+                continue;
+            }
             if let Some(found) = self.try_path(&candidate, request, searched, mismatch)? {
                 self.note(request, &logical_parent(&candidate), SearchOrigin::Cache);
                 return Ok(Some(found));

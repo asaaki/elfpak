@@ -158,7 +158,7 @@ impl UserSpec {
             [name, uid, gid] => {
                 let uid: u32 = uid.parse().map_err(|_| invalid())?;
                 let gid: u32 = gid.parse().map_err(|_| invalid())?;
-                if name.is_empty() {
+                if !is_safe_account_name(name) {
                     return Err(invalid());
                 }
                 Ok(UserSpec {
@@ -171,6 +171,16 @@ impl UserSpec {
             _ => Err(invalid()),
         }
     }
+}
+
+/// POSIX account names are data embedded in colon-delimited system files.
+/// Restrict them to the portable, non-ambiguous subset before rendering.
+fn is_safe_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +359,8 @@ mod tests {
         assert_eq!(UserSpec::parse("65532:1000").unwrap().gid, 1000);
         assert_eq!(UserSpec::parse("svc:1:2").unwrap().name, "svc");
         assert!(UserSpec::parse("nobody").is_err());
+        assert!(UserSpec::parse("evil\nroot:1:2").is_err());
+        assert!(UserSpec::parse("bad:name:1:2").is_err());
     }
 
     #[test]

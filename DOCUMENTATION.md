@@ -436,11 +436,14 @@ Supported target architectures are x86_64 and aarch64. Anything else fails with
 * writes only beneath `--output`
 * records every included file and why
 
-Directory, tar and manifest outputs are assembled in sibling temporary paths
-and published only after they are complete. If planning-time source validation
-or an output write fails, an existing artifact remains untouched and a partial
-new artifact is not exposed. With `--clean`, the previous rootfs is likewise
-kept until its replacement is ready.
+Each directory, tar, and manifest artifact is assembled in a sibling temporary
+path and published only after that artifact is complete. If an individual
+artifact write fails, its previous version remains untouched and no partial
+replacement is exposed. When requesting more than one output, artifacts are
+published sequentially; a later failure can therefore leave already-published
+earlier artifacts new. Re-run the command after correcting the failure rather
+than treating a mixed set as a verified release. With `--clean`, the previous
+rootfs is likewise kept until its replacement is ready.
 
 Output is deterministic for the same application binary, source root,
 configuration and `elfpak` version: entries are ordered by destination, file

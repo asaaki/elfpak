@@ -372,12 +372,12 @@ pub fn ld_cache(entries: &[(&str, &str)]) -> Vec<u8> {
     out.extend_from_slice(b"1.1");
     out.extend_from_slice(&offset(entries.len()).to_le_bytes());
     out.extend_from_slice(&offset(strings.len()).to_le_bytes());
-    out.push(0);
+    out.push(2); // cache_file_new_flags_endian_little
     out.extend_from_slice(&[0, 0, 0]);
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&[0u8; 12]);
     for (key, value) in &offsets {
-        out.extend_from_slice(&0x0300_0003u32.to_le_bytes());
+        out.extend_from_slice(&0x0000_0303u32.to_le_bytes()); // x86_64 ELF libc6
         out.extend_from_slice(&(key + base).to_le_bytes());
         out.extend_from_slice(&(value + base).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());

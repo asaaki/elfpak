@@ -13,15 +13,24 @@ use std::path::{Path, PathBuf};
 
 /// Fixed mtime for every entry, so repeated runs are byte-identical.
 /// Overridable through `SOURCE_DATE_EPOCH`.
-fn source_date_epoch() -> std::time::SystemTime {
-    std::time::UNIX_EPOCH + std::time::Duration::from_secs(source_date_epoch_secs())
+fn source_date_epoch() -> Result<std::time::SystemTime> {
+    std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(source_date_epoch_secs()?))
+        .ok_or_else(|| Error::Config {
+            message: "SOURCE_DATE_EPOCH is outside the supported system-time range".to_string(),
+        })
 }
 
-pub(crate) fn source_date_epoch_secs() -> u64 {
-    std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(0)
+pub(crate) fn source_date_epoch_secs() -> Result<u64> {
+    match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => value.trim().parse::<u64>().map_err(|_| Error::Config {
+            message: format!("invalid SOURCE_DATE_EPOCH `{value}` (expected an unsigned integer)"),
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::Config {
+            message: "SOURCE_DATE_EPOCH is not valid Unicode".to_string(),
+        }),
+    }
 }
 
 #[derive(Debug)]
@@ -48,6 +57,8 @@ impl RootFsBuilder {
     /// A failed build leaves an existing output untouched and exposes no new
     /// output when the destination did not exist.
     pub fn apply(&self, plan: &BundlePlan) -> Result<RootFsReport> {
+        // Validate this shared reproducibility input before touching output.
+        let _ = source_date_epoch()?;
         guard_output(&self.output)?;
         let parent = output_parent(&self.output);
         std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
@@ -164,7 +175,12 @@ fn path_exists(path: &Path) -> bool {
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(path).map_err(|e| io(path, e))?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| io(path, e))?;
+    if metadata.is_symlink() {
+        return Err(Error::Config {
+            message: format!("output `{}` must not be a symlink", path.display()),
+        });
+    }
     if metadata.is_dir() {
         return Ok(());
     }
@@ -174,9 +190,9 @@ fn ensure_directory(path: &Path) -> Result<()> {
 }
 
 /// Clone an existing output into the stage without following symlinks. Regular
-/// files are hard-linked because the stage is deliberately on the same
-/// filesystem; planned files are unlinked before replacement, so applying the
-/// plan cannot mutate the published tree through those links.
+/// files are copied rather than hard-linked. A hard link would leave an
+/// unplanned file in the newly published rootfs sharing an inode with the old
+/// rootfs, so a later writer of the old tree could mutate the new snapshot.
 fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
     let mut stack = vec![(source.to_path_buf(), destination.to_path_buf())];
     let mut directories = Vec::new();
@@ -200,8 +216,9 @@ fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
                 std::fs::create_dir(&destination_path).map_err(|e| io(&destination_path, e))?;
                 stack.push((source_path, destination_path));
             } else if metadata.is_file() {
-                std::fs::hard_link(&source_path, &destination_path)
+                std::fs::copy(&source_path, &destination_path)
                     .map_err(|e| io(&destination_path, e))?;
+                set_permissions_from(&destination_path, &metadata)?;
             } else {
                 return Err(Error::Config {
                     message: format!(
@@ -223,9 +240,40 @@ fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
 }
 
 /// Replace the visible output only after the complete staged tree exists. An
-/// existing output is moved to a private backup so a failed publish can restore
-/// it; publishing a previously absent output is one atomic rename.
+/// An existing output is atomically exchanged with the staged tree; publishing
+/// a previously absent output is one atomic rename.
 fn publish_directory(stage: tempfile::TempDir, output: &Path) -> Result<()> {
+    // Linux can exchange two sibling paths in one rename operation. This
+    // retains a continuously visible output for readers, unlike moving the
+    // old tree aside before publishing the new one. The temporary directory
+    // then names the old tree and `close` removes it after the exchange.
+    if path_exists(output) {
+        return publish_by_exchange(stage, output);
+    }
+
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    // Do not overwrite a rootfs created between the initial existence check
+    // and publication. A concurrent builder must retry rather than silently
+    // discarding somebody else's output.
+    renameat_with(CWD, stage.path(), CWD, output, RenameFlags::NOREPLACE)
+        .map_err(|e| io(output, e.into()))
+}
+
+fn publish_by_exchange(stage: tempfile::TempDir, output: &Path) -> Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, stage.path(), CWD, output, RenameFlags::EXCHANGE)
+        .map_err(|e| io(output, e.into()))?;
+    let old_path = stage.path().to_path_buf();
+    stage.close().map_err(|e| io(&old_path, e))
+}
+
+/// Legacy publication path retained only for platforms/filesystems where
+/// `renameat2(RENAME_EXCHANGE)` is unavailable. This is never selected on
+/// supported Linux builds: returning an error is safer than exposing a gap.
+#[allow(dead_code)]
+fn publish_directory_legacy(stage: tempfile::TempDir, output: &Path) -> Result<()> {
     let backup = if path_exists(output) {
         let reservation = tempfile::Builder::new()
             .prefix(".elfpak-backup-")
@@ -429,7 +477,9 @@ fn pin_times(path: &Path) {
     let Ok(file) = std::fs::File::open(path) else {
         return;
     };
-    let time = source_date_epoch();
+    let Ok(time) = source_date_epoch() else {
+        return;
+    };
     let _ = file.set_times(
         std::fs::FileTimes::new()
             .set_accessed(time)
@@ -439,7 +489,9 @@ fn pin_times(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{guard_clean, guard_output, has_symlinked_ancestor, remove_existing};
+    use super::{
+        ensure_directory, guard_clean, guard_output, has_symlinked_ancestor, remove_existing,
+    };
     use std::path::Path;
 
     #[test]
@@ -489,5 +541,16 @@ mod tests {
         assert_eq!(err.code(), "E4001");
         let temp = tempfile::tempdir().unwrap();
         guard_output(&temp.path().join("rootfs")).unwrap();
+    }
+
+    #[test]
+    fn an_output_root_symlink_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &output).unwrap();
+
+        assert!(ensure_directory(&output).is_err());
     }
 }

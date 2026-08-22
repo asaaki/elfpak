@@ -71,12 +71,22 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path).map_err(|e| io(path, e))?;
-        Config::parse(&text).map_err(|e| match e {
+        let mut config = Config::parse(&text).map_err(|e| match e {
             Error::Config { message } => Error::Config {
                 message: format!("{}: {message}", path.display()),
             },
             other => other,
-        })
+        })?;
+        // Filesystem paths in a configuration describe the project containing
+        // that configuration, not whichever directory happened to invoke the
+        // CLI. Logical in-image paths (`install` and `include.paths`) remain
+        // rooted in the source filesystem and are intentionally untouched.
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        rebase_path(&mut config.package.binary, base);
+        rebase_path(&mut config.package.output, base);
+        rebase_path(&mut config.package.tar, base);
+        rebase_path(&mut config.package.root, base);
+        Ok(config)
     }
 
     /// Load `elfpak.toml` from `dir` if it exists. A missing file is not an error.
@@ -87,6 +97,14 @@ impl Config {
         }
         let config = Config::load(&candidate)?;
         Ok(Some((candidate, config)))
+    }
+}
+
+fn rebase_path(path: &mut Option<PathBuf>, base: &Path) {
+    if let Some(value) = path
+        && value.is_relative()
+    {
+        *value = base.join(&*value);
     }
 }
 
@@ -136,5 +154,26 @@ allow = ["libc.so.6", "libgcc_s.so.1"]
     fn unknown_keys_are_rejected() {
         let err = Config::parse("[runtime]\npresset = \"web\"\n").unwrap_err();
         assert!(err.to_string().contains("presset"), "{err}");
+    }
+
+    #[test]
+    fn load_resolves_project_paths_against_the_config_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let config_path = project.join("elfpak.toml");
+        std::fs::write(
+            &config_path,
+            "[package]\nbinary = 'bin/app'\nroot = 'sysroot'\noutput = 'dist/rootfs'\ntar = 'dist/app.tar'\ninstall = '/app/server'\n\n[include]\npaths = ['/app/data']\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.package.binary, Some(project.join("bin/app")));
+        assert_eq!(config.package.root, Some(project.join("sysroot")));
+        assert_eq!(config.package.output, Some(project.join("dist/rootfs")));
+        assert_eq!(config.package.tar, Some(project.join("dist/app.tar")));
+        assert_eq!(config.package.install, Some(PathBuf::from("/app/server")));
+        assert_eq!(config.include.paths, vec![PathBuf::from("/app/data")]);
     }
 }

@@ -54,7 +54,7 @@ impl TarBuilder {
         writer.mode(tar::HeaderMode::Complete);
 
         let mut report = TarReport::default();
-        let mtime = super::copy::source_date_epoch_secs();
+        let mtime = super::copy::source_date_epoch_secs()?;
 
         for entry in &plan.files {
             entry.assert_well_formed();

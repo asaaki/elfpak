@@ -187,10 +187,62 @@ impl Manifest {
 
     pub fn load(path: &Path) -> Result<Manifest> {
         let bytes = std::fs::read(path).map_err(|e| io(path, e))?;
-        serde_json::from_slice(&bytes).map_err(|e| Error::Manifest {
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::Manifest {
             path: path.to_path_buf(),
             message: e.to_string(),
-        })
+        })?;
+        manifest.validate(path)?;
+        Ok(manifest)
+    }
+
+    /// Reject malformed untrusted manifest data before verification relies on
+    /// it. `verify` is also public, so it still treats an unknown kind as a
+    /// problem, but normal CLI use gets a clear load-time error.
+    fn validate(&self, manifest_path: &Path) -> Result<()> {
+        if self.manifest_version == 0 || self.manifest_version > MANIFEST_VERSION {
+            return Err(invalid_manifest(
+                manifest_path,
+                format!("unsupported manifest version {}", self.manifest_version),
+            ));
+        }
+        let mut paths = std::collections::HashSet::new();
+        for file in &self.files {
+            let path = Path::new(&file.path);
+            if !path.is_absolute()
+                || path != crate::paths::normalize_absolute(path)
+                || !paths.insert(path.to_path_buf())
+            {
+                return Err(invalid_manifest(
+                    manifest_path,
+                    format!("invalid or duplicate path `{}`", file.path),
+                ));
+            }
+            let mode = u32::from_str_radix(&file.mode, 8).ok();
+            if mode.is_none_or(|mode| mode > 0o7777) {
+                return Err(invalid_manifest(
+                    manifest_path,
+                    format!("invalid mode `{}` for `{}`", file.mode, file.path),
+                ));
+            }
+            match file.kind.as_str() {
+                "directory" if file.size == 0 && file.sha256.is_none() && file.target.is_none() => {
+                }
+                "symlink" if file.size == 0 && file.sha256.is_none() && file.target.is_some() => {}
+                "executable" | "interpreter" | "shared-object" | "certificate-bundle"
+                | "runtime-config" | "application-data"
+                    if file.target.is_none()
+                        && file.sha256.as_ref().is_some_and(|digest| {
+                            self.manifest_version < MANIFEST_VERSION || is_sha256(digest)
+                        }) => {}
+                _ => {
+                    return Err(invalid_manifest(
+                        manifest_path,
+                        format!("inconsistent entry `{}`", file.path),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check a materialized rootfs against this manifest. An entry can be
@@ -198,10 +250,35 @@ impl Manifest {
     /// permissions that changed.
     pub fn verify(&self, rootfs: &Path, options: &VerifyOptions) -> VerifyReport {
         let mut report = VerifyReport::default();
+        match std::fs::symlink_metadata(rootfs) {
+            Ok(metadata) if metadata.is_symlink() => {
+                report.problems.push(Problem {
+                    path: "/".to_string(),
+                    detail: "verification root must not be a symlink".to_string(),
+                });
+                return report;
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                report.problems.push(Problem {
+                    path: "/".to_string(),
+                    detail: "verification root is not a directory".to_string(),
+                });
+                return report;
+            }
+            Ok(_) | Err(_) => {}
+        }
         for file in &self.files {
             report.checked += 1;
             let target = crate::paths::join_under(rootfs, Path::new(&file.path));
             assert!(target.starts_with(rootfs));
+
+            if has_symlinked_ancestor(rootfs, &target) {
+                report.problems.push(Problem {
+                    path: file.path.clone(),
+                    detail: "path traverses a symlinked directory inside the rootfs".to_string(),
+                });
+                continue;
+            }
 
             let Ok(metadata) = std::fs::symlink_metadata(&target) else {
                 report.problems.push(Problem {
@@ -286,6 +363,37 @@ impl Manifest {
     }
 }
 
+fn invalid_manifest(path: &Path, message: String) -> Error {
+    Error::Manifest {
+        path: path.to_path_buf(),
+        message,
+    }
+}
+
+fn is_sha256(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// A final symlink is a valid manifest entry; only ancestor symlinks would
+/// redirect metadata reads or hashing outside the supplied rootfs.
+fn has_symlinked_ancestor(rootfs: &Path, target: &Path) -> bool {
+    let mut current = target.parent();
+    while let Some(path) = current {
+        if path == rootfs {
+            return false;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_symlink() => return true,
+            Ok(_) | Err(_) => {}
+        }
+        current = path.parent();
+    }
+    true
+}
+
 fn set_output_permissions(stage: &Path, destination: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -308,7 +416,12 @@ fn verify_entry(
             detail: "expected a directory".to_string(),
         }),
         "symlink" => verify_symlink(file, target, metadata),
-        _ => verify_regular(file, target, metadata),
+        "executable" | "interpreter" | "shared-object" | "certificate-bundle"
+        | "runtime-config" | "application-data" => verify_regular(file, target, metadata),
+        _ => Some(Problem {
+            path: file.path.clone(),
+            detail: format!("unknown manifest entry kind `{}`", file.kind),
+        }),
     }
 }
 
@@ -352,9 +465,12 @@ fn verify_regular(
             detail: "expected a regular file".to_string(),
         });
     }
-    // An entry without a digest is one `elfpak` never writes; there is nothing
-    // to compare, and the mode check still applies.
-    let expected = file.sha256.as_ref()?;
+    let Some(expected) = file.sha256.as_ref() else {
+        return Some(Problem {
+            path: file.path.clone(),
+            detail: "regular file has no sha256 digest".to_string(),
+        });
+    };
     match sha256_file(target) {
         Ok((actual, size)) if &actual.0 == expected && size == file.size => None,
         Ok((_actual, size)) if size != file.size => Some(Problem {

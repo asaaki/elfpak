@@ -76,17 +76,19 @@ fn substitute(name: &str, ctx: &TokenContext) -> Option<String> {
     }
 }
 
-/// Expand a search path entry and normalize it to a logical absolute path.
-///
-/// Relative entries are interpreted against the requesting object's directory,
-/// which is what the loader effectively does for `$ORIGIN`-style layouts.
+/// Expand a validated search path entry and normalize it to a logical absolute
+/// path. The ELF parser rejects entries that would remain relative because
+/// glibc resolves those against its runtime current working directory.
 pub fn expand_search_path(entry: &str, ctx: &TokenContext) -> PathBuf {
     let expanded = expand(entry, ctx);
     let path = Path::new(&expanded);
     if path.is_absolute() {
         crate::paths::normalize_absolute(path)
     } else {
-        crate::paths::normalize_absolute(&ctx.origin.join(path))
+        // The parser permits only `$ORIGIN`-prefixed relative spelling, which
+        // expands to an absolute path. Keep this fallback defensive for direct
+        // callers, without pretending ordinary relative paths are `$ORIGIN`.
+        crate::paths::normalize_absolute(path)
     }
 }
 
@@ -141,10 +143,7 @@ mod tests {
             expand_search_path("$ORIGIN/../lib", &ctx()),
             PathBuf::from("/opt/app/lib")
         );
-        assert_eq!(
-            expand_search_path("../lib", &ctx()),
-            PathBuf::from("/opt/app/lib")
-        );
+        assert_eq!(expand_search_path("../lib", &ctx()), PathBuf::from("/lib"));
         assert_eq!(
             expand_search_path("/usr/lib", &ctx()),
             PathBuf::from("/usr/lib")

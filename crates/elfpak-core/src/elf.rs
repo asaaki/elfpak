@@ -152,6 +152,8 @@ pub struct ElfMetadata {
     pub soname: Option<String>,
     pub rpath: Vec<String>,
     pub runpath: Vec<String>,
+    /// Whether the object has a `DT_RUNPATH` tag, even if its value is empty.
+    pub has_runpath: bool,
     /// `DF_1_NODEFLIB`: skip default library search directories.
     pub nodeflib: bool,
     /// `DF_1_ORIGIN` / `DF_ORIGIN`: object expects `$ORIGIN` processing.
@@ -198,8 +200,14 @@ impl ElfMetadata {
             Some(dynamic) => (dynamic.info.flags, dynamic.info.flags_1),
             None => (0, 0),
         };
-        let rpath: Vec<String> = elf.rpaths.iter().flat_map(|s| split_paths(s)).collect();
-        let runpath: Vec<String> = elf.runpaths.iter().flat_map(|s| split_paths(s)).collect();
+        let rpath = parse_search_paths(path, "DT_RPATH", &elf.rpaths)?;
+        let runpath = parse_search_paths(path, "DT_RUNPATH", &elf.runpaths)?;
+        let has_runpath = elf.dynamic.as_ref().is_some_and(|dynamic| {
+            dynamic
+                .dyns
+                .iter()
+                .any(|entry| entry.d_tag == goblin::elf::dynamic::DT_RUNPATH)
+        });
         Ok(ElfMetadata {
             path: path.to_path_buf(),
             architecture: architecture_of(&elf),
@@ -210,6 +218,7 @@ impl ElfMetadata {
             soname: elf.soname.map(|s| s.to_string()),
             rpath,
             runpath,
+            has_runpath,
             nodeflib: flags_1 & DF_1_NODEFLIB != 0,
             origin_flag: flags & DF_ORIGIN != 0 || flags_1 & DF_1_ORIGIN != 0,
             is_dynamic: elf.dynamic.is_some(),
@@ -221,7 +230,7 @@ impl ElfMetadata {
     /// Effective search list contributed by this object: `DT_RUNPATH` wins over
     /// `DT_RPATH`, exactly like the glibc loader.
     pub fn runpath_is_authoritative(&self) -> bool {
-        !self.runpath.is_empty()
+        self.has_runpath
     }
 }
 
@@ -270,15 +279,34 @@ fn dlopen_references(elf: &goblin::elf::Elf<'_>) -> Vec<String> {
 
 /// `DT_RPATH`/`DT_RUNPATH`/`LD_LIBRARY_PATH` are colon separated lists.
 ///
-/// Empty entries are dropped. To the loader an empty entry means the current
-/// working directory, which would make the result depend on where `elfpak` was
-/// invoked from.
-pub fn split_paths(value: &str) -> Vec<String> {
-    value
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+/// Search paths that depend on a runtime current working directory cannot be
+/// reproduced in a relocatable bundle, so they are refused rather than being
+/// silently interpreted as `$ORIGIN` paths.
+fn parse_search_paths(path: &Path, tag: &str, values: &[&str]) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for value in values {
+        // An explicitly empty `DT_RUNPATH` is valid and still suppresses
+        // `DT_RPATH`; it contributes no directories of its own.
+        if value.is_empty() {
+            continue;
+        }
+        for entry in value.split(':') {
+            let origin_relative = entry == "$ORIGIN"
+                || entry == "${ORIGIN}"
+                || entry.starts_with("$ORIGIN/")
+                || entry.starts_with("${ORIGIN}/");
+            if entry.is_empty() || (!entry.starts_with('/') && !origin_relative) {
+                return Err(Error::Config {
+                    message: format!(
+                        "`{}` contains unsupported {tag} entry `{entry}`; empty and relative loader search paths depend on the runtime working directory",
+                        path.display()
+                    ),
+                });
+            }
+            paths.push(entry.to_string());
+        }
+    }
+    Ok(paths)
 }
 
 #[cfg(test)]
@@ -353,9 +381,11 @@ mod tests {
     }
 
     #[test]
-    fn search_path_lists_are_colon_separated() {
-        assert_eq!(split_paths("/a:/b::/c"), vec!["/a", "/b", "/c"]);
-        assert!(split_paths("").is_empty());
+    fn dynamic_search_paths_refuse_cwd_dependent_entries() {
+        let path = Path::new("/app");
+        assert!(parse_search_paths(path, "DT_RUNPATH", &["/a:$ORIGIN/lib"]).is_ok());
+        assert!(parse_search_paths(path, "DT_RUNPATH", &["/a::/b"]).is_err());
+        assert!(parse_search_paths(path, "DT_RUNPATH", &["relative"]).is_err());
     }
 
     #[test]

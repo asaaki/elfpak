@@ -32,14 +32,37 @@ const NEW_ENTRY_LEN: usize = 24;
 /// A distribution cache holds a few thousand libraries. `nlibs` comes out of
 /// the file and is never trusted, so this bounds what is read.
 const CACHE_ENTRIES_MAX: usize = 65_536;
+/// A cache is a small index, not an arbitrary data container. This prevents a
+/// hostile sysroot from making planning allocate or repeatedly scan huge data.
+const CACHE_BYTES_MAX: u64 = 16 * 1024 * 1024;
+/// Both ELF sonames and filesystem components are far shorter in practice;
+/// this also bounds malformed unterminated-string scans.
+const CACHE_STRING_LEN_MAX: usize = 4096;
+/// A loader lookup should not turn one malicious soname into tens of thousands
+/// of filesystem probes. Normal caches have only a handful of alternatives.
+const CACHE_CANDIDATES_PER_SONAME_MAX: usize = 256;
 
 #[derive(Debug, Clone, Default)]
 pub struct LdCache {
     /// soname -> candidate absolute paths, in cache order.
     entries: HashMap<String, Vec<PathBuf>>,
+    /// Same candidates with loader-selection metadata retained.
+    records: HashMap<String, Vec<CacheRecord>>,
     /// Candidates kept, i.e. the total length of the lists above. Relative and
     /// duplicate entries are dropped on the way in and are not counted.
     len: usize,
+}
+
+/// One raw cache entry. The loader checks its ABI and hardware requirements
+/// before considering the pathname, so preserving this metadata is essential
+/// when planning from a foreign sysroot.
+#[derive(Debug, Clone)]
+struct CacheRecord {
+    soname: String,
+    path: PathBuf,
+    flags: u32,
+    osversion: u32,
+    hwcap: u64,
 }
 
 impl LdCache {
@@ -47,6 +70,12 @@ impl LdCache {
     /// failing the build; the cache is a hint and the search paths remain.
     pub fn parse(bytes: &[u8]) -> LdCache {
         let mut cache = LdCache::default();
+        if u64::try_from(bytes.len())
+            .ok()
+            .is_none_or(|len| len > CACHE_BYTES_MAX)
+        {
+            return cache;
+        }
         let pairs = if starts_with(bytes, 0, NEW_MAGIC) {
             parse_new(bytes, 0)
         } else if starts_with(bytes, 0, OLD_MAGIC) {
@@ -68,15 +97,20 @@ impl LdCache {
             Vec::new()
         };
 
-        for (soname, path) in pairs {
+        for record in pairs {
             // ldconfig only records absolute paths. A relative one would be
             // resolved against this process's working directory downstream.
-            if !path.is_absolute() {
+            if !record.path.is_absolute() {
                 continue;
             }
-            let list = cache.entries.entry(soname).or_default();
-            if !list.contains(&path) {
-                list.push(path);
+            let list = cache.entries.entry(record.soname.clone()).or_default();
+            if list.len() < CACHE_CANDIDATES_PER_SONAME_MAX && !list.contains(&record.path) {
+                list.push(record.path.clone());
+                cache
+                    .records
+                    .entry(record.soname.clone())
+                    .or_default()
+                    .push(record);
                 cache.len += 1;
             }
         }
@@ -84,6 +118,9 @@ impl LdCache {
     }
 
     pub fn load(path: &Path) -> Option<LdCache> {
+        if std::fs::metadata(path).ok()?.len() > CACHE_BYTES_MAX {
+            return None;
+        }
         let bytes = std::fs::read(path).ok()?;
         let cache = LdCache::parse(&bytes);
         if cache.entries.is_empty() {
@@ -95,6 +132,28 @@ impl LdCache {
 
     pub fn lookup(&self, soname: &str) -> &[PathBuf] {
         self.entries.get(soname).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Candidates usable by a portable bundle for `architecture`.
+    ///
+    /// Cache flags encode the ELF ABI. Entries requiring an OS version or CPU
+    /// hwcap are intentionally skipped because a sysroot does not establish a
+    /// deployment kernel or CPU baseline.
+    pub fn lookup_compatible(&self, soname: &str, architecture: &Architecture) -> Vec<PathBuf> {
+        let Some(expected_flags) =
+            entry_flags(architecture).and_then(|flags| u32::try_from(flags).ok())
+        else {
+            return Vec::new();
+        };
+        self.records
+            .get(soname)
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry.flags == expected_flags && entry.osversion == 0 && entry.hwcap == 0
+            })
+            .map(|entry| entry.path.clone())
+            .collect()
     }
 
     /// Candidates the cache holds, counting a soname once per distinct path.
@@ -129,7 +188,13 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 fn read_string(bytes: &[u8], base: usize, offset: u32) -> Option<String> {
     let start = base.checked_add(offset as usize)?;
     let rest = bytes.get(start..)?;
-    let end = rest.iter().position(|&b| b == 0)?;
+    let end = rest
+        .iter()
+        .take(CACHE_STRING_LEN_MAX + 1)
+        .position(|&b| b == 0)?;
+    if end > CACHE_STRING_LEN_MAX {
+        return None;
+    }
     std::str::from_utf8(&rest[..end]).ok().map(str::to_string)
 }
 
@@ -146,7 +211,7 @@ fn entry_capacity(bytes: &[u8], base: usize, header: usize, entry: usize) -> usi
 
 /// `struct cache_file`: a header followed by `nlibs` fixed-size entries whose
 /// string offsets are relative to the start of the image.
-fn parse_old(bytes: &[u8], nlibs: usize) -> Vec<(String, PathBuf)> {
+fn parse_old(bytes: &[u8], nlibs: usize) -> Vec<CacheRecord> {
     let capacity = entry_capacity(bytes, 0, OLD_HEADER_LEN, OLD_ENTRY_LEN);
     let count = nlibs.min(capacity).min(CACHE_ENTRIES_MAX);
     let mut out = Vec::with_capacity(count);
@@ -157,21 +222,40 @@ fn parse_old(bytes: &[u8], nlibs: usize) -> Vec<(String, PathBuf)> {
         else {
             break;
         };
-        let (Some(key), Some(value)) = (read_u32(bytes, offset + 4), read_u32(bytes, offset + 8))
-        else {
+        let (Some(flags), Some(key), Some(value)) = (
+            read_u32(bytes, offset),
+            read_u32(bytes, offset + 4),
+            read_u32(bytes, offset + 8),
+        ) else {
             break;
         };
         if let (Some(soname), Some(path)) =
             (read_string(bytes, 0, key), read_string(bytes, 0, value))
         {
-            out.push((soname, PathBuf::from(path)));
+            out.push(CacheRecord {
+                soname,
+                path: PathBuf::from(path),
+                flags,
+                osversion: 0,
+                hwcap: 0,
+            });
         }
     }
     out
 }
 
-fn parse_new(bytes: &[u8], base: usize) -> Vec<(String, PathBuf)> {
+fn parse_new(bytes: &[u8], base: usize) -> Vec<CacheRecord> {
     if !starts_with(bytes, base + NEW_MAGIC.len(), NEW_VERSION) {
+        return Vec::new();
+    }
+    // The planner supports only little-endian target cache records. Refuse a
+    // different byte order rather than decoding fields incorrectly.
+    let Some(header_flags) = bytes.get(base + 28).copied() else {
+        return Vec::new();
+    };
+    // Old writers left this field zero. Otherwise, the low two bits encode
+    // byte order and must name little-endian for supported targets.
+    if header_flags != 0 && header_flags & 0x03 != FLAGS_ENDIAN_LITTLE {
         return Vec::new();
     }
     let nlibs = match read_u32(bytes, base + 20) {
@@ -188,15 +272,30 @@ fn parse_new(bytes: &[u8], base: usize) -> Vec<(String, PathBuf)> {
         else {
             break;
         };
-        let (Some(key), Some(value)) = (read_u32(bytes, offset + 4), read_u32(bytes, offset + 8))
-        else {
+        let (Some(flags), Some(key), Some(value), Some(osversion)) = (
+            read_u32(bytes, offset),
+            read_u32(bytes, offset + 4),
+            read_u32(bytes, offset + 8),
+            read_u32(bytes, offset + 12),
+        ) else {
             break;
         };
-        if let (Some(soname), Some(path)) = (
+        let hwcap = bytes
+            .get(offset + 16..offset + NEW_ENTRY_LEN)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes);
+        if let (Some(soname), Some(path), Some(hwcap)) = (
             read_string(bytes, base, key),
             read_string(bytes, base, value),
+            hwcap,
         ) {
-            out.push((soname, PathBuf::from(path)));
+            out.push(CacheRecord {
+                soname,
+                path: PathBuf::from(path),
+                flags,
+                osversion,
+                hwcap,
+            });
         }
     }
     out
@@ -412,7 +511,7 @@ mod tests {
         out.extend_from_slice(NEW_VERSION);
         out.extend_from_slice(&offset(entries.len()).to_le_bytes());
         out.extend_from_slice(&offset(strings.len()).to_le_bytes());
-        out.push(0);
+        out.push(FLAGS_ENDIAN_LITTLE);
         out.extend_from_slice(&[0, 0, 0]);
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&[0u8; 12]);
@@ -622,6 +721,48 @@ mod tests {
             1,
             "only what the cache kept is counted"
         );
+    }
+
+    #[test]
+    fn candidates_per_soname_are_bounded_in_cache_order() {
+        let owned: Vec<(String, String)> = (0..=CACHE_CANDIDATES_PER_SONAME_MAX)
+            .map(|index| ("libmany.so".to_string(), format!("/lib/libmany-{index}.so")))
+            .collect();
+        let entries: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(soname, path)| (soname.as_str(), path.as_str()))
+            .collect();
+
+        let cache = LdCache::parse(&new_format(&entries));
+        let found = cache.lookup("libmany.so");
+        assert_eq!(found.len(), CACHE_CANDIDATES_PER_SONAME_MAX);
+        assert_eq!(found[0], Path::new("/lib/libmany-0.so"));
+        assert_eq!(
+            found.last(),
+            Some(&PathBuf::from(format!(
+                "/lib/libmany-{}.so",
+                CACHE_CANDIDATES_PER_SONAME_MAX - 1
+            )))
+        );
+    }
+
+    #[test]
+    fn compatible_lookup_rejects_foreign_abi_and_cpu_specific_entries() {
+        let mut bytes = new_format(&[("libpick.so", "/lib/libpick.so")]);
+        // First entry begins straight after the new-format header.
+        bytes[NEW_HEADER_LEN..NEW_HEADER_LEN + 4].copy_from_slice(&0x0000_0a03u32.to_le_bytes()); // aarch64 libc6
+        let cache = LdCache::parse(&bytes);
+        let x86 = Architecture {
+            machine: Machine::X86_64,
+            class: ElfClass::Elf64,
+            endianness: Endianness::Little,
+        };
+        assert!(cache.lookup_compatible("libpick.so", &x86).is_empty());
+
+        bytes[NEW_HEADER_LEN..NEW_HEADER_LEN + 4].copy_from_slice(&0x0000_0303u32.to_le_bytes());
+        bytes[NEW_HEADER_LEN + 16..NEW_HEADER_LEN + 24].copy_from_slice(&1u64.to_le_bytes());
+        let cache = LdCache::parse(&bytes);
+        assert!(cache.lookup_compatible("libpick.so", &x86).is_empty());
     }
 
     #[test]
