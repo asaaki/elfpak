@@ -8,6 +8,7 @@
 
 mod bundle;
 mod cli;
+mod config;
 mod inspect;
 mod render;
 mod verify;

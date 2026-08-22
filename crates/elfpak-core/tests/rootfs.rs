@@ -120,7 +120,7 @@ fn manifest_records_every_file_and_verifies() {
 
     let loaded = Manifest::load(&path).unwrap();
     assert_eq!(loaded.binary, "/app/server");
-    assert_eq!(loaded.files.len(), plan.files.len());
+    assert_eq!(loaded.files.len(), plan.files().len());
     assert!(loaded.verify(&rootfs, &VerifyOptions::default()).is_ok());
 
     // Tampering is detected.
@@ -175,7 +175,7 @@ fn install_paths_cannot_escape_the_output_directory() {
     .install_as("/../../etc/evil")
     .plan()
     .unwrap();
-    assert_eq!(plan.executable.destination, PathBuf::from("/etc/evil"));
+    assert_eq!(plan.executable().destination(), PathBuf::from("/etc/evil"));
 
     RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
     assert!(rootfs.join("etc/evil").is_file());
@@ -253,8 +253,8 @@ fn statically_linked_binaries_bundle_to_just_themselves() {
         .install_as("/app/server")
         .plan()
         .expect("a static binary needs no closure");
-    assert!(plan.interpreter.is_none());
-    assert_eq!(plan.graph.nodes.len(), 1);
+    assert!(plan.interpreter().is_none());
+    assert_eq!(plan.graph().nodes.len(), 1);
 
     RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
     assert!(rootfs.join("app/server").is_file());

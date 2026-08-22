@@ -78,27 +78,27 @@ pub(crate) fn inspect(
     plan: &BundlePlan,
 ) -> std::io::Result<()> {
     writeln!(out, "{}", binary.display())?;
-    writeln!(out, "  {}", plan.architecture)?;
+    writeln!(out, "  {}", plan.architecture())?;
     writeln!(out)?;
 
     inspect_interpreter(out, plan)?;
-    inspect_dependencies(out, &plan.graph)?;
-    inspect_transitive(out, &plan.graph)?;
+    inspect_dependencies(out, plan.graph())?;
+    inspect_transitive(out, plan.graph())?;
 
     writeln!(out, "  runtime:")?;
     writeln!(
         out,
         "    {} shared objects",
-        plan.graph.shared_objects().count()
+        plan.graph().shared_objects().count()
     )?;
-    writeln!(out, "    {}", human_size(plan.graph.total_size()))?;
+    writeln!(out, "    {}", human_size(plan.graph().total_size()))?;
     writeln!(out)?;
 
     writeln!(out, "  warnings:")?;
-    if plan.warnings.is_empty() {
+    if plan.warnings().is_empty() {
         writeln!(out, "    none")?;
     }
-    for warning in &plan.warnings {
+    for warning in plan.warnings() {
         writeln!(out, "    {}: {}", warning.code, warning.message)?;
     }
     Ok(())
@@ -107,10 +107,10 @@ pub(crate) fn inspect(
 /// `PT_INTERP`, and where it actually lands once symlinks are followed.
 fn inspect_interpreter(out: &mut dyn Write, plan: &BundlePlan) -> std::io::Result<()> {
     writeln!(out, "  interpreter:")?;
-    match &plan.interpreter {
+    match &plan.interpreter() {
         Some(interp) => {
             writeln!(out, "    {}", interp.display())?;
-            if let Some(resolved) = &plan.interpreter_resolved
+            if let Some(resolved) = &plan.interpreter_resolved()
                 && resolved != interp
             {
                 writeln!(out, "      -> {}", resolved.display())?;
@@ -205,17 +205,17 @@ pub(crate) fn bundle_summary(
         out,
         "{} -> {}",
         binary.display(),
-        plan.executable.destination.display()
+        plan.executable().destination().display()
     )?;
-    writeln!(out, "  {}", plan.architecture)?;
-    if let Some(interp) = &plan.interpreter {
+    writeln!(out, "  {}", plan.architecture())?;
+    if let Some(interp) = &plan.interpreter() {
         writeln!(out, "  interpreter: {}", interp.display())?;
     }
 
     if verbose > 0 {
         writeln!(out)?;
         writeln!(out, "  plan:")?;
-        for file in &plan.files {
+        for file in plan.files() {
             summary_entry(out, file)?;
         }
     }
@@ -224,7 +224,7 @@ pub(crate) fn bundle_summary(
     summary_counts(out, plan)?;
     summary_destinations(out, destinations, outputs.written)?;
 
-    for warning in &plan.warnings {
+    for warning in plan.warnings() {
         writeln!(out)?;
         summary_warning(out, warning)?;
     }
@@ -233,7 +233,7 @@ pub(crate) fn bundle_summary(
 
 /// One line per planned entry: what it is, where it goes, why it is there.
 fn summary_entry(out: &mut dyn Write, file: &PlannedFile) -> std::io::Result<()> {
-    let marker = match file.kind {
+    let marker = match file.kind() {
         PlannedFileKind::Directory => "d",
         PlannedFileKind::Symlink => "l",
         _ => "-",
@@ -241,8 +241,8 @@ fn summary_entry(out: &mut dyn Write, file: &PlannedFile) -> std::io::Result<()>
     writeln!(
         out,
         "    {marker} {:<48} {}",
-        file.destination.display(),
-        reason(&file.reason)
+        file.destination().display(),
+        reason(file.reason())
     )
 }
 
@@ -250,11 +250,11 @@ fn summary_counts(out: &mut dyn Write, plan: &BundlePlan) -> std::io::Result<()>
     let dirs = plan.files_of_kind(PlannedFileKind::Directory).count();
     let links = plan.files_of_kind(PlannedFileKind::Symlink).count();
     let files = plan
-        .files
+        .files()
         .iter()
         .filter(|file| {
             !matches!(
-                file.kind,
+                file.kind(),
                 PlannedFileKind::Directory | PlannedFileKind::Symlink
             )
         })

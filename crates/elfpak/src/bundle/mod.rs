@@ -14,9 +14,10 @@ use crate::{
         policy::{dependency_policy, runtime_policy},
     },
     cli::BundleArgs,
+    config::Config,
     render::{self, Verbosity},
 };
-use elfpak_core::{Planner, SourceRoot, config::Config};
+use elfpak_core::{Planner, SourceRoot};
 pub(crate) use outputs::Outputs;
 use std::path::PathBuf;
 

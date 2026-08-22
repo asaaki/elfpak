@@ -25,7 +25,7 @@ fn elfpak_closure(binary: &Path) -> BTreeSet<PathBuf> {
     let plan = Planner::new(SourceRoot::new("/"), binary)
         .plan()
         .unwrap_or_else(|e| panic!("planning {} failed: {e}", binary.display()));
-    plan.graph
+    plan.graph()
         .nodes
         .iter()
         .filter(|node| node.kind == NodeKind::SharedObject)

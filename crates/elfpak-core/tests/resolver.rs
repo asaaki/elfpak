@@ -29,7 +29,7 @@ fn plan_for(sysroot: &Sysroot, exe: &str) -> elfpak_core::BundlePlan {
 }
 
 fn logical_paths(plan: &elfpak_core::BundlePlan) -> Vec<String> {
-    plan.graph
+    plan.graph()
         .nodes
         .iter()
         .map(|n| n.logical.display().to_string())
@@ -58,8 +58,8 @@ fn resolves_transitive_needed_and_preserves_soname_symlinks() {
         .files_of_kind(PlannedFileKind::Symlink)
         .map(|f| {
             (
-                f.destination.display().to_string(),
-                f.link_target.as_ref().unwrap().display().to_string(),
+                f.destination().display().to_string(),
+                f.link_target().as_ref().unwrap().display().to_string(),
             )
         })
         .collect();
@@ -76,8 +76,11 @@ fn resolves_transitive_needed_and_preserves_soname_symlinks() {
     );
 
     // The executable is installed where asked; libraries keep their paths.
-    assert_eq!(plan.executable.destination, PathBuf::from("/app/server"));
-    for node in plan.graph.shared_objects() {
+    assert_eq!(
+        plan.executable().destination(),
+        PathBuf::from("/app/server")
+    );
+    for node in plan.graph().shared_objects() {
         assert_eq!(node.destination, node.logical);
     }
 }
@@ -87,10 +90,10 @@ fn interpreter_is_part_of_the_closure() {
     let Some(sysroot) = sysroot() else { return };
     let plan = plan_for(&sysroot, "/bin/app-default");
 
-    let interpreter = plan.interpreter.expect("PT_INTERP");
+    let interpreter = plan.interpreter().expect("PT_INTERP");
     assert!(interpreter.is_absolute());
     assert_eq!(
-        plan.graph
+        plan.graph()
             .nodes
             .iter()
             .filter(|n| n.kind == NodeKind::Interpreter)
@@ -251,14 +254,14 @@ fn plans_are_deterministic() {
     let second = plan_for(&sysroot, "/bin/app-default");
 
     let render = |plan: &elfpak_core::BundlePlan| {
-        plan.files
+        plan.files()
             .iter()
             .map(|f| {
                 format!(
                     "{} {} {:?}",
-                    f.destination.display(),
-                    f.kind.as_str(),
-                    f.sha256.as_ref().map(|d| d.0.clone())
+                    f.destination().display(),
+                    f.kind().as_str(),
+                    f.sha256().as_ref().map(|d| d.0.clone())
                 )
             })
             .collect::<Vec<_>>()
@@ -281,9 +284,9 @@ fn runtime_policy_entries_carry_a_reason() {
     .unwrap();
 
     let destinations: Vec<String> = plan
-        .files
+        .files()
         .iter()
-        .map(|f| f.destination.display().to_string())
+        .map(|f| f.destination().display().to_string())
         .collect();
     for expected in ["/tmp", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] {
         assert!(
@@ -292,11 +295,11 @@ fn runtime_policy_entries_carry_a_reason() {
         );
     }
     let tmp = plan
-        .files
+        .files()
         .iter()
-        .find(|f| f.destination == Path::new("/tmp"))
+        .find(|f| f.destination() == Path::new("/tmp"))
         .unwrap();
-    assert_eq!(tmp.mode, 0o1777);
+    assert_eq!(tmp.mode(), 0o1777);
 }
 
 #[test]
@@ -353,25 +356,25 @@ fn the_allow_list_governs_the_application_not_the_runtime_policy() {
 /// The generated cache, parsed back the way the loader would read it.
 fn bundled_cache(plan: &elfpak_core::BundlePlan) -> Option<elfpak_core::LdCache> {
     let file = plan
-        .files
+        .files()
         .iter()
-        .find(|f| f.destination == Path::new("/etc/ld.so.cache"))?;
+        .find(|f| f.destination() == Path::new("/etc/ld.so.cache"))?;
     assert_eq!(
         f_reason(file),
         "runtime policy: ld-so-cache",
         "the cache carries its own reason"
     );
     assert_eq!(
-        file.sha256,
+        file.sha256().cloned(),
         Some(elfpak_core::hash::sha256_bytes(
-            file.content.as_ref().expect("generated content")
+            file.content().expect("generated content")
         ))
     );
-    Some(elfpak_core::LdCache::parse(file.content.as_ref().unwrap()))
+    Some(elfpak_core::LdCache::parse(file.content().unwrap()))
 }
 
 fn f_reason(file: &elfpak_core::PlannedFile) -> String {
-    match &file.reason {
+    match file.reason() {
         elfpak_core::InclusionReason::RuntimePolicy { feature } => {
             format!("runtime policy: {}", feature.as_str())
         }
@@ -393,14 +396,14 @@ fn a_library_outside_the_loader_path_gets_a_cache_that_finds_it() {
         "the loader can find the library at its bundled path"
     );
     assert!(
-        !plan.warnings.iter().any(|w| w.code == "E2005"),
+        !plan.warnings().iter().any(|w| w.code == "E2005"),
         "nothing to warn about once the cache exists: {:?}",
-        plan.warnings
+        plan.warnings()
     );
 
     // Every other shared object is in there too, so the cache is a complete
     // description of the bundle rather than a patch for one library.
-    for node in plan.graph.shared_objects() {
+    for node in plan.graph().shared_objects() {
         let soname = node.soname.clone().unwrap();
         assert_eq!(
             cache.lookup(&soname),
@@ -424,7 +427,7 @@ fn a_closure_the_loader_can_already_find_gets_no_cache() {
     // cache would put a file in the image for no reason.
     let plan = plan_for(&sysroot, "/bin/app-default");
     assert!(bundled_cache(&plan).is_none(), "no cache was needed");
-    assert!(!plan.warnings.iter().any(|w| w.code == "E2005"));
+    assert!(!plan.warnings().iter().any(|w| w.code == "E2005"));
 }
 
 #[test]
@@ -464,10 +467,10 @@ fn the_cache_can_be_forced_on_or_off() {
     .unwrap();
     assert!(bundled_cache(&suppressed).is_none());
     let warning = suppressed
-        .warnings
+        .warnings()
         .iter()
         .find(|w| w.code == "E2005")
-        .unwrap_or_else(|| panic!("expected E2005, got {:?}", suppressed.warnings));
+        .unwrap_or_else(|| panic!("expected E2005, got {:?}", suppressed.warnings()));
     assert!(
         warning
             .details
@@ -490,7 +493,7 @@ fn a_relocated_origin_relative_executable_gets_a_cache() {
         [PathBuf::from("/opt/origin/lib/libor.so.1")],
         "the cache keeps the relocated executable working"
     );
-    assert!(!moved.warnings.iter().any(|w| w.code == "E2006"));
+    assert!(!moved.warnings().iter().any(|w| w.code == "E2006"));
 
     // Installed where it already lives, the relative paths still hold and
     // nothing has to be generated.
@@ -517,10 +520,10 @@ fn a_relocated_origin_relative_executable_gets_a_cache() {
     .plan()
     .unwrap();
     let warning = suppressed
-        .warnings
+        .warnings()
         .iter()
         .find(|w| w.code == "E2006")
-        .unwrap_or_else(|| panic!("expected E2006, got {:?}", suppressed.warnings));
+        .unwrap_or_else(|| panic!("expected E2006, got {:?}", suppressed.warnings()));
     assert!(warning.message.contains("/opt/origin/bin"), "{warning:?}");
     assert!(warning.details.iter().any(|d| d.contains("$ORIGIN/../lib")));
 }

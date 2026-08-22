@@ -300,10 +300,34 @@ error[E5001]:
 * `/etc/ld.so.cache`, parsed directly in both the historical and the current
   format; `ldconfig` is never invoked
 * `/etc/ld.so.conf`, including `include` globs
-* architecture-specific default directories and `glibc-hwcaps` subdirectories
+* architecture-specific default directories; CPU-specific `glibc-hwcaps`
+  variants are deliberately not selected because a sysroot does not identify
+  the deployment CPU
 * `DF_1_NODEFLIB`
 * architecture, ELF class and endianness validation of every candidate, so a
   file that merely has the right name can never satisfy a lookup
+
+For a bare soname, lookup follows this order. A `DT_NEEDED` value containing a
+slash bypasses the search and is resolved as an absolute logical path after
+token expansion.
+
+```mermaid
+flowchart TD
+    Needed["bare DT_NEEDED soname"] --> RPath["1. inherited DT_RPATH chain<br/>(requester's RPATH omitted when its RUNPATH is authoritative)"]
+    RPath -->|"otherwise"| LibraryPath["2. --library-path"]
+    LibraryPath -->|"otherwise"| RunPath["3. requester's DT_RUNPATH"]
+    RunPath -->|"otherwise"| Cache["4. /etc/ld.so.cache"]
+    Cache -->|"otherwise"| NoDefault{"DF_1_NODEFLIB?"}
+    NoDefault -->|"yes"| Missing["unresolved library"]
+    NoDefault -->|"no"| Configured["5a. ld.so.conf directories"]
+    Configured -->|"otherwise"| BuiltIn["5b. architecture defaults"]
+    BuiltIn -->|"otherwise"| Missing
+```
+
+At every step, a candidate must be a shared ELF object with the expected
+architecture, class and endianness; the first compatible candidate ends the
+search. An incompatible candidate is remembered for the final diagnostic while
+lookup continues.
 
 Original paths and symlink structure are preserved: `libfoo.so.1 ->
 libfoo.so.1.4.2` stays a symlink, `/lib -> usr/lib` stays a symlink, and
@@ -433,7 +457,8 @@ Supported target architectures are x86_64 and aarch64. Anything else fails with
 * does not contact the network
 * does not invoke Docker
 * treats the source filesystem as read-only
-* writes only beneath `--output`
+* writes only to requested artifact paths and their temporary siblings,
+  creating missing artifact parent directories when needed
 * records every included file and why
 
 Each directory, tar, and manifest artifact is assembled in a sibling temporary
@@ -444,6 +469,31 @@ published sequentially; a later failure can therefore leave already-published
 earlier artifacts new. Re-run the command after correcting the failure rather
 than treating a mixed set as a verified release. With `--clean`, the previous
 rootfs is likewise kept until its replacement is ready.
+
+```mermaid
+sequenceDiagram
+    participant CLI as bundle command
+    participant Planner as Planner
+    participant Rootfs as rootfs destination
+    participant Tar as tar destination
+    participant Manifest as manifest destination
+
+    CLI->>Planner: discover and validate without writing
+    Planner-->>CLI: complete immutable BundlePlan
+    opt --output requested
+        CLI->>Rootfs: build in sibling stage
+        CLI->>Rootfs: publish completed directory
+    end
+    opt --tar requested
+        CLI->>Tar: build in sibling stage
+        CLI->>Tar: publish completed archive
+    end
+    opt manifest enabled
+        CLI->>Manifest: write in sibling stage
+        CLI->>Manifest: publish completed manifest
+    end
+    Note over Rootfs,Manifest: Each artifact is atomic, but the set is published sequentially
+```
 
 Output is deterministic for the same application binary, source root,
 configuration and `elfpak` version: entries are ordered by destination, file
@@ -463,7 +513,7 @@ written — a leftover symlink is never followed out of the output root.
 
 ```text
 crates/elfpak/        CLI: argument parsing, config loading, rendering
-crates/elfpak-core/   library: elf, graph, resolver, plan, rootfs, manifest
+crates/elfpak-core/   library: elf, resolver, graph, policy, plan, rootfs, manifest
 fixtures/axum-server/ integration fixture: a real Axum service
 fixtures/musl-hello/  integration fixture: a musl-linked program
 fixtures/vendor-lib/  integration fixture: a library outside the loader's path
@@ -478,8 +528,9 @@ around it: `lib.rs` dispatches, one module per subcommand does the work.
 
 Inside `elfpak-core` the dependencies run one way: `elf` and `source` read the
 world, `resolver` turns a soname into a file, `graph` records what was found and
-why, `plan` turns that into a `BundlePlan`, and `rootfs` writes one. `plan` is
-the only module that decides anything, and nothing downstream of it re-resolves.
+why, top-level `policy` supplies explicit runtime choices, `plan` turns those
+inputs into a `BundlePlan`, and `rootfs` writes one. `plan` is the only module
+that decides output membership, and nothing downstream of it re-resolves.
 `diagnostics` sits beside them all and owns every code the CLI prints.
 
 Base images are pinned by tag and digest, and no build step installs packages

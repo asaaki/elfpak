@@ -3,7 +3,7 @@
 use crate::{
     elf::Architecture,
     error::{Error, Result},
-    rootfs::policy::RuntimeFeature,
+    policy::RuntimeFeature,
     source::SymlinkEntry,
 };
 use serde::{Deserialize, Serialize};

@@ -1,8 +1,8 @@
 //! Runtime and dependency policy, assembled from the preset, the configuration
 //! file and the flags, in that order of precedence.
 
-use crate::cli::BundleArgs;
-use elfpak_core::{CachePolicy, DependencyPolicy, Preset, RuntimePolicy, UserSpec, config::Config};
+use crate::{cli::BundleArgs, config::Config};
+use elfpak_core::{CachePolicy, DependencyPolicy, Preset, RuntimePolicy, UserSpec};
 
 /// The preset, then every feature the caller switched on its own.
 pub(crate) fn runtime_policy(

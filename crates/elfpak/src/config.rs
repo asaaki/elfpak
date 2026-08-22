@@ -1,76 +1,76 @@
 //! Optional `elfpak.toml`. CLI arguments always override the file, and the tool
 //! stays fully usable without one.
 
-use crate::{
-    error::{Error, Result, io},
-    rootfs::policy::Preset,
-};
+use elfpak_core::{Error, Preset, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Name of the configuration file discovered beside the working directory.
-pub const CONFIG_NAME_DEFAULT: &str = "elfpak.toml";
+const CONFIG_NAME_DEFAULT: &str = "elfpak.toml";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
+pub(crate) struct Config {
     #[serde(default)]
-    pub package: PackageConfig,
+    pub(crate) package: PackageConfig,
     #[serde(default)]
-    pub runtime: RuntimeConfig,
+    pub(crate) runtime: RuntimeConfig,
     #[serde(default)]
-    pub include: IncludeConfig,
+    pub(crate) include: IncludeConfig,
     #[serde(default)]
-    pub dependencies: DependencyConfig,
+    pub(crate) dependencies: DependencyConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PackageConfig {
-    pub binary: Option<PathBuf>,
-    pub install: Option<PathBuf>,
-    pub output: Option<PathBuf>,
-    pub tar: Option<PathBuf>,
-    pub root: Option<PathBuf>,
+pub(crate) struct PackageConfig {
+    pub(crate) binary: Option<PathBuf>,
+    pub(crate) install: Option<PathBuf>,
+    pub(crate) output: Option<PathBuf>,
+    pub(crate) tar: Option<PathBuf>,
+    pub(crate) root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimeConfig {
-    pub preset: Option<Preset>,
-    pub user: Option<String>,
-    pub ca_certificates: Option<bool>,
-    pub tmp: Option<bool>,
-    pub passwd_group: Option<bool>,
-    pub nsswitch: Option<bool>,
-    pub tzdata: Option<bool>,
+pub(crate) struct RuntimeConfig {
+    pub(crate) preset: Option<Preset>,
+    pub(crate) user: Option<String>,
+    pub(crate) ca_certificates: Option<bool>,
+    pub(crate) tmp: Option<bool>,
+    pub(crate) passwd_group: Option<bool>,
+    pub(crate) nsswitch: Option<bool>,
+    pub(crate) tzdata: Option<bool>,
     /// `true` always writes a cache, `false` never does; left out, the planner
     /// writes one exactly when the closure needs it.
-    pub ld_so_cache: Option<bool>,
+    pub(crate) ld_so_cache: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct IncludeConfig {
+pub(crate) struct IncludeConfig {
     #[serde(default)]
-    pub paths: Vec<PathBuf>,
+    pub(crate) paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DependencyConfig {
-    pub allow: Option<Vec<String>>,
+pub(crate) struct DependencyConfig {
+    pub(crate) allow: Option<Vec<String>>,
 }
 
 impl Config {
-    pub fn parse(text: &str) -> Result<Config> {
+    pub(crate) fn parse(text: &str) -> Result<Config> {
         toml::from_str(text).map_err(|e| Error::Config {
             message: e.to_string(),
         })
     }
 
-    pub fn load(path: &Path) -> Result<Config> {
-        let text = std::fs::read_to_string(path).map_err(|e| io(path, e))?;
+    pub(crate) fn load(path: &Path) -> Result<Config> {
+        let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let mut config = Config::parse(&text).map_err(|e| match e {
             Error::Config { message } => Error::Config {
                 message: format!("{}: {message}", path.display()),
@@ -90,7 +90,7 @@ impl Config {
     }
 
     /// Load `elfpak.toml` from `dir` if it exists. A missing file is not an error.
-    pub fn discover(dir: &Path) -> Result<Option<(PathBuf, Config)>> {
+    pub(crate) fn discover(dir: &Path) -> Result<Option<(PathBuf, Config)>> {
         let candidate = dir.join(CONFIG_NAME_DEFAULT);
         if !candidate.is_file() {
             return Ok(None);

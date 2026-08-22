@@ -9,8 +9,17 @@ loader would, and package that closure for a `FROM scratch` container.
 narrowly focused on turning a compiled binary plus the filesystem it was built
 against into a deterministic minimal rootfs.
 
-```text
-cargo build → ELF binary → elfpak → minimal rootfs → FROM scratch
+```mermaid
+flowchart TB
+    Build["cargo build"] --> Binary["ELF binary"]
+    Binary --> Bundle["elfpak bundle"]
+    Bundle --> Rootfs["minimal rootfs directory"]
+    Bundle --> Tar["deterministic rootfs tar"]
+    Bundle --> Manifest["manifest"]
+    Rootfs --> Scratch["FROM scratch"]
+    Tar --> Scratch
+    Rootfs --> Verify["elfpak verify"]
+    Manifest --> Verify
 ```
 
 ## Quick start
@@ -64,8 +73,9 @@ CA-specific code in the application; the system trust store comes along.
 
 * **Loader semantics, not filename matching.** `PT_INTERP`, recursive
   `DT_NEEDED`, `DT_RPATH` inheritance versus `DT_RUNPATH`, `$ORIGIN`/`$LIB`/
-  `$PLATFORM`, `ld.so.cache`, `ld.so.conf`, glibc-hwcaps, and architecture
-  validation of every candidate.
+  `$PLATFORM`, `ld.so.cache`, `ld.so.conf`, deliberate exclusion of unsafe
+  CPU-specific glibc-hwcaps variants, and architecture validation of every
+  candidate.
 * **Original paths and symlinks preserved.** `libfoo.so.1 -> libfoo.so.1.4.2`
   stays a symlink; nothing is relocated into a private directory with a
   compensating `LD_LIBRARY_PATH`. Where a library sits outside the directories
@@ -84,8 +94,9 @@ CA-specific code in the application; the system trust store comes along.
 
 `elfpak bundle` does not execute the target, does not call `ldd` or `ldconfig`,
 does not run shell commands, does not contact the network, and does not invoke
-Docker. It treats the source filesystem as read-only and writes only beneath
-`--output`.
+Docker. It treats the source filesystem as read-only and writes only to the
+requested directory, tar and manifest destinations and their temporary
+siblings.
 
 Output is deterministic for the same binary, source root, configuration and
 `elfpak` version.

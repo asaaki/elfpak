@@ -167,8 +167,10 @@ dependencies = [
  "anyhow",
  "clap",
  "elfpak-core",
+ "serde",
  "serde_json",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -183,7 +185,6 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
- "toml",
 ]
 
 [[package]]

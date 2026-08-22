@@ -1,8 +1,8 @@
 //! Where a bundle comes from and where it goes. Command line first, then the
 //! configuration file, then the documented default.
 
-use crate::cli::BundleArgs;
-use elfpak_core::{Error, config::Config, manifest::MANIFEST_NAME_DEFAULT};
+use crate::{cli::BundleArgs, config::Config};
+use elfpak_core::{Error, manifest::MANIFEST_NAME_DEFAULT};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
