@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/elfpak", "crates/elfpak-core"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
@@ -25,7 +25,8 @@ cast_lossless = "warn"
 undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
-elfpak-core = { path = "crates/elfpak-core", version = "0.1.0" }
+elfpak-core = { path = "crates/elfpak-core" }
+
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 goblin = { version = "0.10", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }
