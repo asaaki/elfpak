@@ -25,10 +25,19 @@ bump kind:
         exit 1
     fi
     git remote get-url origin >/dev/null
+    if ! command -v tomli >/dev/null; then
+        echo "release bumps require tomli (cargo binstall tomli)" >&2
+        exit 1
+    fi
 
-    current="$(sed -n 's/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' Cargo.toml | head -n 1)"
+    current="$(tomli query --strip-trailing-newline --filepath Cargo.toml workspace.package.version | tr -d '[:space:]\"')"
     if [[ ! "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
         echo "workspace version is missing or is not simple SemVer: ${current:-<missing>}" >&2
+        exit 1
+    fi
+    core_dependency_version="$(tomli query --strip-trailing-newline --filepath Cargo.toml workspace.dependencies.elfpak-core.version | tr -d '[:space:]\"')"
+    if [[ "$core_dependency_version" != "$current" ]]; then
+        echo "elfpak-core dependency version ${core_dependency_version:-<missing>} does not match workspace version $current" >&2
         exit 1
     fi
 
@@ -47,7 +56,13 @@ bump kind:
         exit 1
     fi
 
-    sed -i "0,/^version = \"$current\"$/s//version = \"$new_version\"/" Cargo.toml
+    manifest_next="$(mktemp --tmpdir=. .Cargo.toml.XXXXXX)"
+    trap 'rm -f "$manifest_next"' EXIT
+    tomli set --strip-trailing-newline workspace.package.version "$new_version" < Cargo.toml |
+        tomli set --strip-trailing-newline workspace.dependencies.elfpak-core.version "$new_version" > "$manifest_next"
+    chmod --reference=Cargo.toml "$manifest_next"
+    mv "$manifest_next" Cargo.toml
+    trap - EXIT
     cargo update --workspace --offline
 
     git add Cargo.toml Cargo.lock
