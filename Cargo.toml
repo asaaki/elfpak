@@ -25,7 +25,7 @@ cast_lossless = "warn"
 undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
-elfpak-core = { path = "crates/elfpak-core" }
+elfpak-core = { path = "crates/elfpak-core", version = "0.1.2" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
