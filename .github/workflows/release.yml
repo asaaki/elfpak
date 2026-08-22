@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Wait for CI workflow to succeed
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             let ciRun;
@@ -66,7 +66,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: version
         name: Ensure tag matches Cargo version
         shell: bash
@@ -89,7 +89,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
@@ -119,8 +119,8 @@ jobs:
             artifact: elfpak-aarch64-unknown-linux-musl
             directory: arm64
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
       - name: Export static binary from the distribution image
         run: >-
           docker buildx build
@@ -134,7 +134,7 @@ jobs:
           mkdir -p release-assets
           install -m 0755 "dist/${{ matrix.directory }}/elfpak" "release-assets/${{ matrix.artifact }}"
           sha256sum "release-assets/${{ matrix.artifact }}" > "release-assets/${{ matrix.artifact }}.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: release-assets/
@@ -145,16 +145,16 @@ jobs:
     needs: verify-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: metadata
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
@@ -164,7 +164,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -182,11 +182,12 @@ jobs:
       - publish-container
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
+          pattern: "!*.dockerbuild"
           path: release-assets
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: release-assets/*
