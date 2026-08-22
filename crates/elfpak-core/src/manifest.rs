@@ -6,7 +6,10 @@ use crate::{
     plan::{BundlePlan, InclusionReason, PlannedFileKind},
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 pub const MANIFEST_VERSION: u32 = 2;
 /// Name of the manifest written beside a bundle.
@@ -164,14 +167,22 @@ impl Manifest {
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
         let mut json = self.to_json();
         json.push('\n');
-        std::fs::write(path, json).map_err(|e| io(path, e))
+        let mut stage = tempfile::Builder::new()
+            .prefix(".elfpak-manifest-")
+            .tempfile_in(parent)
+            .map_err(|e| io(parent, e))?;
+        set_output_permissions(stage.path(), path)?;
+        stage.write_all(json.as_bytes()).map_err(|e| io(path, e))?;
+        stage.as_file().sync_all().map_err(|e| io(path, e))?;
+        stage.persist(path).map_err(|e| io(path, e.error))?;
+        Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Manifest> {
@@ -273,6 +284,15 @@ impl Manifest {
             .filter(|f| f.kind != PlannedFileKind::Directory.as_str())
             .count()
     }
+}
+
+fn set_output_permissions(stage: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = std::fs::metadata(destination)
+        .map(|metadata| metadata.permissions())
+        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o644));
+    std::fs::set_permissions(stage, permissions).map_err(|e| io(stage, e))
 }
 
 /// Check one entry against what the manifest recorded for it. `None` means the

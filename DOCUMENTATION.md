@@ -436,6 +436,12 @@ Supported target architectures are x86_64 and aarch64. Anything else fails with
 * writes only beneath `--output`
 * records every included file and why
 
+Directory, tar and manifest outputs are assembled in sibling temporary paths
+and published only after they are complete. If planning-time source validation
+or an output write fails, an existing artifact remains untouched and a partial
+new artifact is not exposed. With `--clean`, the previous rootfs is likewise
+kept until its replacement is ready.
+
 Output is deterministic for the same application binary, source root,
 configuration and `elfpak` version: entries are ordered by destination, file
 modes are normalized to `0755`/`0644`, and file *and directory* timestamps are

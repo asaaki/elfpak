@@ -16,9 +16,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
 tar.workspace = true
-tempfile.workspace = true

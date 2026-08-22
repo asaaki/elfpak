@@ -1,7 +1,8 @@
 //! Materialization of a [`BundlePlan`] into a directory tree.
 //!
-//! Nothing is written outside the output root, the source filesystem is only
-//! ever read, and no file appears that the plan did not list.
+//! Nothing is written outside the output root and the source filesystem is only
+//! ever read. A clean output contains only planned entries; without `clean`,
+//! pre-existing unplanned entries are deliberately retained.
 
 use crate::{
     error::{Error, Result, io},
@@ -37,24 +38,48 @@ impl RootFsBuilder {
         }
     }
 
-    /// Remove an existing output directory before writing.
+    /// Exclude an existing output directory from the staged replacement.
     pub fn clean(mut self, clean: bool) -> RootFsBuilder {
         self.clean = clean;
         self
     }
 
-    /// Materialize a plan: create, link and copy, in plan order.
+    /// Materialize a plan into a sibling staging directory, then publish it.
+    /// A failed build leaves an existing output untouched and exposes no new
+    /// output when the destination did not exist.
     pub fn apply(&self, plan: &BundlePlan) -> Result<RootFsReport> {
         guard_output(&self.output)?;
-        if self.clean && self.output.exists() {
-            guard_clean(&self.output)?;
-            std::fs::remove_dir_all(&self.output).map_err(|e| io(&self.output, e))?;
+        let parent = output_parent(&self.output);
+        std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+
+        let stage = tempfile::Builder::new()
+            .prefix(".elfpak-rootfs-")
+            .tempdir_in(parent)
+            .map_err(|e| io(parent, e))?;
+
+        if path_exists(&self.output) {
+            ensure_directory(&self.output)?;
         }
-        std::fs::create_dir_all(&self.output).map_err(|e| io(&self.output, e))?;
-        let output = self
-            .output
-            .canonicalize()
-            .map_err(|e| io(&self.output, e))?;
+        if path_exists(&self.output) && !self.clean {
+            clone_tree(&self.output, stage.path())?;
+        } else {
+            // Temporary directories start as 0700. The root of a generated
+            // filesystem should have the same normalized mode as its ordinary
+            // directory entries.
+            set_mode(stage.path(), 0o755)?;
+        }
+        if self.clean && path_exists(&self.output) {
+            guard_clean(&self.output)?;
+        }
+
+        let report = self.apply_into(plan, stage.path())?;
+        publish_directory(stage, &self.output)?;
+        Ok(report)
+    }
+
+    /// Apply a plan to an isolated directory that is not externally visible.
+    fn apply_into(&self, plan: &BundlePlan, output: &Path) -> Result<RootFsReport> {
+        let output = output.canonicalize().map_err(|e| io(output, e))?;
 
         let mut report = RootFsReport::default();
         // Entries are sorted by destination, so parents always precede children.
@@ -123,6 +148,116 @@ impl RootFsBuilder {
         }
         Ok(target)
     }
+}
+
+/// Parent used for sibling staging. A bare relative output such as `rootfs`
+/// lives beside a temporary directory in the current working directory.
+fn output_parent(output: &Path) -> &Path {
+    output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn ensure_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path).map_err(|e| io(path, e))?;
+    if metadata.is_dir() {
+        return Ok(());
+    }
+    Err(Error::Config {
+        message: format!("output `{}` is not a directory", path.display()),
+    })
+}
+
+/// Clone an existing output into the stage without following symlinks. Regular
+/// files are hard-linked because the stage is deliberately on the same
+/// filesystem; planned files are unlinked before replacement, so applying the
+/// plan cannot mutate the published tree through those links.
+fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
+    let mut stack = vec![(source.to_path_buf(), destination.to_path_buf())];
+    let mut directories = Vec::new();
+
+    while let Some((source_dir, destination_dir)) = stack.pop() {
+        let source_metadata = std::fs::metadata(&source_dir).map_err(|e| io(&source_dir, e))?;
+        directories.push((destination_dir.clone(), source_metadata));
+
+        for entry in std::fs::read_dir(&source_dir).map_err(|e| io(&source_dir, e))? {
+            let entry = entry.map_err(|e| io(&source_dir, e))?;
+            let source_path = entry.path();
+            let destination_path = destination_dir.join(entry.file_name());
+            let metadata =
+                std::fs::symlink_metadata(&source_path).map_err(|e| io(&source_path, e))?;
+
+            if metadata.is_symlink() {
+                let target = std::fs::read_link(&source_path).map_err(|e| io(&source_path, e))?;
+                std::os::unix::fs::symlink(target, &destination_path)
+                    .map_err(|e| io(&destination_path, e))?;
+            } else if metadata.is_dir() {
+                std::fs::create_dir(&destination_path).map_err(|e| io(&destination_path, e))?;
+                stack.push((source_path, destination_path));
+            } else if metadata.is_file() {
+                std::fs::hard_link(&source_path, &destination_path)
+                    .map_err(|e| io(&destination_path, e))?;
+            } else {
+                return Err(Error::Config {
+                    message: format!(
+                        "existing output contains unsupported entry `{}`",
+                        source_path.display()
+                    ),
+                });
+            }
+        }
+    }
+
+    // Creating children changes directory timestamps. Restore metadata from
+    // the bottom up after the complete snapshot has been assembled.
+    for (path, metadata) in directories.into_iter().rev() {
+        set_permissions_from(&path, &metadata)?;
+        set_times_from(&path, &metadata);
+    }
+    Ok(())
+}
+
+/// Replace the visible output only after the complete staged tree exists. An
+/// existing output is moved to a private backup so a failed publish can restore
+/// it; publishing a previously absent output is one atomic rename.
+fn publish_directory(stage: tempfile::TempDir, output: &Path) -> Result<()> {
+    let backup = if path_exists(output) {
+        let reservation = tempfile::Builder::new()
+            .prefix(".elfpak-backup-")
+            .tempdir_in(output_parent(output))
+            .map_err(|e| io(output, e))?;
+        let path = reservation.path().to_path_buf();
+        reservation.close().map_err(|e| io(&path, e))?;
+        std::fs::rename(output, &path).map_err(|e| io(output, e))?;
+        Some(path)
+    } else {
+        None
+    };
+
+    if let Err(error) = std::fs::rename(stage.path(), output) {
+        if let Some(backup) = &backup
+            && let Err(rollback) = std::fs::rename(backup, output)
+        {
+            return Err(Error::Config {
+                message: format!(
+                    "failed to publish `{}` ({error}) and failed to restore its backup `{}` ({rollback})",
+                    output.display(),
+                    backup.display()
+                ),
+            });
+        }
+        return Err(io(output, error));
+    }
+
+    if let Some(backup) = backup {
+        remove_existing(&backup)?;
+    }
+    Ok(())
 }
 
 /// Create a directory, replacing anything else that occupies the path —
@@ -266,6 +401,25 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 
     assert!(mode <= 0o7777);
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| io(path, e))
+}
+
+fn set_permissions_from(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    std::fs::set_permissions(path, metadata.permissions()).map_err(|e| io(path, e))
+}
+
+fn set_times_from(path: &Path, metadata: &std::fs::Metadata) {
+    let (Ok(accessed), Ok(modified), Ok(file)) = (
+        metadata.accessed(),
+        metadata.modified(),
+        std::fs::File::open(path),
+    ) else {
+        return;
+    };
+    let _ = file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(accessed)
+            .set_modified(modified),
+    );
 }
 
 /// Pin access and modification times. Not every filesystem supports this, and

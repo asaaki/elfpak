@@ -37,13 +37,18 @@ impl TarBuilder {
     }
 
     pub fn apply(&self, plan: &BundlePlan) -> Result<TarReport> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-        }
-        let file = std::fs::File::create(&self.path).map_err(|e| io(&self.path, e))?;
-        let mut writer = tar::Builder::new(std::io::BufWriter::new(file));
+        let parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+        let mut stage = tempfile::Builder::new()
+            .prefix(".elfpak-tar-")
+            .tempfile_in(parent)
+            .map_err(|e| io(parent, e))?;
+        set_output_permissions(stage.path(), &self.path)?;
+        let mut writer = tar::Builder::new(std::io::BufWriter::new(stage.as_file_mut()));
         // Long paths and link targets get GNU extension records rather than
         // being silently truncated.
         writer.mode(tar::HeaderMode::Complete);
@@ -85,11 +90,13 @@ impl TarBuilder {
             }
         }
 
+        writer.finish().map_err(|e| io(&self.path, e))?;
         writer
             .into_inner()
             .map_err(|e| io(&self.path, e))?
             .flush()
             .map_err(|e| io(&self.path, e))?;
+        stage.as_file().sync_all().map_err(|e| io(&self.path, e))?;
 
         let entries = report.files + report.directories + report.symlinks;
         assert_eq!(
@@ -97,8 +104,20 @@ impl TarBuilder {
             plan.files.len(),
             "every entry is archived"
         );
+        stage
+            .persist(&self.path)
+            .map_err(|e| io(&self.path, e.error))?;
         Ok(report)
     }
+}
+
+fn set_output_permissions(stage: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = std::fs::metadata(destination)
+        .map(|metadata| metadata.permissions())
+        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o644));
+    std::fs::set_permissions(stage, permissions).map_err(|e| io(stage, e))
 }
 
 /// A header with ownership and timestamp pinned.

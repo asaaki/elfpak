@@ -90,6 +90,10 @@ Docker. It treats the source filesystem as read-only and writes only beneath
 Output is deterministic for the same binary, source root, configuration and
 `elfpak` version.
 
+Directory, tar and manifest outputs are staged beside their destinations and
+published only when complete, so a failed build leaves the previous artifact
+intact instead of exposing partial output.
+
 ## Documentation
 
 [DOCUMENTATION.md](DOCUMENTATION.md) covers the full CLI, runtime policy,

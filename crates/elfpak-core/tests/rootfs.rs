@@ -207,6 +207,27 @@ fn clean_replaces_a_previous_rootfs() {
 }
 
 #[test]
+fn non_clean_build_preserves_unplanned_files() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+    std::fs::create_dir_all(rootfs.join("stale")).unwrap();
+    std::fs::write(rootfs.join("stale/file"), b"keep").unwrap();
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
+
+    assert_eq!(std::fs::read(rootfs.join("stale/file")).unwrap(), b"keep");
+    assert!(rootfs.join("app/server").is_file());
+}
+
+#[test]
 fn statically_linked_binaries_bundle_to_just_themselves() {
     if !have_cc() {
         return;
@@ -536,6 +557,9 @@ fn materialization_rejects_a_source_file_changed_after_planning() {
     let Some(sysroot) = sysroot() else { return };
     let output = tempfile::tempdir().unwrap();
     let rootfs = output.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    std::fs::write(rootfs.join("previous"), b"previous rootfs").unwrap();
+    let rootfs_before = snapshot(&rootfs);
     let binary = sysroot.path("/bin/app-default");
     let plan = Planner::new(SourceRoot::new(&sysroot.root), &binary)
         .install_as("/app/server")
@@ -543,18 +567,60 @@ fn materialization_rejects_a_source_file_changed_after_planning() {
         .unwrap();
 
     std::fs::write(&binary, b"changed after planning").unwrap();
-    let error = RootFsBuilder::new(&rootfs).apply(&plan).unwrap_err();
+    let error = RootFsBuilder::new(&rootfs)
+        .clean(true)
+        .apply(&plan)
+        .unwrap_err();
+    assert!(matches!(error, elfpak_core::Error::SourceChanged { .. }));
+    assert_eq!(
+        snapshot(&rootfs),
+        rootfs_before,
+        "a failed clean build must leave the previous rootfs untouched"
+    );
+    assert_eq!(
+        std::fs::read(rootfs.join("previous")).unwrap(),
+        b"previous rootfs"
+    );
+
+    let absent_rootfs = output.path().join("absent-rootfs");
+    let error = RootFsBuilder::new(&absent_rootfs).apply(&plan).unwrap_err();
     assert!(matches!(error, elfpak_core::Error::SourceChanged { .. }));
     assert!(
-        !rootfs.join("app/server").exists(),
-        "the mismatched file must not be left in the rootfs"
+        !absent_rootfs.exists(),
+        "a failed build must not publish a partial new rootfs"
     );
 
     let archive = output.path().join("bundle.tar");
+    std::fs::write(&archive, b"previous archive").unwrap();
     let error = elfpak_core::TarBuilder::new(&archive)
         .apply(&plan)
         .unwrap_err();
     assert!(matches!(error, elfpak_core::Error::SourceChanged { .. }));
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        b"previous archive",
+        "a failed build must not truncate the previous archive"
+    );
+
+    let absent_archive = output.path().join("absent.tar");
+    let error = elfpak_core::TarBuilder::new(&absent_archive)
+        .apply(&plan)
+        .unwrap_err();
+    assert!(matches!(error, elfpak_core::Error::SourceChanged { .. }));
+    assert!(
+        !absent_archive.exists(),
+        "a failed build must not publish a partial new archive"
+    );
+
+    let temporary_outputs: Vec<_> = std::fs::read_dir(output.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".elfpak-"))
+        .collect();
+    assert!(
+        temporary_outputs.is_empty(),
+        "failed builds clean up their staging paths"
+    );
 }
 
 #[test]
