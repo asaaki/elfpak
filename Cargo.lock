@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-elfpak"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "elfpak"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "elfpak-core"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "goblin",
  "rustix",
