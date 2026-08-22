@@ -3,7 +3,7 @@
 # Distribution image for the elfpak utility itself: a single static binary that
 # can be copied into any builder image.
 #
-#   FROM ghcr.io/example/elfpak:0.1 AS elfpak
+#   FROM ghcr.io/<your-GitHub-owner>/elfpak:0.1 AS elfpak
 #   COPY --from=elfpak /elfpak /usr/local/bin/elfpak
 #
 # Build all supported architectures at once:

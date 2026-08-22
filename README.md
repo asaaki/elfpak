@@ -27,7 +27,7 @@ flowchart TB
 ```dockerfile
 # syntax=docker/dockerfile:1
 
-FROM ghcr.io/example/elfpak:0.1 AS elfpak
+FROM ghcr.io/<your-GitHub-owner>/elfpak:0.1 AS elfpak
 
 FROM rust:1.97.1-slim-trixie AS build
 WORKDIR /src
@@ -135,3 +135,21 @@ architecture never needs emulation.
 Roadmap 0.1/0.2 is implemented for x86_64 and aarch64, along with tar output,
 loader-oracle tests against real glibc, and parser fuzzing. OCI output, runtime
 tracing (`elfpak trace`) and SBOM generation are not implemented yet.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+## Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
