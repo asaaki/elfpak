@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
   packages: write
 
 env:
@@ -15,8 +16,52 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  wait-for-ci:
+    name: Wait for CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CI workflow to succeed
+        uses: actions/github-script@v8
+        with:
+          script: |
+            let ciRun;
+
+            // CI and Release start from the same tag push. Give GitHub time to
+            // register the CI run before treating its absence as a failure.
+            for (let attempt = 0; attempt < 30; attempt += 1) {
+              const workflows = await github.rest.actions.listWorkflowRunsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                event: 'push',
+                head_sha: context.sha,
+              });
+
+              ciRun = workflows.data.workflow_runs.find(run => run.name === 'CI');
+              if (ciRun) break;
+              await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+
+            if (!ciRun) {
+              throw new Error(`CI workflow not found for commit ${context.sha}`);
+            }
+
+            while (ciRun.status !== 'completed') {
+              await new Promise(resolve => setTimeout(resolve, 10000));
+              const workflow = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: ciRun.id,
+              });
+              ciRun = workflow.data;
+            }
+
+            if (ciRun.conclusion !== 'success') {
+              throw new Error(`CI workflow failed with conclusion: ${ciRun.conclusion}`);
+            }
+
   verify-version:
     name: Verify release tag
+    needs: wait-for-ci
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

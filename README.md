@@ -27,7 +27,7 @@ flowchart TB
 ```dockerfile
 # syntax=docker/dockerfile:1
 
-FROM ghcr.io/<your-GitHub-owner>/elfpak:0.1 AS elfpak
+FROM ghcr.io/asaaki/elfpak:0.1 AS elfpak
 
 FROM rust:1.97.1-slim-trixie AS build
 WORKDIR /src
