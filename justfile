@@ -2,6 +2,61 @@
 default:
     @just --list
 
+# Bump the workspace version, commit it, create an annotated tag, and push it.
+bump kind:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    bump_kind="{{ kind }}"
+    case "$bump_kind" in
+        major|minor|patch) ;;
+        *)
+            echo "usage: just bump <major|minor|patch>" >&2
+            exit 2
+            ;;
+    esac
+
+    if [[ "$(git branch --show-current)" != "main" ]]; then
+        echo "release bumps must be made from the main branch" >&2
+        exit 1
+    fi
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo "release bumps require a clean worktree" >&2
+        exit 1
+    fi
+    git remote get-url origin >/dev/null
+
+    current="$(sed -n 's/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' Cargo.toml | head -n 1)"
+    if [[ ! "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        echo "workspace version is missing or is not simple SemVer: ${current:-<missing>}" >&2
+        exit 1
+    fi
+
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    patch="${BASH_REMATCH[3]}"
+    case "$bump_kind" in
+        major) new_version="$((major + 1)).0.0" ;;
+        minor) new_version="$major.$((minor + 1)).0" ;;
+        patch) new_version="$major.$minor.$((patch + 1))" ;;
+    esac
+
+    tag="v$new_version"
+    if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+        echo "tag $tag already exists" >&2
+        exit 1
+    fi
+
+    sed -i "0,/^version = \"$current\"$/s//version = \"$new_version\"/" Cargo.toml
+    cargo update --workspace --offline
+
+    git add Cargo.toml Cargo.lock
+    git commit -S -m "Release $tag"
+    git tag -s "$tag" -m "Release $tag"
+    git push origin main --follow-tags
+
+    echo "Released $tag"
+
 # Format, lint at the strictest setting, and run every test.
 check: fmt-check lint test
 
