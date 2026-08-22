@@ -4,6 +4,7 @@ Reference for `elfpak`. See [README.md](README.md) for the short version.
 
 - [Commands](#commands)
   - [`cargo elfpak bundle`](#cargo-elfpak-bundle)
+  - [OCI image output](#oci-image-output)
 - [Presets and runtime policy](#presets-and-runtime-policy)
 - [Configuration file](#configuration-file)
 - [Dependency policy](#dependency-policy)
@@ -24,6 +25,14 @@ elfpak inspect <binary> [--root <sysroot>] [--library-path <dir>] [--json]
 elfpak bundle <binary>...
     --output <dir>            where the rootfs directory is written
     --tar <file>              where the rootfs tar archive is written
+    --oci-layout <dir>        where an OCI image layout is written
+    --oci-archive <file>      where a tarred OCI image layout is written
+    --image-tag <tag>         local name in the OCI index (default: latest)
+    --entrypoint <arg>        OCI entrypoint argument (repeatable)
+    --cmd <arg>               OCI default command argument (repeatable)
+    --working-dir <dir>       OCI process working directory (default: /)
+    --env <key=value>         OCI environment entry (repeatable)
+    --label <key=value>       OCI image label (repeatable)
     --install <path>          path of the executable inside the rootfs
     --install-dir <dir>       directory for executables, preserving their names
     --root <sysroot>          logical / used for dependency lookup (default: /)
@@ -40,8 +49,8 @@ elfpak bundle <binary>...
 elfpak verify <manifest> [--rootfs <dir>] [--strict]
 ```
 
-At least one of `--output` and `--tar` is required; giving both writes both from
-the same plan.
+At least one output flag is required. Any combination of `--output`, `--tar`,
+`--oci-layout`, and `--oci-archive` writes from the same immutable plan.
 
 Global flags: `-q/--quiet`, `-v`/`-vv` for verbosity. `-v` on `bundle` prints
 every planned file with the reason it was included.
@@ -185,6 +194,138 @@ byte-identical archive on every run.
 Symlinks are stored as symlink entries and directories keep their modes,
 including the sticky bit on `/tmp`.
 
+### OCI image output
+
+`--oci-layout` and `--oci-archive` produce a runnable OCI image without Docker,
+a daemon, network access, or registry credentials:
+
+```console
+$ cargo elfpak bundle --release --bin server \
+    --oci-layout dist/server.oci \
+    --oci-archive dist/server.oci.tar \
+    --install /app/server \
+    --image-tag ci \
+    --entrypoint /app/server \
+    --cmd --serve \
+    --working-dir /app \
+    --env RUST_LOG=info \
+    --label org.opencontainers.image.source=https://github.com/example/server
+```
+
+Each `--entrypoint` and `--cmd` occurrence supplies exactly one argument, so
+argument boundaries are preserved; leading-hyphen values such as `--serve` are
+accepted. `--env` and `--label` are repeatable `KEY=VALUE` entries. A single
+application defaults its entrypoint to its installed path. A multi-binary
+bundle must specify an entrypoint. The local tag defaults to `latest`, the
+working directory to `/`, and command, environment, and labels to empty.
+
+CLI scalar values override `[image]` scalars. A non-empty CLI collection
+replaces its complete TOML collection. OCI output paths follow the usual
+CLI-over-`[package]` precedence:
+
+```toml
+[package]
+binary = "target/release/server"
+install = "/app/server"
+oci_layout = "dist/server.oci"
+oci_archive = "dist/server.oci.tar"
+
+[image]
+tag = "ci"
+entrypoint = ["/app/server"]
+cmd = ["--serve"]
+working_dir = "/app"
+env = { RUST_LOG = "info" }
+labels = { "org.opencontainers.image.source" = "https://github.com/example/server" }
+```
+
+`--user <uid[:gid]>` continues to control generated identity files and also
+sets the OCI process user to the resolved numeric `uid:gid`. It does not change
+layer file ownership, which is normalized to `0:0`.
+
+The directory contains `oci-layout`, `index.json`, and content-addressed blobs
+under `blobs/sha256/`. The archive contains that complete layout; it is not the
+rootfs tar produced by `--tar` and must not be extracted at `/`. Both forms are
+single-platform (`linux/amd64` for x86_64 or `linux/arm64` for aarch64) with one
+uncompressed deterministic layer. Multi-platform index assembly, compression,
+and direct registry push are intentionally outside this interface.
+
+The local tag is part of transport syntax in the following examples:
+
+```console
+$ skopeo inspect oci:$PWD/dist/server.oci:ci
+$ skopeo inspect oci-archive:$PWD/dist/server.oci.tar:ci
+$ skopeo copy oci-archive:$PWD/dist/server.oci.tar:ci \
+    docker://ghcr.io/example/server:sha-0123456789abcdef
+
+$ oras cp --from-oci-layout \
+    $PWD/dist/server.oci:ci ghcr.io/example/server:latest
+
+$ podman run --rm oci-archive:$PWD/dist/server.oci.tar:ci --version
+
+$ ctr images import --base-name ghcr.io/example/server dist/server.oci.tar
+$ nerdctl load --input dist/server.oci.tar
+
+$ crane push dist/server.oci ghcr.io/example/server:latest
+```
+
+For ORAS, `oras cp --from-oci-layout` also accepts the layout tar. A generic
+`oras push server.oci.tar` instead uploads one opaque tar artifact and does not
+publish the runnable image graph. Crane's directory input is the OCI layout;
+use Skopeo or ORAS for an OCI layout archive.
+
+A minimal GitHub Actions flow builds and tests the Rust program before it
+packages, smoke-tests, and publishes the exact OCI archive to GHCR:
+
+```yaml
+name: CI
+on: [pull_request, push]
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install --yes skopeo podman
+      - run: cargo install cargo-elfpak --locked
+      - run: cargo test --workspace --all-targets --locked
+      - name: Build and test OCI image
+        env:
+          LOCAL_TAG: ci-${{ github.sha }}
+        run: |
+          mkdir -p dist
+          cargo elfpak bundle --release --locked --bin my-server \
+            --oci-archive dist/my-server.oci.tar \
+            --image-tag "$LOCAL_TAG" \
+            --install /app/my-server \
+            --entrypoint /app/my-server
+          skopeo inspect "oci-archive:${PWD}/dist/my-server.oci.tar:${LOCAL_TAG}"
+          podman run --rm \
+            "oci-archive:${PWD}/dist/my-server.oci.tar:${LOCAL_TAG}" --version
+      - name: Publish successful pushes
+        if: github.event_name == 'push'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOCAL_TAG: ci-${{ github.sha }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | skopeo login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          skopeo copy --all \
+            "oci-archive:${PWD}/dist/my-server.oci.tar:${LOCAL_TAG}" \
+            "docker://${IMAGE}:sha-${GITHUB_SHA}"
+```
+
+For stricter trust boundaries, split packaging and publication into separate
+jobs, transfer the tested archive as a workflow artifact, and grant
+`packages: write` only to the publish job.
+
 ## Presets and runtime policy
 
 ELF analysis can prove which shared objects a program loads. It cannot prove
@@ -227,8 +368,9 @@ code: the system trust store is exactly where the TLS stack already looks.
 Pinning a bundle explicitly in application code remains possible, but it is
 opt-in rather than a requirement.
 
-`--user` only records an identity in `passwd`/`group`. The container runtime
-still decides who the process runs as (`USER 65532:65532` in the Dockerfile).
+For rootfs and rootfs-tar consumers, `--user` records an identity in
+`passwd`/`group` but the container runtime still decides who runs the process.
+OCI output additionally records the numeric identity in its runtime config.
 
 ### When two features want the same path
 
@@ -556,7 +698,7 @@ deliberately invokes Cargo first and may therefore perform whatever
 local build work that Cargo requires; after Cargo reports the executable, the
 same standalone planning and output guarantees apply.
 
-Each directory, tar, and manifest artifact is assembled in a sibling temporary
+Each directory, tar, OCI, and manifest artifact is assembled in a sibling temporary
 path and published only after that artifact is complete. Existing directories
 are exchanged atomically when the filesystem supports it. Filesystems without
 atomic exchange, including WSL's Windows mounts, use a rollback-capable rename
@@ -620,6 +762,7 @@ fixtures/musl-hello/  integration fixture: a musl-linked program
 fixtures/vendor-lib/  integration fixture: a library outside the loader's path
 fuzz/                 cargo-fuzz targets for the parsing boundary
 tests/docker/         Docker smoke tests, one Dockerfile per scenario
+tests/oci/            daemonless Skopeo/Podman interoperability smoke test
 Dockerfile            static elfpak distribution image (FROM scratch)
 ```
 
@@ -681,6 +824,7 @@ $ tests/docker/smoke.sh verify     # `elfpak verify` as a build gate
 $ tests/docker/smoke.sh cross      # non-Rust cross-architecture packaging
 $ tests/docker/smoke.sh multi      # multiple inputs in one scratch image
 $ tests/docker/smoke.sh cargo-multi # cargo-elfpak multi-binary selectors
+$ just oci-smoke                    # OCI layout/archive via Skopeo and Podman
 
 $ tests/docker/smoke.sh --fresh    # remove the suite's images, build with --no-cache
 ```
@@ -810,10 +954,10 @@ and Cargo-subcommand CLIs, ELF
 parsing, architecture detection, full static closure,
 RPATH/RUNPATH/token/cache/conf resolution, path and symlink preservation,
 presets, manifest with recorded policy, hashes, dependency allow-list, `verify`
-including strict mode, deterministic directory and tar output, loader-oracle
-tests, parser fuzzing, and x86_64 + aarch64 support.
+including strict mode, deterministic directory, tar, and single-platform OCI
+output, loader-oracle tests, parser fuzzing, and x86_64 + aarch64 support.
 
-Not implemented yet, by design: OCI output, runtime tracing (`elfpak trace`),
-SBOM generation, and musl-specific behaviour beyond generic ELF parsing — which
-includes `/etc/ld-musl-<arch>.path`, the musl counterpart of the generated
-loader cache.
+Not implemented yet, by design: OCI multi-platform assembly, direct registry
+push, runtime tracing (`elfpak trace`), SBOM generation, and musl-specific
+behaviour beyond generic ELF parsing — including `/etc/ld-musl-<arch>.path`,
+the musl counterpart of the generated loader cache.

@@ -80,6 +80,48 @@ pub struct BundleArgs {
     #[arg(long, value_name = "FILE")]
     pub(crate) tar: Option<PathBuf>,
 
+    /// Write an OCI image layout directory
+    #[arg(long, value_name = "DIR")]
+    pub(crate) oci_layout: Option<PathBuf>,
+
+    /// Write an OCI image layout as a deterministic tar archive
+    #[arg(long, value_name = "FILE")]
+    pub(crate) oci_archive: Option<PathBuf>,
+
+    /// Reference name stored in the OCI image index
+    #[arg(long, value_name = "TAG")]
+    pub(crate) image_tag: Option<String>,
+
+    /// OCI entrypoint argument (repeatable)
+    #[arg(
+        long,
+        value_name = "ARG",
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true
+    )]
+    pub(crate) entrypoint: Vec<String>,
+
+    /// OCI command argument (repeatable)
+    #[arg(
+        long,
+        value_name = "ARG",
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true
+    )]
+    pub(crate) cmd: Vec<String>,
+
+    /// OCI process working directory
+    #[arg(long, value_name = "DIR")]
+    pub(crate) working_dir: Option<PathBuf>,
+
+    /// OCI environment entry (repeatable)
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    pub(crate) env: Vec<String>,
+
+    /// OCI image label (repeatable)
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    pub(crate) label: Vec<String>,
+
     /// Path of the executable inside the rootfs
     #[arg(long, conflicts_with = "install_dir")]
     pub(crate) install: Option<PathBuf>,

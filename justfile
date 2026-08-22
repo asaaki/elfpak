@@ -113,6 +113,10 @@ test:
 smoke *args:
     tests/docker/smoke.sh {{args}}
 
+# OCI interoperability smoke test; requires Skopeo and Podman, not Docker.
+oci-smoke:
+    tests/oci/smoke.sh
+
 # Parser fuzzing. Needs a nightly toolchain and cargo-fuzz.
 fuzz target="parse_elf" seconds="60":
     cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}}

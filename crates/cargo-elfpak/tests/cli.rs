@@ -244,6 +244,37 @@ fn builds_missing_and_stale_binaries_and_reuses_fresh_ones() {
 }
 
 #[test]
+fn oci_archive_options_build_the_cargo_binary_before_dry_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    let archive = tmp.path().join("image.tar");
+    write_binary_project(&project, "oci-fixture", "fn main() {}\n");
+
+    let output = cargo_elfpak(
+        &project,
+        &[
+            "bundle",
+            "--oci-archive",
+            archive.to_str().unwrap(),
+            "--install",
+            "/app/oci-fixture",
+            "--image-tag",
+            "ci-test",
+            "--entrypoint",
+            "/app/oci-fixture",
+            "--dry-run",
+            "--no-config",
+        ],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("built Cargo binary:"), "{text}");
+    assert!(text.contains("oci archive:"), "{text}");
+    assert!(!archive.exists());
+}
+
+#[test]
 fn package_selector_disambiguates_a_virtual_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("workspace");

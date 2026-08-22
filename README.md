@@ -15,9 +15,11 @@ flowchart TB
     Binary --> Bundle["elfpak bundle"]
     Bundle --> Rootfs["minimal rootfs directory"]
     Bundle --> Tar["deterministic rootfs tar"]
+    Bundle --> OCI["OCI image layout or archive"]
     Bundle --> Manifest["manifest"]
     Rootfs --> Scratch["FROM scratch"]
     Tar --> Scratch
+    OCI --> Registry["registry or daemonless runtime"]
     Rootfs --> Verify["elfpak verify"]
     Manifest --> Verify
 ```
@@ -86,8 +88,27 @@ elfpak bundle  <binary>... build a minimal rootfs plus a manifest
 elfpak verify  <manifest>  check a materialized rootfs against its manifest
 ```
 
-`bundle` writes a directory (`--output`), a deterministic tar archive
-(`--tar`, for `ADD rootfs.tar /`), or both from the same plan.
+`bundle` writes any combination of a directory (`--output`), deterministic
+rootfs tar (`--tar`, for `ADD rootfs.tar /`), OCI image layout
+(`--oci-layout`), and OCI layout archive (`--oci-archive`) from the same plan.
+
+Build a runnable image without Docker or a container daemon:
+
+```console
+$ cargo elfpak bundle --release --bin server \
+    --oci-archive dist/server.oci.tar \
+    --install /app/server \
+    --image-tag ci \
+    --entrypoint /app/server
+$ skopeo copy \
+    oci-archive:$PWD/dist/server.oci.tar:ci \
+    docker://ghcr.io/example/server:latest
+```
+
+Use `--oci-layout dist/server.oci` and `oci:$PWD/dist/server.oci:ci` for the
+directory form. The archive is a tar of an OCI layout, not a rootfs tar to
+extract at `/`. See [DOCUMENTATION.md](DOCUMENTATION.md#oci-image-output) for
+Skopeo, ORAS, Podman, nerdctl, Crane, and GHCR CI examples.
 
 Two presets: `minimal` is the ELF closure alone, `web` adds CA certificates,
 `/tmp`, `passwd`/`group` and `nsswitch.conf`. Every feature is also switchable
@@ -121,18 +142,20 @@ CA-specific code in the application; the system trust store comes along.
 
 `elfpak bundle` does not execute the target, does not call `ldd` or `ldconfig`,
 does not run shell commands, does not contact the network, and does not invoke
-Docker. It treats the source filesystem as read-only and writes only to the
-requested directory, tar and manifest destinations and their temporary
-siblings.
+Docker. OCI production is likewise daemonless. It treats the source filesystem
+as read-only and writes only to requested artifact destinations and their
+temporary siblings.
 
 Tar output is deterministic for the same binaries, source root, configuration
 and `elfpak` version. Set `SOURCE_DATE_EPOCH` to request pinned timestamps for
 planned files and directories; tar remains the portable byte-reproducible
 output.
 
-Directory, tar and manifest outputs are staged beside their destinations and
-published only when complete, so a failed build leaves the previous artifact
-intact instead of exposing partial output.
+Directory, tar, OCI, and manifest outputs are staged beside their destinations
+and published only when complete, so a failed build leaves the previous
+artifact intact instead of exposing partial output. OCI layouts use one
+uncompressed, deterministic layer and content-addressed config and manifest
+blobs.
 
 ## Documentation
 
@@ -147,6 +170,7 @@ $ just check              # fmt, clippy -D warnings, and the whole test suite
 $ just test               # unit, integration and loader-oracle tests
 $ just smoke              # Docker smoke tests (see DOCUMENTATION.md)
 $ just smoke --fresh      # ... with nothing reused from a previous run
+$ just oci-smoke          # Skopeo + Podman interoperability, no Docker
 
 $ cargo run -p cargo-elfpak -- bundle --help
 
@@ -163,9 +187,10 @@ architecture never needs emulation.
 
 ## Status
 
-Roadmap 0.1/0.2 is implemented for x86_64 and aarch64, along with tar output,
-loader-oracle tests against real glibc, and parser fuzzing. OCI output, runtime
-tracing (`elfpak trace`) and SBOM generation are not implemented yet.
+Rootfs, deterministic tar, and single-platform OCI image outputs are
+implemented for x86_64 and aarch64, along with loader-oracle tests against real
+glibc and parser fuzzing. Runtime tracing (`elfpak trace`), multi-platform OCI
+index assembly, direct registry push, and SBOM generation remain future work.
 
 ## License
 

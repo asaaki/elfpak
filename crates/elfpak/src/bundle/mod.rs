@@ -3,6 +3,7 @@
 //! The command itself is here; the pieces it assembles from arguments and
 //! configuration are one module each.
 
+mod image;
 mod outputs;
 pub(crate) mod paths;
 mod policy;
@@ -44,11 +45,26 @@ pub(crate) fn run(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()>
         .library_paths(args.library_paths.clone())
         .plan()?;
 
+    let image = if paths.oci_layout.is_some() || paths.oci_archive.is_some() {
+        let image = image::resolve(args, &config)?;
+        image.resolve(&plan)?;
+        Some(image)
+    } else {
+        None
+    };
+
     let manifest_path = manifest_path(args, &paths);
+    outputs::validate_output_layout(&paths, manifest_path.as_deref())?;
     let outputs = if args.dry_run {
         Outputs::default()
     } else {
-        write_outputs(args, &paths, &plan, manifest_path.as_deref())?
+        write_outputs(
+            args,
+            &paths,
+            &plan,
+            image.as_ref(),
+            manifest_path.as_deref(),
+        )?
     };
 
     verbosity.print(|out| {
@@ -59,6 +75,8 @@ pub(crate) fn run(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()>
             render::Destinations {
                 rootfs: paths.output.as_deref(),
                 tar: paths.tar.as_deref(),
+                oci_layout: paths.oci_layout.as_deref(),
+                oci_archive: paths.oci_archive.as_deref(),
                 manifest: manifest_path.as_deref(),
             },
             &outputs,

@@ -2,7 +2,9 @@
 
 use crate::{
     error::{Error, Result, io},
+    graph::Digest,
     hash::sha256_file,
+    oci::ResolvedImageConfig,
     plan::{BundlePlan, InclusionReason, PlannedFileKind},
 };
 use serde::{Deserialize, Serialize};
@@ -11,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const MANIFEST_VERSION: u32 = 3;
+pub const MANIFEST_VERSION: u32 = 4;
 const MANIFEST_SHA256_VERSION: u32 = 2;
 /// Name of the manifest written beside a bundle.
 pub const MANIFEST_NAME_DEFAULT: &str = "elfpak-manifest.json";
@@ -35,6 +37,15 @@ pub struct Manifest {
     /// Where the tar archive was written, when one was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tar: Option<String>,
+    /// Where an OCI image layout directory was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci_layout: Option<String>,
+    /// Where an OCI image layout archive was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci_archive: Option<String>,
+    /// Resolved OCI metadata and the published manifest digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ManifestImage>,
     /// Resolved runtime and dependency policy. Reproducing a bundle requires
     /// the same configuration, so the configuration is part of the record.
     #[serde(default)]
@@ -81,6 +92,49 @@ pub struct ManifestFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestImage {
+    pub tag: String,
+    pub os: String,
+    pub architecture: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    pub entrypoint: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmd: Vec<String>,
+    pub working_dir: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub manifest_digest: String,
+}
+
+impl ManifestImage {
+    pub fn from_oci(image: &ResolvedImageConfig, manifest_digest: &Digest) -> ManifestImage {
+        ManifestImage {
+            tag: image.tag().to_string(),
+            os: image.os().to_string(),
+            architecture: image.architecture().to_string(),
+            user: image.user().map(str::to_string),
+            entrypoint: image.entrypoint().to_vec(),
+            cmd: image.cmd().to_vec(),
+            working_dir: image.working_dir().to_string(),
+            env: image.env().to_vec(),
+            labels: image.labels().clone(),
+            manifest_digest: format!("sha256:{manifest_digest}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ManifestOutputs<'a> {
+    pub rootfs: Option<&'a Path>,
+    pub tar: Option<&'a Path>,
+    pub oci_layout: Option<&'a Path>,
+    pub oci_archive: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Reason {
     Simple(String),
@@ -108,7 +162,15 @@ impl From<&InclusionReason> for Reason {
 impl Manifest {
     /// A manifest of a plan, without recording where the bundle was written.
     pub fn from_plan(plan: &BundlePlan, source_root: &Path, rootfs: Option<&Path>) -> Manifest {
-        Manifest::from_plan_with_outputs(plan, source_root, rootfs, None)
+        Manifest::from_plan_with_artifacts(
+            plan,
+            source_root,
+            ManifestOutputs {
+                rootfs,
+                ..ManifestOutputs::default()
+            },
+            None,
+        )
     }
 
     pub fn from_plan_with_outputs(
@@ -116,6 +178,24 @@ impl Manifest {
         source_root: &Path,
         rootfs: Option<&Path>,
         tar: Option<&Path>,
+    ) -> Manifest {
+        Manifest::from_plan_with_artifacts(
+            plan,
+            source_root,
+            ManifestOutputs {
+                rootfs,
+                tar,
+                ..ManifestOutputs::default()
+            },
+            None,
+        )
+    }
+
+    pub fn from_plan_with_artifacts(
+        plan: &BundlePlan,
+        source_root: &Path,
+        outputs: ManifestOutputs<'_>,
+        image: Option<ManifestImage>,
     ) -> Manifest {
         let files: Vec<ManifestFile> = plan
             .files
@@ -142,8 +222,11 @@ impl Manifest {
             architecture: plan.architecture.machine.to_string(),
             interpreter: plan.interpreter().map(|p| p.display().to_string()),
             source_root: source_root.display().to_string(),
-            rootfs: rootfs.map(|p| p.display().to_string()),
-            tar: tar.map(|p| p.display().to_string()),
+            rootfs: outputs.rootfs.map(|p| p.display().to_string()),
+            tar: outputs.tar.map(|p| p.display().to_string()),
+            oci_layout: outputs.oci_layout.map(|p| p.display().to_string()),
+            oci_archive: outputs.oci_archive.map(|p| p.display().to_string()),
+            image,
             policy: ManifestPolicy {
                 preset: plan.preset.map(|p| p.to_string()),
                 ca_certificates: plan.runtime_policy.ca_certificates,
@@ -265,6 +348,36 @@ impl Manifest {
                 ));
             }
         }
+        self.validate_image(manifest_path)?;
+        Ok(())
+    }
+
+    fn validate_image(&self, manifest_path: &Path) -> Result<()> {
+        let has_oci_output = self.oci_layout.is_some() || self.oci_archive.is_some();
+        if self.manifest_version < 4 && (has_oci_output || self.image.is_some()) {
+            return Err(invalid_manifest(
+                manifest_path,
+                "OCI fields require manifest version 4".to_string(),
+            ));
+        }
+        if has_oci_output != self.image.is_some() {
+            return Err(invalid_manifest(
+                manifest_path,
+                "OCI destinations and image metadata must be recorded together".to_string(),
+            ));
+        }
+        if let Some(image) = &self.image {
+            let digest = image
+                .manifest_digest
+                .strip_prefix("sha256:")
+                .filter(|digest| is_sha256(digest));
+            if digest.is_none() {
+                return Err(invalid_manifest(
+                    manifest_path,
+                    "image manifest_digest must be sha256:<64 lowercase hex>".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -275,7 +388,7 @@ impl Manifest {
         if self.manifest_version >= 3 && self.binaries.is_empty() {
             return Err(invalid_manifest(
                 manifest_path,
-                "manifest version 3 requires a non-empty binaries list".to_string(),
+                "manifest version 3 or newer requires a non-empty binaries list".to_string(),
             ));
         }
         let binaries: Vec<&str> = if self.binaries.is_empty() {

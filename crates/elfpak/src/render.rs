@@ -50,6 +50,8 @@ impl Verbosity {
 pub(crate) struct Destinations<'a> {
     pub(crate) rootfs: Option<&'a Path>,
     pub(crate) tar: Option<&'a Path>,
+    pub(crate) oci_layout: Option<&'a Path>,
+    pub(crate) oci_archive: Option<&'a Path>,
     pub(crate) manifest: Option<&'a Path>,
 }
 
@@ -285,6 +287,12 @@ fn summary_destinations(
     }
     if let Some(tar) = destinations.tar {
         writeln!(out, "  tar:      {}{suffix}", tar.display())?;
+    }
+    if let Some(layout) = destinations.oci_layout {
+        writeln!(out, "  oci layout:  {}{suffix}", layout.display())?;
+    }
+    if let Some(archive) = destinations.oci_archive {
+        writeln!(out, "  oci archive: {}{suffix}", archive.display())?;
     }
     if let Some(manifest) = destinations.manifest {
         writeln!(out, "  manifest: {}{suffix}", manifest.display())?;

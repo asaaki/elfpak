@@ -6,6 +6,7 @@ pub mod error;
 pub mod graph;
 pub mod hash;
 pub mod manifest;
+pub mod oci;
 pub mod paths;
 pub mod plan;
 pub mod policy;
@@ -16,7 +17,10 @@ pub mod source;
 pub use elf::{Architecture, ElfClass, ElfMetadata, Endianness, Machine, ObjectType};
 pub use error::{Error, Result};
 pub use graph::{DependencyGraph, DependencyReason, Digest, Node, NodeKind};
-pub use manifest::{Manifest, VerifyReport};
+pub use manifest::{Manifest, ManifestImage, ManifestOutputs, VerifyReport};
+pub use oci::{
+    OciArchiveBuilder, OciImageConfig, OciLayoutBuilder, OciReport, ResolvedImageConfig,
+};
 pub use plan::{
     ApplicationPlan, BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Planner, Warning,
 };

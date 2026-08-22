@@ -4,7 +4,8 @@ mod common;
 
 use common::{Sysroot, have_cc};
 use elfpak_core::{
-    LdCache, Manifest, PlannedFileKind, Planner, RootFsBuilder, SourceRoot, manifest::VerifyOptions,
+    LdCache, Manifest, ManifestImage, ManifestOutputs, OciLayoutBuilder, PlannedFileKind, Planner,
+    RootFsBuilder, SourceRoot, manifest::VerifyOptions,
 };
 use std::{
     collections::BTreeMap,
@@ -486,6 +487,33 @@ fn tar_archive_describes_the_same_tree_as_the_directory() {
 }
 
 #[test]
+fn tar_stream_matches_the_file_builder() {
+    if !isolated_source_date_epoch("tar_stream_matches_the_file_builder", None) {
+        return;
+    }
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let archive = output.path().join("rootfs.tar");
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    let builder = elfpak_core::TarBuilder::new(&archive);
+
+    let file_report = builder.apply(&plan).unwrap();
+    let (stream, stream_report) = builder.write_to(Vec::new(), &plan).unwrap();
+
+    assert_eq!(stream, std::fs::read(&archive).unwrap());
+    assert_eq!(stream_report.files, file_report.files);
+    assert_eq!(stream_report.directories, file_report.directories);
+    assert_eq!(stream_report.symlinks, file_report.symlinks);
+    assert_eq!(stream_report.bytes, file_report.bytes);
+}
+
+#[test]
 fn tar_metadata_is_pinned_and_paths_are_relative() {
     if !isolated_source_date_epoch("tar_metadata_is_pinned_and_paths_are_relative", None) {
         return;
@@ -661,6 +689,91 @@ fn manifests_without_a_policy_section_still_load() {
     assert_eq!(manifest.files.len(), 1);
     assert!(manifest.policy.preset.is_none());
     assert!(!manifest.policy.tmp);
+}
+
+#[test]
+fn manifest_versions_one_through_three_load_without_oci_fields() {
+    let Some(sysroot) = sysroot() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    let manifest = Manifest::from_plan(&plan, &sysroot.root, None);
+
+    for version in 1..=3 {
+        let path = temp.path().join(format!("v{version}.json"));
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value["manifest_version"] = serde_json::json!(version);
+        let object = value.as_object_mut().unwrap();
+        object.remove("oci_layout");
+        object.remove("oci_archive");
+        object.remove("image");
+        if version < 3 {
+            object.remove("binaries");
+        }
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let loaded = Manifest::load(&path).unwrap();
+        assert_eq!(loaded.manifest_version, version);
+        assert!(loaded.oci_layout.is_none());
+        assert!(loaded.oci_archive.is_none());
+        assert!(loaded.image.is_none());
+    }
+}
+
+#[test]
+fn version_four_requires_consistent_oci_image_metadata() {
+    let Some(sysroot) = sysroot() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let layout = temp.path().join("image");
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    let report = OciLayoutBuilder::new(&layout).apply(&plan).unwrap();
+    let manifest = Manifest::from_plan_with_artifacts(
+        &plan,
+        &sysroot.root,
+        ManifestOutputs {
+            oci_layout: Some(&layout),
+            ..ManifestOutputs::default()
+        },
+        Some(ManifestImage::from_oci(
+            report.image(),
+            report.manifest_digest(),
+        )),
+    );
+    let valid = temp.path().join("valid.json");
+    manifest.write(&valid).unwrap();
+    Manifest::load(&valid).unwrap();
+
+    let mut cases = Vec::new();
+    let mut missing_destination = serde_json::to_value(&manifest).unwrap();
+    missing_destination
+        .as_object_mut()
+        .unwrap()
+        .remove("oci_layout");
+    cases.push((missing_destination, "destinations"));
+    let mut missing_image = serde_json::to_value(&manifest).unwrap();
+    missing_image.as_object_mut().unwrap().remove("image");
+    cases.push((missing_image, "metadata"));
+    let mut invalid_digest = serde_json::to_value(&manifest).unwrap();
+    invalid_digest["image"]["manifest_digest"] = serde_json::json!("sha256:ABC");
+    cases.push((invalid_digest, "manifest_digest"));
+
+    for (index, (value, expected)) in cases.into_iter().enumerate() {
+        let path = temp.path().join(format!("invalid-{index}.json"));
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let error = Manifest::load(&path).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 #[test]

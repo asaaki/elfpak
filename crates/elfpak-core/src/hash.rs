@@ -7,7 +7,7 @@ use crate::{
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
-    io::{BufRead, Read},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -76,6 +76,51 @@ impl<R: Read> Read for HashingReader<R> {
     }
 }
 
+/// A writer which records the digest and number of bytes accepted by its
+/// inner writer.
+#[derive(Debug)]
+pub struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+    size: u64,
+}
+
+impl<W> HashingWriter<W> {
+    pub fn new(inner: W) -> HashingWriter<W> {
+        HashingWriter {
+            inner,
+            hasher: Sha256::new(),
+            size: 0,
+        }
+    }
+
+    pub fn finish(self) -> (W, Digest, u64) {
+        (
+            self.inner,
+            Digest(crate::paths::hex(&self.hasher.finalize())),
+            self.size,
+        )
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        let written_u64 = u64::try_from(written)
+            .map_err(|_| std::io::Error::other("written byte count exceeds u64"))?;
+        self.size = self
+            .size
+            .checked_add(written_u64)
+            .ok_or_else(|| std::io::Error::other("written byte count exceeds u64"))?;
+        self.hasher.update(&buffer[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Fail when bytes copied from a source no longer match the plan.
 pub fn ensure_matches_plan(
     path: &Path,
@@ -128,6 +173,19 @@ impl DigestCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashing_writer_returns_the_written_bytes_digest_and_size() {
+        let mut writer = HashingWriter::new(Vec::new());
+        writer.write_all(b"first").unwrap();
+        writer.write_all(b"-second").unwrap();
+        writer.flush().unwrap();
+
+        let (bytes, digest, size) = writer.finish();
+        assert_eq!(bytes, b"first-second");
+        assert_eq!(size, 12);
+        assert_eq!(digest, sha256_bytes(b"first-second"));
+    }
 
     #[test]
     fn streaming_and_in_memory_hashing_agree() {

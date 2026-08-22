@@ -20,6 +20,8 @@ pub(crate) struct Paths {
     pub(crate) root: PathBuf,
     pub(crate) output: Option<PathBuf>,
     pub(crate) tar: Option<PathBuf>,
+    pub(crate) oci_layout: Option<PathBuf>,
+    pub(crate) oci_archive: Option<PathBuf>,
 }
 
 impl Paths {
@@ -30,9 +32,17 @@ impl Paths {
             .clone()
             .or_else(|| config.package.output.clone());
         let tar = args.tar.clone().or_else(|| config.package.tar.clone());
-        if output.is_none() && tar.is_none() {
+        let oci_layout = args
+            .oci_layout
+            .clone()
+            .or_else(|| config.package.oci_layout.clone());
+        let oci_archive = args
+            .oci_archive
+            .clone()
+            .or_else(|| config.package.oci_archive.clone());
+        if output.is_none() && tar.is_none() && oci_layout.is_none() && oci_archive.is_none() {
             return Err(Error::Config {
-                message: "no output given (pass --output <dir> and/or --tar <file>)".to_string(),
+                message: "no output given (pass --output <dir>, --tar <file>, --oci-layout <dir>, and/or --oci-archive <file>)".to_string(),
             }
             .into());
         }
@@ -47,6 +57,8 @@ impl Paths {
                 .unwrap_or_else(|| PathBuf::from("/")),
             output,
             tar,
+            oci_layout,
+            oci_archive,
         })
     }
 }
@@ -157,6 +169,8 @@ pub(crate) fn manifest_path(args: &BundleArgs, paths: &Paths) -> Option<PathBuf>
         .output
         .clone()
         .or_else(|| paths.tar.clone())
+        .or_else(|| paths.oci_layout.clone())
+        .or_else(|| paths.oci_archive.clone())
         .unwrap_or_else(|| PathBuf::from("."));
     Some(manifest_path_default(&beside))
 }
@@ -167,5 +181,56 @@ fn manifest_path_default(output: &Path) -> PathBuf {
     match output.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(MANIFEST_NAME_DEFAULT),
         _ => PathBuf::from(MANIFEST_NAME_DEFAULT),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Cli, Command};
+    use clap::Parser;
+
+    fn args(values: &[&str]) -> BundleArgs {
+        let cli = Cli::try_parse_from(
+            ["elfpak", "bundle", "/bin/app"]
+                .into_iter()
+                .chain(values.iter().copied()),
+        )
+        .unwrap();
+        match cli.command {
+            Command::Bundle(bundle) => bundle.into_bundle(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn oci_only_outputs_are_accepted_and_cli_paths_take_precedence() {
+        let config = Config::parse(
+            "[package]\noci_layout = 'configured-layout'\noci_archive = 'configured.tar'\n",
+        )
+        .unwrap();
+        let args = args(&["--oci-layout", "cli-layout", "--oci-archive", "cli.tar"]);
+        let paths = Paths::resolve(&args, &config).unwrap();
+        assert_eq!(paths.oci_layout, Some(PathBuf::from("cli-layout")));
+        assert_eq!(paths.oci_archive, Some(PathBuf::from("cli.tar")));
+        assert!(paths.output.is_none());
+        assert!(paths.tar.is_none());
+    }
+
+    #[test]
+    fn default_manifest_location_uses_the_first_output_kind() {
+        let args = args(&[]);
+        let paths = Paths {
+            inputs: Vec::new(),
+            root: PathBuf::from("/"),
+            output: None,
+            tar: None,
+            oci_layout: Some(PathBuf::from("dist/layout")),
+            oci_archive: Some(PathBuf::from("elsewhere/archive.tar")),
+        };
+        assert_eq!(
+            manifest_path(&args, &paths),
+            Some(PathBuf::from("dist").join(MANIFEST_NAME_DEFAULT))
+        );
     }
 }

@@ -29,6 +29,7 @@ flowchart TB
     Plan --> Inspect["inspect / dry-run"]
     Plan --> Rootfs["rootfs directory"]
     Plan --> Tar["deterministic tar"]
+    Plan --> OCI["OCI layout / archive"]
     Plan --> Manifest["manifest"]
     Rootfs --> Verify["verify"]
     Manifest --> Verify
@@ -37,7 +38,7 @@ flowchart TB
 The `BundlePlan` is the central boundary: discovery and validation finish
 before any output is written. Its fields are crate-private and external callers
 receive read-only views, so the public API preserves planner-established
-invariants. Both directory and tar output consume the same plan; neither
+invariants. Directory, tar, and OCI output consume the same plan; none
 re-resolves dependencies.
 
 ## Workspace and ownership
@@ -50,6 +51,7 @@ re-resolves dependencies.
 | `fixtures/` | Small real programs used by integration and Docker tests: Axum, musl, and an off-path vendor library. |
 | `crates/elfpak-core/tests/` | Unit/integration, filesystem-safety, resolver, robustness, and glibc-oracle tests. |
 | `tests/docker/` | End-to-end scratch-image smoke scenarios. |
+| `tests/oci/` | Daemonless OCI interoperability smoke test using Skopeo and Podman. |
 | `fuzz/` | Separate nightly `cargo-fuzz` harness for the ELF parser boundary. |
 
 Both command crates use small executable entry points around testable libraries.
@@ -163,9 +165,16 @@ Directory output similarly normalizes modes. Its planned files and directories
 share one materialization timestamp by default, or the explicit
 `SOURCE_DATE_EPOCH` when reproducible directory metadata is required.
 
+`OciLayoutBuilder` is the third plan renderer. It streams the same deterministic
+tar as one uncompressed OCI layer while hashing it, then writes a stable image
+configuration, manifest, and single-platform index into a content-addressed
+layout. `OciArchiveBuilder` wraps that exact layout in a fixed-order transport
+tar. Both stage beside their destinations and publish only after the complete
+descriptor graph exists; neither invokes a daemon or registry.
+
 `Manifest` records every application, the shared plan, resolved policy, output
-locations, warnings, and every planned entry's path, kind, reason, mode, size,
-digest, or link target.
+locations, OCI image metadata and manifest digest when applicable, warnings,
+and every planned entry's path, kind, reason, mode, size, digest, or link target.
 It is written beside the artifacts, never into a rootfs. `verify` validates the
 manifest before checking a materialized tree; normal verification detects
 missing or altered entries, while `--strict` additionally detects unlisted
@@ -177,7 +186,7 @@ entries and mode changes.
   planned before materialization.
 - Original library paths and symlink topology are preserved rather than
   relocated behind `LD_LIBRARY_PATH`.
-- Tar output is byte-stable for equal inputs and tool version. Directory output
+- Tar and OCI output are byte-stable for equal inputs and tool version. Directory output
   applies `SOURCE_DATE_EPOCH` to planned files and directories on a best-effort
   basis; symlink timestamps are the documented platform limitation.
 - Bounded graph, cache, search-path, directory-walk, and symlink processing
@@ -192,7 +201,8 @@ workspace test suite. The suite covers parser robustness, path safety,
 determinism, plan/manifest behavior, resolver semantics, and comparisons with
 the real glibc loader. Docker smoke tests add scratch-image scenarios for web
 services, CA roots, musl, generated loader caches, tar delivery, verification,
-and cross-architecture packaging.
+and cross-architecture packaging. `just oci-smoke` independently validates OCI
+layout/archive inspection and execution with Skopeo and Podman.
 
 The top-level `Dockerfile` builds a static musl `elfpak` for amd64 or arm64
 with `rust-lld`, then publishes it in `FROM scratch`. The build stage runs on
@@ -208,5 +218,5 @@ and the test strategy independently checks the most loader-sensitive behavior.
 
 Deliberate limitations are documented scope rather than design defects:
 only x86_64/aarch64 are supported; `dlopen` cannot be fully discovered
-statically; OCI output, runtime tracing, and SBOM generation are not yet
-implemented.
+statically; OCI output is single-platform with one uncompressed layer and no
+direct push; runtime tracing and SBOM generation are not yet implemented.

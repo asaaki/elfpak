@@ -221,6 +221,308 @@ fn bundle_dry_run_writes_nothing() {
 }
 
 #[test]
+fn oci_outputs_and_image_options_are_accepted_in_dry_runs() {
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = tmp.path().join("image");
+    let archive = tmp.path().join("image.tar");
+
+    let layout_output = elfpak(&[
+        "bundle",
+        binary.to_str().unwrap(),
+        "--oci-layout",
+        layout.to_str().unwrap(),
+        "--install",
+        "/app/server",
+        "--image-tag",
+        "ci-test",
+        "--entrypoint",
+        "/app/server",
+        "--entrypoint",
+        "--verbose",
+        "--cmd",
+        "--version",
+        "--working-dir",
+        "/app",
+        "--env",
+        "RUST_LOG=info",
+        "--label",
+        "org.example.test=true",
+        "--dry-run",
+        "--no-config",
+    ]);
+    assert!(layout_output.status.success(), "{}", stderr(&layout_output));
+    assert!(stdout(&layout_output).contains("oci layout:"));
+    assert!(!layout.exists());
+
+    let archive_output = elfpak(&[
+        "bundle",
+        binary.to_str().unwrap(),
+        "--oci-archive",
+        archive.to_str().unwrap(),
+        "--install",
+        "/app/server",
+        "--dry-run",
+        "--no-config",
+    ]);
+    assert!(
+        archive_output.status.success(),
+        "{}",
+        stderr(&archive_output)
+    );
+    assert!(stdout(&archive_output).contains("oci archive:"));
+    assert!(!archive.exists());
+}
+
+#[test]
+fn invalid_oci_metadata_fails_before_writing() {
+    let Some(binary) = subject() else { return };
+    let Some([first, second]) = multiple_subjects() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+
+    let cases: &[(&str, &[&str])] = &[
+        ("image tag", &["--image-tag", "bad/tag"]),
+        ("environment", &["--env", "MISSING_SEPARATOR"]),
+        ("label", &["--label", "MISSING_SEPARATOR"]),
+        ("working directory", &["--working-dir", "/missing"]),
+    ];
+    for (expected, options) in cases {
+        let layout = tmp.path().join(expected.replace(' ', "-"));
+        let mut arguments = vec![
+            "bundle",
+            binary.to_str().unwrap(),
+            "--oci-layout",
+            layout.to_str().unwrap(),
+            "--install",
+            "/app/server",
+            "--dry-run",
+            "--no-config",
+        ];
+        arguments.extend_from_slice(options);
+        let output = elfpak(&arguments);
+        assert!(
+            !output.status.success(),
+            "{expected} unexpectedly succeeded"
+        );
+        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+        assert!(!layout.exists());
+    }
+
+    let multi = tmp.path().join("multi");
+    let output = elfpak(&[
+        "bundle",
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+        "--oci-layout",
+        multi.to_str().unwrap(),
+        "--install-dir",
+        "/app",
+        "--dry-run",
+        "--no-config",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("entrypoint"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!multi.exists());
+}
+
+#[test]
+fn rootfs_only_does_not_validate_unused_image_defaults() {
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("elfpak.toml");
+    let rootfs = tmp.path().join("rootfs");
+    std::fs::write(
+        &config,
+        format!(
+            "[package]\nbinary = '{}'\noutput = '{}'\n\n[image]\ntag = 'bad/tag'\nworking_dir = '/missing'\n",
+            binary.display(),
+            rootfs.display()
+        ),
+    )
+    .unwrap();
+
+    let output = elfpak(&["bundle", "--config", config.to_str().unwrap(), "--dry-run"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn bundle_can_write_every_output_from_one_plan() {
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = tmp.path().join("rootfs");
+    let rootfs_tar = tmp.path().join("rootfs.tar");
+    let layout = tmp.path().join("image");
+    let archive = tmp.path().join("image.tar");
+
+    let output = elfpak(&[
+        "bundle",
+        binary.to_str().unwrap(),
+        "--output",
+        rootfs.to_str().unwrap(),
+        "--tar",
+        rootfs_tar.to_str().unwrap(),
+        "--oci-layout",
+        layout.to_str().unwrap(),
+        "--oci-archive",
+        archive.to_str().unwrap(),
+        "--install",
+        "/app/server",
+        "--image-tag",
+        "ci-test",
+        "--entrypoint",
+        "/app/server",
+        "--cmd",
+        "--version",
+        "--working-dir",
+        "/app",
+        "--env",
+        "RUST_LOG=info",
+        "--label",
+        "org.example.test=true",
+        "--no-config",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(rootfs.is_dir());
+    assert!(rootfs_tar.is_file());
+    assert!(layout.is_dir());
+    assert!(archive.is_file());
+    let text = stdout(&output);
+    for destination in ["rootfs:", "tar:", "oci layout:", "oci archive:"] {
+        assert!(text.contains(destination), "{text}");
+    }
+
+    let layout_index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(layout.join("index.json")).unwrap()).unwrap();
+    let unpacked = tmp.path().join("unpacked-image");
+    std::fs::create_dir(&unpacked).unwrap();
+    let extraction = Command::new("tar")
+        .args([
+            "-xf",
+            archive.to_str().unwrap(),
+            "-C",
+            unpacked.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extraction.status.success(), "{}", stderr(&extraction));
+    let archive_index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(unpacked.join("index.json")).unwrap()).unwrap();
+    assert_eq!(
+        layout_index["manifests"][0]["digest"],
+        archive_index["manifests"][0]["digest"]
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(tmp.path().join("elfpak-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["manifest_version"], 4);
+    assert_eq!(manifest["oci_layout"], layout.display().to_string());
+    assert_eq!(manifest["oci_archive"], archive.display().to_string());
+    assert_eq!(manifest["image"]["tag"], "ci-test");
+    assert_eq!(manifest["image"]["os"], "linux");
+    assert_eq!(manifest["image"]["architecture"], "amd64");
+    assert_eq!(
+        manifest["image"]["entrypoint"],
+        serde_json::json!(["/app/server"])
+    );
+    assert_eq!(manifest["image"]["cmd"], serde_json::json!(["--version"]));
+    assert_eq!(manifest["image"]["working_dir"], "/app");
+    assert_eq!(
+        manifest["image"]["env"],
+        serde_json::json!(["RUST_LOG=info"])
+    );
+    assert_eq!(manifest["image"]["labels"]["org.example.test"], "true");
+    assert_eq!(
+        manifest["image"]["manifest_digest"],
+        layout_index["manifests"][0]["digest"]
+    );
+}
+
+#[test]
+fn output_artifacts_must_not_overlap() {
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            vec!["--output", "tree", "--oci-layout", "tree/child/.."],
+            ["--output", "--oci-layout"],
+        ),
+        (
+            vec!["--output", "tree", "--tar", "tree/rootfs.tar"],
+            ["--output", "--tar"],
+        ),
+        (
+            vec!["--output", "tree", "--oci-archive", "tree/image.tar"],
+            ["--output", "--oci-archive"],
+        ),
+        (
+            vec!["--output", "tree", "--manifest", "tree/manifest.json"],
+            ["--output", "--manifest"],
+        ),
+        (
+            vec!["--oci-layout", "tree", "--tar", "tree/rootfs.tar"],
+            ["--oci-layout", "--tar"],
+        ),
+        (
+            vec!["--oci-layout", "tree", "--oci-archive", "tree/image.tar"],
+            ["--oci-layout", "--oci-archive"],
+        ),
+        (
+            vec!["--oci-layout", "tree", "--manifest", "tree/manifest.json"],
+            ["--oci-layout", "--manifest"],
+        ),
+        (
+            vec!["--tar", "same", "--oci-archive", "same"],
+            ["--tar", "--oci-archive"],
+        ),
+        (
+            vec!["--tar", "same", "--manifest", "same"],
+            ["--tar", "--manifest"],
+        ),
+        (
+            vec!["--oci-archive", "same", "--manifest", "same"],
+            ["--oci-archive", "--manifest"],
+        ),
+    ];
+
+    for (case_index, (options, expected)) in cases.into_iter().enumerate() {
+        let case = tmp.path().join(format!("case-{case_index}"));
+        std::fs::create_dir(&case).unwrap();
+        let mut arguments = vec![
+            "bundle".to_string(),
+            binary.display().to_string(),
+            "--install".to_string(),
+            "/app/server".to_string(),
+            "--dry-run".to_string(),
+            "--no-config".to_string(),
+        ];
+        let has_manifest = options.contains(&"--manifest");
+        for [flag, path] in options.as_chunks::<2>().0 {
+            arguments.push((*flag).to_string());
+            arguments.push(case.join(path).display().to_string());
+        }
+        if !has_manifest {
+            arguments.push("--no-manifest".to_string());
+        }
+        let refs: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let output = elfpak(&refs);
+        assert!(
+            !output.status.success(),
+            "case {case_index} unexpectedly succeeded"
+        );
+        let error = stderr(&output);
+        assert!(error.contains(expected[0]), "case {case_index}: {error}");
+        assert!(error.contains(expected[1]), "case {case_index}: {error}");
+    }
+}
+
+#[test]
 fn bundle_then_verify_round_trips() {
     let Some(binary) = subject() else { return };
     let tmp = tempfile::tempdir().unwrap();

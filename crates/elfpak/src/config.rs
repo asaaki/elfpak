@@ -3,7 +3,10 @@
 
 use elfpak_core::{Error, Preset, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 /// Name of the configuration file discovered beside the working directory.
 const CONFIG_NAME_DEFAULT: &str = "elfpak.toml";
@@ -19,6 +22,8 @@ pub(crate) struct Config {
     pub(crate) include: IncludeConfig,
     #[serde(default)]
     pub(crate) dependencies: DependencyConfig,
+    #[serde(default)]
+    pub(crate) image: ImageConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -31,7 +36,24 @@ pub(crate) struct PackageConfig {
     pub(crate) install_dir: Option<PathBuf>,
     pub(crate) output: Option<PathBuf>,
     pub(crate) tar: Option<PathBuf>,
+    pub(crate) oci_layout: Option<PathBuf>,
+    pub(crate) oci_archive: Option<PathBuf>,
     pub(crate) root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImageConfig {
+    pub(crate) tag: Option<String>,
+    #[serde(default)]
+    pub(crate) entrypoint: Vec<String>,
+    #[serde(default)]
+    pub(crate) cmd: Vec<String>,
+    pub(crate) working_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -91,6 +113,8 @@ impl Config {
         }
         rebase_path(&mut config.package.output, base);
         rebase_path(&mut config.package.tar, base);
+        rebase_path(&mut config.package.oci_layout, base);
+        rebase_path(&mut config.package.oci_archive, base);
         rebase_path(&mut config.package.root, base);
         Ok(config)
     }
@@ -204,5 +228,45 @@ allow = ["libc.so.6", "libgcc_s.so.1"]
         assert_eq!(config.package.tar, Some(project.join("dist/app.tar")));
         assert_eq!(config.package.install, Some(PathBuf::from("/app/server")));
         assert_eq!(config.include.paths, vec![PathBuf::from("/app/data")]);
+    }
+
+    #[test]
+    fn parses_and_rebases_oci_outputs_and_image_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let config_path = project.join("elfpak.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[package]
+binary = "target/release/server"
+oci_layout = "dist/image"
+oci_archive = "dist/image.tar"
+
+[image]
+tag = "ci-test"
+entrypoint = ["/app/server", "--serve"]
+cmd = ["--listen", "0.0.0.0:8080"]
+working_dir = "/app"
+env = { RUST_LOG = "info", EMPTY = "" }
+labels = { "org.example.revision" = "abc123" }
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.package.oci_layout, Some(project.join("dist/image")));
+        assert_eq!(
+            config.package.oci_archive,
+            Some(project.join("dist/image.tar"))
+        );
+        assert_eq!(config.image.tag.as_deref(), Some("ci-test"));
+        assert_eq!(config.image.entrypoint, ["/app/server", "--serve"]);
+        assert_eq!(config.image.cmd, ["--listen", "0.0.0.0:8080"]);
+        assert_eq!(config.image.working_dir, Some(PathBuf::from("/app")));
+        assert_eq!(config.image.env["RUST_LOG"], "info");
+        assert_eq!(config.image.env["EMPTY"], "");
+        assert_eq!(config.image.labels["org.example.revision"], "abc123");
     }
 }

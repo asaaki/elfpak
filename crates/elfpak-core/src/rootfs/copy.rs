@@ -185,18 +185,18 @@ impl RootFsBuilder {
 
 /// Parent used for sibling staging. A bare relative output such as `rootfs`
 /// lives beside a temporary directory in the current working directory.
-fn output_parent(output: &Path) -> &Path {
+pub(crate) fn output_parent(output: &Path) -> &Path {
     output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn path_exists(path: &Path) -> bool {
+pub(crate) fn path_exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-fn ensure_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path).map_err(|e| io(path, e))?;
     if metadata.is_symlink() {
         return Err(Error::Config {
@@ -264,7 +264,7 @@ fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
 /// Replace the visible output only after the complete staged tree exists.
 /// Existing outputs are atomically exchanged when the filesystem supports it;
 /// otherwise a rollback-capable sequence publishes the staged tree.
-fn publish_directory(stage: tempfile::TempDir, output: &Path) -> Result<()> {
+pub(crate) fn publish_directory(stage: tempfile::TempDir, output: &Path) -> Result<()> {
     // Linux can exchange two sibling paths in one rename operation. This
     // retains a continuously visible output for readers, unlike moving the
     // old tree aside before publishing the new one. The temporary directory
@@ -278,8 +278,38 @@ fn publish_directory(stage: tempfile::TempDir, output: &Path) -> Result<()> {
     // Do not overwrite a rootfs created between the initial existence check
     // and publication. A concurrent builder must retry rather than silently
     // discarding somebody else's output.
-    renameat_with(CWD, stage.path(), CWD, output, RenameFlags::NOREPLACE)
-        .map_err(|e| io(output, e.into()))
+    let publish = renameat_with(CWD, stage.path(), CWD, output, RenameFlags::NOREPLACE);
+    finish_noreplace(stage, output, publish)
+}
+
+fn finish_noreplace(
+    stage: tempfile::TempDir,
+    output: &Path,
+    publish: std::result::Result<(), rustix::io::Errno>,
+) -> Result<()> {
+    if let Err(error) = publish {
+        if matches!(
+            error,
+            rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP
+        ) {
+            return publish_new_directory_legacy(stage, output);
+        }
+        return Err(io(output, error.into()));
+    }
+    Ok(())
+}
+
+/// Reserve an absent destination before using plain rename on filesystems
+/// without `RENAME_NOREPLACE`, notably WSL shared mounts.
+fn publish_new_directory_legacy(stage: tempfile::TempDir, output: &Path) -> Result<()> {
+    std::fs::create_dir(output).map_err(|error| io(output, error))?;
+    if let Err(error) = std::fs::rename(stage.path(), output) {
+        // Remove only our empty reservation. If anything appeared inside it,
+        // `remove_dir` refuses and the foreign content remains untouched.
+        let _ = std::fs::remove_dir(output);
+        return Err(io(output, error));
+    }
+    Ok(())
 }
 
 fn publish_by_exchange(stage: tempfile::TempDir, output: &Path) -> Result<()> {
@@ -403,7 +433,7 @@ fn write_file(target: &Path, file: &PlannedFile) -> Result<u64> {
 /// Refuse the filesystem root as an output even when `--clean` was not
 /// requested. Materializing there would turn logical bundle destinations such
 /// as `/app/server` into writes to the host filesystem.
-fn guard_output(output: &Path) -> Result<()> {
+pub(crate) fn guard_output(output: &Path) -> Result<()> {
     // `canonicalize` cannot resolve a path that has not been created yet, so
     // normalize an absolute spelling first. Otherwise `/new/..` would evade
     // the guard and become `/` after `create_dir_all`.
@@ -524,8 +554,8 @@ fn pin_times(path: &Path, time: std::time::SystemTime) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_directory, finish_exchange, guard_clean, guard_output, has_symlinked_ancestor,
-        remove_existing,
+        ensure_directory, finish_exchange, finish_noreplace, guard_clean, guard_output,
+        has_symlinked_ancestor, remove_existing,
     };
     use std::path::Path;
 
@@ -606,6 +636,21 @@ mod tests {
 
         assert_eq!(std::fs::read(output.join("new")).unwrap(), b"new");
         assert!(!output.join("old").exists());
+    }
+
+    #[test]
+    fn unsupported_noreplace_falls_back_to_portable_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        let stage = tempfile::Builder::new()
+            .prefix(".elfpak-rootfs-")
+            .tempdir_in(temp.path())
+            .unwrap();
+        std::fs::write(stage.path().join("new"), b"new").unwrap();
+
+        finish_noreplace(stage, &output, Err(rustix::io::Errno::INVAL)).unwrap();
+
+        assert_eq!(std::fs::read(output.join("new")).unwrap(), b"new");
     }
 
     #[test]
