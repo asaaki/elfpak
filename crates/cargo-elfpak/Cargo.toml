@@ -22,7 +22,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-elfpak = { path = "../elfpak", version = "0.3.0" }
+elfpak = { path = "../elfpak", version = "0.3.1" }
 anyhow.workspace = true
 cargo_metadata = "0.23.1"
 clap.workspace = true
