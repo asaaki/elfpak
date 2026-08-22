@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+
+# Docker smoke test: build a real Axum service, package it with elfpak, and run
+# the result on FROM scratch. This is the primary product UX.
+#
+# Unlike the elfpak image, this stage deliberately does *not* cross-compile: the
+# builder runs on the target platform so the arm64 run exercises a natively
+# built application, packaged by a natively running elfpak. Building both
+# architectures in one buildx invocation still runs them in parallel:
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 --load -f ... .
+
+# Base images are pinned by tag *and* digest so a build is reproducible and the
+# toolchain never moves under us. Refresh a digest with:
+#   docker buildx imagetools inspect <tag> --format '{{.Manifest.Digest}}'
+ARG ELFPAK_IMAGE=ghcr.io/asaaki/elfpak:latest
+ARG RUST_IMAGE=rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c
+
+FROM ${ELFPAK_IMAGE} AS elfpak
+
+FROM ${RUST_IMAGE} AS build
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# The target cache is keyed per architecture so the amd64 and arm64 builds do
+# not clobber each other (emulated rebuilds are expensive).
+ARG TARGETARCH
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target,id=axum-target-${TARGETARCH},sharing=locked \
+    cargo build --release --locked \
+    && cp target/release/axum-server /axum-server
+
+# Copied after the application build so that changing elfpak does not invalidate
+# it; under emulation that recompile is the most expensive step in the suite.
+COPY --from=elfpak /elfpak /usr/local/bin/elfpak
+
+# The `minimal` preset is used by the smoke test to prove that outbound HTTPS
+# depends on what `web` adds, not on anything compiled into the application.
+ARG ELFPAK_PRESET=web
+
+RUN elfpak bundle /axum-server \
+    --output /rootfs \
+    --install /app/server \
+    --preset "${ELFPAK_PRESET}" \
+    --user 65532:65532 \
+    -v
+
+FROM scratch
+
+COPY --from=build /rootfs /
+
+USER 65532:65532
+WORKDIR /app
+EXPOSE 8080
+
+ENTRYPOINT ["/app/server"]
