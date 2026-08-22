@@ -52,6 +52,129 @@ fn host_target() -> String {
         .to_owned()
 }
 
+fn write_multi_binary_project(project: &Path, package: &str, binaries: &[&str]) {
+    std::fs::create_dir_all(project.join("src/bin")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+    )
+    .unwrap();
+    for binary in binaries {
+        std::fs::write(
+            project.join("src/bin").join(format!("{binary}.rs")),
+            format!("fn main() {{ println!(\"{binary}\"); }}\n"),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn multiple_binaries_all_selects_every_workspace_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let rootfs = tmp.path().join("rootfs");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nresolver = \"3\"\nmembers = [\"api\", \"worker\"]\n",
+    )
+    .unwrap();
+    write_binary_project(&workspace.join("api"), "api", "fn main() {}\n");
+    write_binary_project(&workspace.join("worker"), "worker", "fn main() {}\n");
+
+    let output = cargo_elfpak(
+        &workspace,
+        &[
+            "bundle",
+            "--all",
+            "--install-dir",
+            "/app",
+            "--output",
+            rootfs.to_str().unwrap(),
+            "--dry-run",
+            "--no-config",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("/debug/api"), "{text}");
+    assert!(text.contains("/debug/worker"), "{text}");
+    assert!(text.contains("-> /app/api"), "{text}");
+    assert!(text.contains("-> /app/worker"), "{text}");
+}
+
+#[test]
+fn multiple_binaries_all_bins_selects_one_packages_binaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("tools");
+    let rootfs = tmp.path().join("rootfs");
+    write_multi_binary_project(&project, "tools", &["first", "second"]);
+
+    let output = cargo_elfpak(
+        &project,
+        &[
+            "bundle",
+            "-p",
+            "tools",
+            "--all-bins",
+            "--install-dir",
+            "/app",
+            "--output",
+            rootfs.to_str().unwrap(),
+            "--dry-run",
+            "--no-config",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("-> /app/first"), "{text}");
+    assert!(text.contains("-> /app/second"), "{text}");
+}
+
+#[test]
+fn multiple_binaries_bins_materializes_only_the_named_subset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("tools");
+    let rootfs = tmp.path().join("rootfs");
+    write_multi_binary_project(&project, "tools", &["first", "second", "third"]);
+
+    let output = cargo_elfpak(
+        &project,
+        &[
+            "bundle",
+            "-p",
+            "tools",
+            "--bins",
+            "first,third",
+            "--install-dir",
+            "/app",
+            "--output",
+            rootfs.to_str().unwrap(),
+            "--no-config",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(rootfs.join("app/first").is_file());
+    assert!(!rootfs.join("app/second").exists());
+    assert!(rootfs.join("app/third").is_file());
+}
+
+#[test]
+fn multiple_binaries_selector_modes_conflict_before_building() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_binary_project(&project, "conflict-fixture", "this is not Rust\n");
+
+    let output = cargo_elfpak(&project, &["bundle", "--all", "--bin", "conflict-fixture"]);
+    assert!(!output.status.success());
+    let error = stderr(&output);
+    assert!(error.contains("cannot be used with"), "{error}");
+    assert!(
+        !error.contains("src/main.rs"),
+        "Cargo must not run: {error}"
+    );
+}
+
 #[test]
 fn builds_missing_and_stale_binaries_and_reuses_fresh_ones() {
     let tmp = tempfile::tempdir().unwrap();

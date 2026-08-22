@@ -53,7 +53,7 @@ runtime policy asked for.
 
 ## Cargo workflow
 
-Install the Cargo adapter when packaging a binary from its Rust project:
+Install the Cargo adapter when packaging binaries from a Rust project:
 
 ```console
 $ cargo install cargo-elfpak
@@ -63,17 +63,26 @@ $ cargo elfpak bundle --release \
     --preset web
 ```
 
-`cargo-elfpak` asks Cargo to build the selected binary. Cargo reuses it when it
-is fresh and rebuilds it when any tracked input changed; the exact executable
-path Cargo reports is then passed to the normal `elfpak bundle` implementation.
+`cargo-elfpak` asks Cargo to build the selected binaries. Cargo reuses each one
+when it is fresh and rebuilds it when any tracked input changed; the exact
+executable paths Cargo reports are passed to the normal `elfpak bundle`
+implementation.
 Use `-p <package>` in an ambiguous workspace and `--bin <name>` when the package
-has no inferable default binary.
+has no inferable default binary. Multi-binary projects can select a subset with
+`-p <package> --bins server,migrate`, every binary in one package with
+`-p <package> --all-bins`, or every binary in the workspace with `--all`; use
+`--install-dir` to preserve their names under one directory:
+
+```console
+$ cargo elfpak bundle --release --all \
+    --output rootfs --install-dir /app --preset web
+```
 
 ## Commands
 
 ```text
 elfpak inspect <binary>    analyze and print the runtime closure, copying nothing
-elfpak bundle  <binary>    build a minimal rootfs plus a manifest
+elfpak bundle  <binary>... build a minimal rootfs plus a manifest
 elfpak verify  <manifest>  check a materialized rootfs against its manifest
 ```
 
@@ -116,7 +125,7 @@ Docker. It treats the source filesystem as read-only and writes only to the
 requested directory, tar and manifest destinations and their temporary
 siblings.
 
-Output is deterministic for the same binary, source root, configuration and
+Output is deterministic for the same binaries, source root, configuration and
 `elfpak` version.
 
 Directory, tar and manifest outputs are staged beside their destinations and

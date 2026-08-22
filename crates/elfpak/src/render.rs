@@ -4,7 +4,7 @@
 //! points are [`inspect`] and [`bundle_summary`]. [`Verbosity`] decides whether
 //! any of it is written at all.
 
-use crate::bundle::Outputs;
+use crate::bundle::{Outputs, paths::BundleInput};
 use elfpak_core::{
     Error,
     graph::{DependencyGraph, NodeKind},
@@ -195,21 +195,24 @@ pub(crate) fn reason(reason: &InclusionReason) -> String {
 /// `elfpak bundle` summary.
 pub(crate) fn bundle_summary(
     out: &mut dyn Write,
-    binary: &Path,
+    inputs: &[BundleInput],
     plan: &BundlePlan,
     destinations: Destinations<'_>,
     outputs: &Outputs,
     verbose: u8,
 ) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "{} -> {}",
-        binary.display(),
-        plan.executable().destination().display()
-    )?;
-    writeln!(out, "  {}", plan.architecture())?;
-    if let Some(interp) = &plan.interpreter() {
-        writeln!(out, "  interpreter: {}", interp.display())?;
+    assert_eq!(inputs.len(), plan.applications().len());
+    for (input, application) in inputs.iter().zip(plan.applications()) {
+        writeln!(
+            out,
+            "{} -> {}",
+            input.binary.display(),
+            application.executable().destination().display()
+        )?;
+        writeln!(out, "  {}", plan.architecture())?;
+        if let Some(interp) = application.interpreter() {
+            writeln!(out, "  interpreter: {}", interp.display())?;
+        }
     }
 
     if verbose > 0 {

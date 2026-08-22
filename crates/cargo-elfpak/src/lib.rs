@@ -44,17 +44,20 @@ fn try_run(cli: Cli) -> Result<std::process::ExitCode> {
         args.offline,
         args.frozen,
     )?;
-    let selection = metadata::select(
+    let selections = metadata::select_many(
         &metadata,
         &SelectionContext {
             package: args.package,
             binary: args.bin,
+            binaries: args.bins,
+            all_bins: args.all_bins,
+            all: args.all,
             manifest_path: args.manifest_path.clone(),
             current_dir: PathBuf::from(&current_dir),
         },
     )?;
-    let artifact = build::run(&BuildRequest {
-        selection: &selection,
+    let artifacts = build::run(&BuildRequest {
+        selections: &selections,
         current_dir: &current_dir,
         manifest_path: args.manifest_path.as_deref(),
         release: args.release,
@@ -71,12 +74,17 @@ fn try_run(cli: Cli) -> Result<std::process::ExitCode> {
     })?;
 
     if !cli.quiet {
-        let state = if artifact.fresh { "fresh" } else { "built" };
-        println!("{state} Cargo binary: {}", artifact.executable.display());
+        for artifact in &artifacts {
+            let state = if artifact.fresh { "fresh" } else { "built" };
+            println!("{state} Cargo binary: {}", artifact.executable.display());
+        }
     }
-    Ok(elfpak::run_bundle(
+    Ok(elfpak::run_bundle_many(
         args.bundle,
-        artifact.executable,
+        artifacts
+            .into_iter()
+            .map(|artifact| artifact.executable)
+            .collect(),
         cli.quiet,
         cli.verbose,
     ))

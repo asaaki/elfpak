@@ -132,35 +132,74 @@ impl PlannedFile {
 }
 
 #[derive(Debug, Clone)]
-pub struct BundlePlan {
+pub struct ApplicationPlan {
     pub(crate) executable: PlannedFile,
+    pub(crate) graph: DependencyGraph,
+    /// `PT_INTERP` as declared by this executable.
+    pub(crate) interpreter: Option<PathBuf>,
+    /// Where that interpreter lives after following symlinks.
+    pub(crate) interpreter_resolved: Option<PathBuf>,
+}
+
+impl ApplicationPlan {
+    pub fn executable(&self) -> &PlannedFile {
+        &self.executable
+    }
+
+    pub fn graph(&self) -> &DependencyGraph {
+        &self.graph
+    }
+
+    pub fn interpreter(&self) -> Option<&Path> {
+        self.interpreter.as_deref()
+    }
+
+    pub fn interpreter_resolved(&self) -> Option<&Path> {
+        self.interpreter_resolved.as_deref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BundlePlan {
+    pub(crate) applications: Vec<ApplicationPlan>,
     /// All entries, including the executable, sorted by destination.
     pub(crate) files: Vec<PlannedFile>,
-    pub(crate) graph: DependencyGraph,
     pub(crate) architecture: Architecture,
     /// Preset the policy was derived from, when one was named.
     pub(crate) preset: Option<Preset>,
     /// Runtime policy this plan was built with, recorded for the manifest.
     pub(crate) runtime_policy: RuntimePolicy,
     pub(crate) dependency_policy: DependencyPolicy,
-    /// `PT_INTERP` as declared by the executable.
-    pub(crate) interpreter: Option<PathBuf>,
-    /// Where that interpreter actually lives after following symlinks.
-    pub(crate) interpreter_resolved: Option<PathBuf>,
     pub(crate) warnings: Vec<Warning>,
 }
 
 impl BundlePlan {
+    /// The first application, retained for singular callers.
     pub fn executable(&self) -> &PlannedFile {
-        &self.executable
+        self.applications
+            .first()
+            .expect("a bundle plan always contains an application")
+            .executable()
+    }
+
+    pub fn applications(&self) -> &[ApplicationPlan] {
+        &self.applications
+    }
+
+    pub fn executables(&self) -> impl Iterator<Item = &PlannedFile> {
+        self.applications.iter().map(ApplicationPlan::executable)
     }
 
     pub fn files(&self) -> &[PlannedFile] {
         &self.files
     }
 
+    /// The first dependency graph, retained for singular callers.
     pub fn graph(&self) -> &DependencyGraph {
-        &self.graph
+        self.applications
+            .first()
+            .expect("a bundle plan always contains an application")
+            .graph()
     }
 
     pub fn architecture(&self) -> Architecture {
@@ -179,12 +218,18 @@ impl BundlePlan {
         &self.dependency_policy
     }
 
+    /// The first application's interpreter, retained for singular callers.
     pub fn interpreter(&self) -> Option<&Path> {
-        self.interpreter.as_deref()
+        self.applications
+            .first()
+            .and_then(ApplicationPlan::interpreter)
     }
 
+    /// The first application's resolved interpreter, retained for singular callers.
     pub fn interpreter_resolved(&self) -> Option<&Path> {
-        self.interpreter_resolved.as_deref()
+        self.applications
+            .first()
+            .and_then(ApplicationPlan::interpreter_resolved)
     }
 
     pub fn warnings(&self) -> &[Warning] {

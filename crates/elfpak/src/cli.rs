@@ -27,7 +27,7 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Analyze an executable and print its runtime closure without copying files
     Inspect(InspectArgs),
-    /// Build a minimal rootfs for an executable
+    /// Build a minimal rootfs for one or more executables
     Bundle(Box<StandaloneBundleArgs>),
     /// Check a materialized rootfs against a manifest
     Verify(VerifyArgs),
@@ -53,8 +53,8 @@ pub(crate) struct InspectArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct StandaloneBundleArgs {
-    /// Executable to package
-    pub(crate) binary: Option<PathBuf>,
+    /// Executable(s) to package
+    pub(crate) binaries: Vec<PathBuf>,
 
     #[command(flatten)]
     pub(crate) bundle: BundleArgs,
@@ -62,7 +62,7 @@ pub(crate) struct StandaloneBundleArgs {
 
 impl StandaloneBundleArgs {
     pub(crate) fn into_bundle(mut self) -> BundleArgs {
-        self.bundle.binary = self.binary;
+        self.bundle.binaries = self.binaries;
         self.bundle
     }
 }
@@ -70,7 +70,7 @@ impl StandaloneBundleArgs {
 #[derive(Debug, Args)]
 pub struct BundleArgs {
     #[arg(skip)]
-    pub(crate) binary: Option<PathBuf>,
+    pub(crate) binaries: Vec<PathBuf>,
 
     /// Directory the rootfs is written to
     #[arg(short, long)]
@@ -81,8 +81,12 @@ pub struct BundleArgs {
     pub(crate) tar: Option<PathBuf>,
 
     /// Path of the executable inside the rootfs
-    #[arg(long)]
+    #[arg(long, conflicts_with = "install_dir")]
     pub(crate) install: Option<PathBuf>,
+
+    /// Directory for executables inside the rootfs, preserving their names
+    #[arg(long, value_name = "DIR", conflicts_with = "install")]
+    pub(crate) install_dir: Option<PathBuf>,
 
     /// Sysroot used as the logical `/` for dependency lookup
     #[arg(long)]

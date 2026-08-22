@@ -17,7 +17,9 @@ pub use elf::{Architecture, ElfClass, ElfMetadata, Endianness, Machine, ObjectTy
 pub use error::{Error, Result};
 pub use graph::{DependencyGraph, DependencyReason, Digest, Node, NodeKind};
 pub use manifest::{Manifest, VerifyReport};
-pub use plan::{BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Planner, Warning};
+pub use plan::{
+    ApplicationPlan, BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Planner, Warning,
+};
 pub use policy::{CachePolicy, DependencyPolicy, Preset, RuntimeFeature, RuntimePolicy, UserSpec};
 pub use resolver::{DynamicLinkerResolver, LdCache, LibraryRequest, Resolver};
 pub use rootfs::{RootFsBuilder, RootFsReport, TarBuilder, TarReport};

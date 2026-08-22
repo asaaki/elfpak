@@ -6,7 +6,7 @@ use std::path::PathBuf;
     name = "cargo",
     bin_name = "cargo",
     version,
-    about = "Package a Cargo binary and its Linux runtime closure"
+    about = "Package Cargo binaries and their Linux runtime closures"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -35,19 +35,49 @@ pub(crate) struct ElfpakArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Build a Cargo binary and package its Linux runtime closure
+    /// Build Cargo binaries and package their Linux runtime closures
     Bundle(CargoBundleArgs),
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct CargoBundleArgs {
     /// Select a package from the workspace
-    #[arg(short = 'p', long = "package", value_name = "PACKAGE")]
+    #[arg(
+        short = 'p',
+        long = "package",
+        value_name = "PACKAGE",
+        conflicts_with = "all"
+    )]
     pub(crate) package: Option<String>,
 
     /// Select the binary target to package
-    #[arg(long = "bin", value_name = "NAME")]
+    #[arg(
+        long = "bin",
+        value_name = "NAME",
+        conflicts_with_all = ["bins", "all_bins", "all"]
+    )]
     pub(crate) bin: Option<String>,
+
+    /// Select comma-separated binary targets from one package
+    #[arg(
+        long = "bins",
+        value_name = "NAMES",
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+        conflicts_with_all = ["bin", "all_bins", "all"]
+    )]
+    pub(crate) bins: Vec<String>,
+
+    /// Select every binary target from one package
+    #[arg(long, conflicts_with_all = ["bin", "bins", "all"])]
+    pub(crate) all_bins: bool,
+
+    /// Select every binary target from every workspace package
+    #[arg(
+        long,
+        conflicts_with_all = ["package", "bin", "bins", "all_bins"]
+    )]
+    pub(crate) all: bool,
 
     /// Build artifacts in release mode
     #[arg(long, conflicts_with = "profile")]

@@ -11,7 +11,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
+const MANIFEST_SHA256_VERSION: u32 = 2;
 /// Name of the manifest written beside a bundle.
 pub const MANIFEST_NAME_DEFAULT: &str = "elfpak-manifest.json";
 
@@ -21,6 +22,9 @@ pub struct Manifest {
     pub elfpak_version: String,
     /// Install path of the application inside the rootfs.
     pub binary: String,
+    /// Install paths of every application. Empty in manifests before version 3.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binaries: Vec<String>,
     pub architecture: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<String>,
@@ -130,9 +134,13 @@ impl Manifest {
         Manifest {
             manifest_version: MANIFEST_VERSION,
             elfpak_version: env!("CARGO_PKG_VERSION").to_string(),
-            binary: plan.executable.destination.display().to_string(),
+            binary: plan.executable().destination.display().to_string(),
+            binaries: plan
+                .executables()
+                .map(|file| file.destination.display().to_string())
+                .collect(),
             architecture: plan.architecture.machine.to_string(),
-            interpreter: plan.interpreter.as_ref().map(|p| p.display().to_string()),
+            interpreter: plan.interpreter().map(|p| p.display().to_string()),
             source_root: source_root.display().to_string(),
             rootfs: rootfs.map(|p| p.display().to_string()),
             tar: tar.map(|p| p.display().to_string()),
@@ -205,6 +213,7 @@ impl Manifest {
                 format!("unsupported manifest version {}", self.manifest_version),
             ));
         }
+        let binaries = self.validate_binaries(manifest_path)?;
         let mut paths = std::collections::HashSet::new();
         for file in &self.files {
             let path = Path::new(&file.path);
@@ -232,7 +241,7 @@ impl Manifest {
                 | "runtime-config" | "application-data"
                     if file.target.is_none()
                         && file.sha256.as_ref().is_some_and(|digest| {
-                            self.manifest_version < MANIFEST_VERSION || is_sha256(digest)
+                            self.manifest_version < MANIFEST_SHA256_VERSION || is_sha256(digest)
                         }) => {}
                 _ => {
                     return Err(invalid_manifest(
@@ -242,7 +251,58 @@ impl Manifest {
                 }
             }
         }
+        if self.manifest_version >= 3 {
+            let executables: std::collections::HashSet<PathBuf> = self
+                .files
+                .iter()
+                .filter(|file| file.kind == "executable")
+                .map(|file| crate::paths::normalize_absolute(Path::new(&file.path)))
+                .collect();
+            if binaries != executables {
+                return Err(invalid_manifest(
+                    manifest_path,
+                    "binaries must list every executable manifest entry exactly once".to_string(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn validate_binaries(
+        &self,
+        manifest_path: &Path,
+    ) -> Result<std::collections::HashSet<PathBuf>> {
+        if self.manifest_version >= 3 && self.binaries.is_empty() {
+            return Err(invalid_manifest(
+                manifest_path,
+                "manifest version 3 requires a non-empty binaries list".to_string(),
+            ));
+        }
+        let binaries: Vec<&str> = if self.binaries.is_empty() {
+            vec![self.binary.as_str()]
+        } else {
+            if self.binaries.first().map(String::as_str) != Some(self.binary.as_str()) {
+                return Err(invalid_manifest(
+                    manifest_path,
+                    "binary must be the first entry in binaries".to_string(),
+                ));
+            }
+            self.binaries.iter().map(String::as_str).collect()
+        };
+        let mut unique = std::collections::HashSet::new();
+        for binary in binaries {
+            let path = Path::new(binary);
+            if !path.is_absolute()
+                || path != crate::paths::normalize_absolute(path)
+                || !unique.insert(path.to_path_buf())
+            {
+                return Err(invalid_manifest(
+                    manifest_path,
+                    format!("invalid or duplicate binary path `{binary}`"),
+                ));
+            }
+        }
+        Ok(unique)
     }
 
     /// Check a materialized rootfs against this manifest. An entry can be

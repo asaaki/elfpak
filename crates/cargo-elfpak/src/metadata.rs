@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{Metadata, Package, PackageId, Target};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 pub(crate) fn load(
     current_dir: &Path,
@@ -35,6 +38,9 @@ fn append_flag(options: &mut Vec<String>, flag: &str, enabled: bool) {
 pub(crate) struct SelectionContext {
     pub(crate) package: Option<String>,
     pub(crate) binary: Option<String>,
+    pub(crate) binaries: Vec<String>,
+    pub(crate) all_bins: bool,
+    pub(crate) all: bool,
     pub(crate) manifest_path: Option<PathBuf>,
     pub(crate) current_dir: PathBuf,
 }
@@ -46,15 +52,136 @@ pub(crate) struct Selection {
     pub(crate) binary_name: String,
 }
 
-pub(crate) fn select(metadata: &Metadata, context: &SelectionContext) -> Result<Selection> {
-    let package = select_package(metadata, context)?;
-    let binary = select_binary(package, context.binary.as_deref())?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BuildScope {
+    WorkspaceAllBins,
+    PackageAllBins,
+    Selected,
+}
 
-    Ok(Selection {
+#[derive(Debug)]
+pub(crate) struct SelectionSet {
+    pub(crate) binaries: Vec<Selection>,
+    pub(crate) build_scope: BuildScope,
+}
+
+#[cfg(test)]
+pub(crate) fn select(metadata: &Metadata, context: &SelectionContext) -> Result<Selection> {
+    let mut selected = select_many(metadata, context)?;
+    if selected.binaries.len() != 1 {
+        bail!("selection produced more than one Cargo binary");
+    }
+    Ok(selected.binaries.remove(0))
+}
+
+pub(crate) fn select_many(metadata: &Metadata, context: &SelectionContext) -> Result<SelectionSet> {
+    validate_selector_combination(context)?;
+    if context.all {
+        return select_workspace_binaries(metadata);
+    }
+
+    let package = select_package(metadata, context)?;
+    let binaries = if context.all_bins {
+        binary_targets(package)?
+    } else if !context.binaries.is_empty() {
+        select_named_binaries(package, &context.binaries)?
+    } else {
+        vec![select_binary(package, context.binary.as_deref())?]
+    };
+    let build_scope = if context.all_bins {
+        BuildScope::PackageAllBins
+    } else {
+        BuildScope::Selected
+    };
+    Ok(SelectionSet {
+        binaries: binaries
+            .into_iter()
+            .map(|binary| selection(package, binary))
+            .collect(),
+        build_scope,
+    })
+}
+
+fn validate_selector_combination(context: &SelectionContext) -> Result<()> {
+    let binary_modes = usize::from(context.binary.is_some())
+        + usize::from(!context.binaries.is_empty())
+        + usize::from(context.all_bins)
+        + usize::from(context.all);
+    if binary_modes > 1 {
+        bail!("--bin, --bins, --all-bins, and --all are mutually exclusive");
+    }
+    if context.all && context.package.is_some() {
+        bail!("--all cannot be used with --package");
+    }
+    Ok(())
+}
+
+fn select_workspace_binaries(metadata: &Metadata) -> Result<SelectionSet> {
+    let mut packages = metadata.workspace_packages();
+    packages.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut binaries = Vec::new();
+    let mut names = BTreeMap::<String, String>::new();
+    for package in packages {
+        let mut targets: Vec<_> = package
+            .targets
+            .iter()
+            .filter(|target| target.is_bin())
+            .collect();
+        targets.sort_by(|left, right| left.name.cmp(&right.name));
+        for target in targets {
+            if let Some(existing) = names.insert(target.name.clone(), package.name.to_string()) {
+                bail!(
+                    "binary name `{}` is shared by workspace packages `{existing}` and `{}`; select a subset",
+                    target.name,
+                    package.name
+                );
+            }
+            binaries.push(selection(package, target));
+        }
+    }
+    if binaries.is_empty() {
+        bail!("workspace has no binary targets");
+    }
+    Ok(SelectionSet {
+        binaries,
+        build_scope: BuildScope::WorkspaceAllBins,
+    })
+}
+
+fn select_named_binaries<'a>(
+    package: &'a Package,
+    requested: &[String],
+) -> Result<Vec<&'a Target>> {
+    let binaries = binary_targets(package)?;
+    let mut names = BTreeSet::new();
+    let mut selected = Vec::with_capacity(requested.len());
+    for name in requested {
+        if !names.insert(name.as_str()) {
+            bail!("binary `{name}` was selected more than once");
+        }
+        let target = binaries
+            .iter()
+            .copied()
+            .find(|target| target.name == *name)
+            .with_context(|| {
+                format!(
+                    "binary `{name}` does not exist in package `{}`; available binaries: {}",
+                    package.name,
+                    binary_names(&binaries)
+                )
+            })?;
+        selected.push(target);
+    }
+    selected.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(selected)
+}
+
+fn selection(package: &Package, binary: &Target) -> Selection {
+    Selection {
         package_id: package.id.clone(),
         package_name: package.name.to_string(),
         binary_name: binary.name.clone(),
-    })
+    }
 }
 
 fn select_package<'a>(metadata: &'a Metadata, context: &SelectionContext) -> Result<&'a Package> {
@@ -138,15 +265,7 @@ fn package_containing<'a>(packages: &[&'a Package], current_dir: &Path) -> Optio
 }
 
 fn select_binary<'a>(package: &'a Package, requested: Option<&str>) -> Result<&'a Target> {
-    let mut binaries: Vec<_> = package
-        .targets
-        .iter()
-        .filter(|target| target.is_bin())
-        .collect();
-    binaries.sort_by(|left, right| left.name.cmp(&right.name));
-    if binaries.is_empty() {
-        bail!("package `{}` has no binary targets", package.name);
-    }
+    let binaries = binary_targets(package)?;
 
     if let Some(requested) = requested {
         return binaries
@@ -192,6 +311,19 @@ fn select_binary<'a>(package: &'a Package, requested: Option<&str>) -> Result<&'
     )
 }
 
+fn binary_targets(package: &Package) -> Result<Vec<&Target>> {
+    let mut binaries: Vec<_> = package
+        .targets
+        .iter()
+        .filter(|target| target.is_bin())
+        .collect();
+    binaries.sort_by(|left, right| left.name.cmp(&right.name));
+    if binaries.is_empty() {
+        bail!("package `{}` has no binary targets", package.name);
+    }
+    Ok(binaries)
+}
+
 fn absolute_path(path: &Path, current_dir: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -219,7 +351,7 @@ fn binary_names(binaries: &[&Target]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectionContext, select};
+    use super::{SelectionContext, select, select_many};
     use cargo_metadata::Metadata;
     use std::path::PathBuf;
 
@@ -276,9 +408,99 @@ mod tests {
         SelectionContext {
             package: package.map(str::to_owned),
             binary: binary.map(str::to_owned),
+            binaries: Vec::new(),
+            all_bins: false,
+            all: false,
             manifest_path: None,
             current_dir: PathBuf::from("/workspace"),
         }
+    }
+
+    fn selected_names(selected: &super::SelectionSet) -> Vec<(&str, &str)> {
+        selected
+            .binaries
+            .iter()
+            .map(|binary| (binary.package_name.as_str(), binary.binary_name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn all_selects_every_workspace_binary_in_stable_order() {
+        let mut selected_context = context(None, None);
+        selected_context.all = true;
+
+        let selected = select_many(&workspace(), &selected_context).unwrap();
+
+        assert_eq!(
+            selected_names(&selected),
+            [("api", "migrate"), ("api", "serve"), ("worker", "worker")]
+        );
+        assert_eq!(selected.build_scope, super::BuildScope::WorkspaceAllBins);
+    }
+
+    #[test]
+    fn all_bins_selects_every_binary_in_one_package() {
+        let mut selected_context = context(Some("api"), None);
+        selected_context.all_bins = true;
+
+        let selected = select_many(&workspace(), &selected_context).unwrap();
+
+        assert_eq!(
+            selected_names(&selected),
+            [("api", "migrate"), ("api", "serve")]
+        );
+        assert_eq!(selected.build_scope, super::BuildScope::PackageAllBins);
+    }
+
+    #[test]
+    fn bins_selects_a_named_subset_in_one_package() {
+        let mut selected_context = context(Some("api"), None);
+        selected_context.binaries = vec!["migrate".to_string()];
+
+        let selected = select_many(&workspace(), &selected_context).unwrap();
+
+        assert_eq!(selected_names(&selected), [("api", "migrate")]);
+        assert_eq!(selected.build_scope, super::BuildScope::Selected);
+    }
+
+    #[test]
+    fn all_rejects_binary_names_shared_by_packages() {
+        let mut metadata = workspace();
+        metadata.packages[1].targets[0].name = "serve".to_string();
+        let mut selected_context = context(None, None);
+        selected_context.all = true;
+
+        let error = select_many(&metadata, &selected_context).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("serve"), "{text}");
+        assert!(text.contains("api"), "{text}");
+        assert!(text.contains("worker"), "{text}");
+    }
+
+    #[test]
+    fn all_skips_workspace_packages_without_binary_targets() {
+        let mut metadata = workspace();
+        metadata.packages[1].targets.clear();
+        let mut selected_context = context(None, None);
+        selected_context.all = true;
+
+        let selected = select_many(&metadata, &selected_context).unwrap();
+
+        assert_eq!(
+            selected_names(&selected),
+            [("api", "migrate"), ("api", "serve")]
+        );
+    }
+
+    #[test]
+    fn bins_reports_an_unknown_name_with_available_choices() {
+        let mut selected_context = context(Some("api"), None);
+        selected_context.binaries = vec!["missing".to_string()];
+
+        let error = select_many(&workspace(), &selected_context).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("missing"), "{text}");
+        assert!(text.contains("migrate, serve"), "{text}");
     }
 
     #[test]

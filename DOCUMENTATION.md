@@ -21,10 +21,11 @@ Reference for `elfpak`. See [README.md](README.md) for the short version.
 ```text
 elfpak inspect <binary> [--root <sysroot>] [--library-path <dir>] [--json]
 
-elfpak bundle <binary>
+elfpak bundle <binary>...
     --output <dir>            where the rootfs directory is written
     --tar <file>              where the rootfs tar archive is written
     --install <path>          path of the executable inside the rootfs
+    --install-dir <dir>       directory for executables, preserving their names
     --root <sysroot>          logical / used for dependency lookup (default: /)
     --preset <minimal|web>    runtime policy preset
     --include <path>          extra file or directory, location preserved
@@ -65,20 +66,30 @@ directory, Cargo's root package, or a sole workspace default member, in that
 order. An ambiguous virtual workspace fails and lists the packages accepted by
 `-p`.
 
-Binary selection uses `--bin` when supplied. Otherwise it honors `default-run`,
-then a binary named like the package, then a sole binary target. If multiple
-binaries remain, the command fails and lists the names accepted by `--bin`.
+Binary selection uses one of four modes:
 
-Before bundling, the adapter always runs a narrowly selected `cargo build`.
-Cargo's own fingerprinting decides whether the executable is fresh or needs to
+- `--bin <NAME>` selects one binary from the selected package;
+- `--bins <NAME>,<NAME>` selects a named subset from the selected package;
+- `--all-bins` selects every binary from the selected package; and
+- `--all` selects every binary target from every workspace member.
+
+Without one of these modes, selection honors `default-run`, then a binary named
+like the package, then a sole binary target. If multiple binaries remain, the
+command fails and lists the names accepted by `--bin`. `--bins` and
+`--all-bins` use the normal package inference when `-p` is omitted. `--all`
+conflicts with `-p` and every other binary selector.
+
+Before bundling, the adapter always runs one appropriately scoped `cargo build`.
+Cargo's own fingerprinting decides whether each executable is fresh or needs to
 be rebuilt, covering dependencies, build scripts, features, profiles, compiler
-options and configuration. The executable path comes from Cargo's JSON artifact
-message rather than from a guessed `target/` layout.
+options and configuration. Executable paths come from Cargo's JSON artifact
+messages rather than from a guessed `target/` layout.
 
 The Cargo build options are:
 
 ```text
--p, --package <PACKAGE>  --bin <NAME>
+-p, --package <PACKAGE>
+--bin <NAME> | --bins <NAMES> | --all-bins | --all
 --release | --profile <NAME>
 --target <TRIPLE>        --target-dir <DIR>
 --manifest-path <PATH>
@@ -87,10 +98,11 @@ The Cargo build options are:
 ```
 
 All other options are the standalone `elfpak bundle` options documented below.
-The Cargo artifact replaces any `binary` value in `elfpak.toml`; every other
-configuration and CLI precedence rule is unchanged. `cargo-elfpak` accepts one
-package, binary and target per invocation because one bundle has one application
-executable.
+The Cargo artifacts replace `binary` or `binaries` values in `elfpak.toml`;
+every other configuration and CLI precedence rule is unchanged. Multiple
+selected binaries keep their target names beneath `--install-dir` (or `/` when
+it is omitted). If workspace packages expose the same binary target name,
+`--all` fails and names both packages; select a non-colliding subset instead.
 
 ### `inspect`
 
@@ -133,6 +145,21 @@ $ elfpak bundle ./server \
 The executable is installed at `--install`; every other file keeps the path it
 had in the source root. The manifest is written beside the rootfs, never inside
 it (`--manifest` overrides the location, `--no-manifest` disables it).
+
+Pass multiple executables with `--install-dir` to create one bundle. Their
+basenames are preserved and shared libraries are stored once:
+
+```console
+$ elfpak bundle ./server ./migrate \
+    --output /out/rootfs \
+    --install-dir /app \
+    --preset web
+```
+
+With no install option, binaries land at `/<basename>`. Singular `--install`
+cannot represent multiple binaries and is rejected in that mode. Duplicate
+basenames, mixed executable architectures, and cross-application path
+collisions fail before any output is published.
 
 ### Tar output
 
@@ -246,6 +273,19 @@ allow = ["libc.so.6", "libgcc_s.so.1"]
 
 Unknown keys are rejected rather than ignored, so typos surface immediately.
 
+For a standalone multi-binary bundle, replace the singular package keys with:
+
+```toml
+[package]
+binaries = ["target/release/server", "target/release/migrate"]
+install_dir = "/app"
+output = "/rootfs"
+```
+
+`binary` conflicts with `binaries`, and `install` conflicts with `install_dir`.
+Relative binary paths are resolved beside the configuration file; install paths
+remain logical paths inside the rootfs.
+
 ## Dependency policy
 
 `[dependencies].allow` (or `--allow-library`, repeatable) turns the runtime
@@ -279,6 +319,7 @@ file, its digest, its mode, and why it is there:
 ```json
 {
   "binary": "/app/server",
+  "binaries": ["/app/server", "/app/migrate"],
   "architecture": "x86_64",
   "interpreter": "/lib64/ld-linux-x86-64.so.2",
   "policy": {
@@ -311,6 +352,10 @@ preset, every runtime feature, the user identity, explicit includes and the
 allow-list. Reproducing a bundle requires the same configuration, so the
 configuration is part of the record rather than something the caller has to
 remember.
+
+Manifest version 3 records every installed application in `binaries` while
+retaining `binary` as the primary/first application for compatibility. Older
+manifests without `binaries` continue to verify as singular bundles.
 
 ```console
 $ elfpak verify /out/elfpak-manifest.json
@@ -545,7 +590,7 @@ sequenceDiagram
     Note over Rootfs,Manifest: Each artifact is atomic, but the set is published sequentially
 ```
 
-Output is deterministic for the same application binary, source root,
+Output is deterministic for the same application binaries, source root,
 configuration and `elfpak` version: entries are ordered by destination, file
 modes are normalized to `0755`/`0644`, and file *and directory* timestamps are
 pinned to `SOURCE_DATE_EPOCH` (default: the Unix epoch), so an image layer built
@@ -629,6 +674,8 @@ $ tests/docker/smoke.sh ldcache    # a library the loader only finds through a c
 $ tests/docker/smoke.sh tar        # the same service delivered as a tar and ADDed
 $ tests/docker/smoke.sh verify     # `elfpak verify` as a build gate
 $ tests/docker/smoke.sh cross      # non-Rust cross-architecture packaging
+$ tests/docker/smoke.sh multi      # multiple inputs in one scratch image
+$ tests/docker/smoke.sh cargo-multi # cargo-elfpak multi-binary selectors
 
 $ tests/docker/smoke.sh --fresh    # remove the suite's images, build with --no-cache
 ```
@@ -743,6 +790,13 @@ The Docker smoke tests:
   `elfpak`, and runs the result under emulation. Nothing is compiled or executed
   for the foreign architecture, which keeps it cheap and covers the non-Rust
   path.
+* `multi` — passes two distribution executables to one `elfpak bundle`
+  invocation with `--install-dir`, copies the combined rootfs into one scratch
+  image, and independently runs both preserved executable names.
+* `cargo-multi` — builds a temporary Cargo workspace with two packages and four
+  binary targets. It exercises workspace `--all`, package `--all-bins`, and a
+  comma-separated `--bins first,third` subset, checks excluded binaries never
+  enter the subset rootfs, and runs every workspace binary from scratch.
 
 ## Status
 

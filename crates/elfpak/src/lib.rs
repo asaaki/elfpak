@@ -43,12 +43,25 @@ pub fn run() -> std::process::ExitCode {
 /// The supplied binary takes precedence over `elfpak.toml`; every other bundle
 /// option retains the standalone command's normal precedence rules.
 pub fn run_bundle(
-    mut args: BundleArgs,
+    args: BundleArgs,
     binary: PathBuf,
     quiet: bool,
     verbose: u8,
 ) -> std::process::ExitCode {
-    args.binary = Some(binary);
+    run_bundle_many(args, vec![binary], quiet, verbose)
+}
+
+/// Run `elfpak bundle` with binaries selected by an embedding adapter.
+///
+/// The supplied binaries take precedence over `elfpak.toml`; every other
+/// bundle option retains the standalone command's normal precedence rules.
+pub fn run_bundle_many(
+    mut args: BundleArgs,
+    binaries: Vec<PathBuf>,
+    quiet: bool,
+    verbose: u8,
+) -> std::process::ExitCode {
+    args.binaries = binaries;
     finish(bundle::run(&args, Verbosity::new(quiet, verbose)))
 }
 

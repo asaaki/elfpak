@@ -8,6 +8,11 @@ repository.workspace = true
 readme.workspace = true
 description = "Cargo subcommand for packaging a binary and its Linux runtime closure"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.{ archive-format }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [lib]
 name = "cargo_elfpak"
 path = "src/lib.rs"

@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+
+# Multiple-input smoke test. Two distribution executables are packaged by one
+# elfpak invocation and then independently executed from the same scratch image.
+
+# Base images are pinned by tag and digest so the fixture cannot move beneath
+# the test. Refresh the digest with `docker buildx imagetools inspect`.
+ARG ELFPAK_IMAGE=elfpak:local
+ARG DEBIAN_IMAGE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+
+FROM ${ELFPAK_IMAGE} AS elfpak
+
+FROM ${DEBIAN_IMAGE} AS build
+
+COPY --from=elfpak /elfpak /usr/local/bin/elfpak
+
+RUN elfpak bundle /bin/echo /usr/bin/printf \
+    --output /rootfs \
+    --install-dir /app \
+    --preset minimal \
+    -v
+
+FROM scratch
+
+COPY --from=build /rootfs /
+
+ENTRYPOINT ["/app/echo"]

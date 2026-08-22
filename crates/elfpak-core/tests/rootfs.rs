@@ -3,7 +3,9 @@
 mod common;
 
 use common::{Sysroot, have_cc};
-use elfpak_core::{Manifest, Planner, RootFsBuilder, SourceRoot, manifest::VerifyOptions};
+use elfpak_core::{
+    LdCache, Manifest, PlannedFileKind, Planner, RootFsBuilder, SourceRoot, manifest::VerifyOptions,
+};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -37,6 +39,110 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (String, u64)> {
         }
     }
     out
+}
+
+#[test]
+fn multi_executable_plan_contains_every_application_and_shared_file_once() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/default")
+    .add_binary(sysroot.path("/bin/app-rpath"), "/app/rpath")
+    .plan()
+    .unwrap();
+
+    let destinations: Vec<_> = plan
+        .executables()
+        .map(|file| file.destination().to_path_buf())
+        .collect();
+    assert_eq!(
+        destinations,
+        [PathBuf::from("/app/default"), PathBuf::from("/app/rpath")]
+    );
+    assert_eq!(plan.applications().len(), 2);
+    assert_eq!(
+        plan.files()
+            .iter()
+            .filter(|file| {
+                file.kind() == PlannedFileKind::SharedObject
+                    && file.destination() == Path::new("/usr/lib/libbase.so.1.4.2")
+            })
+            .count(),
+        1,
+        "a shared dependency has one materialized entry"
+    );
+
+    RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
+    assert!(rootfs.join("app/default").is_file());
+    assert!(rootfs.join("app/rpath").is_file());
+}
+
+#[test]
+fn multi_executable_plan_rejects_duplicate_install_destinations() {
+    let Some(sysroot) = sysroot() else { return };
+
+    let error = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .add_binary(sysroot.path("/bin/app-rpath"), "/app/server")
+    .plan()
+    .unwrap_err();
+
+    assert!(error.to_string().contains("/app/server"), "{error}");
+}
+
+#[test]
+fn multi_executable_loader_cache_names_libraries_from_every_closure() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/default")
+    .add_binary(sysroot.path("/bin/app-cached"), "/app/cached")
+    .plan()
+    .unwrap();
+    RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
+
+    let cache = LdCache::parse(&std::fs::read(rootfs.join("etc/ld.so.cache")).unwrap());
+    assert!(
+        cache
+            .lookup("libbase.so.1")
+            .contains(&PathBuf::from("/usr/lib/libbase.so.1.4.2"))
+    );
+    assert!(
+        cache
+            .lookup("libcached.so.1")
+            .contains(&PathBuf::from("/opt/cached/libcached.so.1"))
+    );
+}
+
+#[test]
+fn multi_executable_plan_rejects_a_cross_application_library_collision() {
+    let Some(sysroot) = sysroot() else { return };
+
+    let error = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/default")
+    .add_binary(sysroot.path("/bin/app-rpath"), "/usr/lib/libtop.so.1")
+    .plan()
+    .unwrap_err();
+
+    let message = error.to_string();
+    assert!(message.contains("/usr/lib/libtop.so.1"), "{message}");
+    assert!(message.contains("collides"), "{message}");
 }
 
 #[test]
@@ -120,6 +226,7 @@ fn manifest_records_every_file_and_verifies() {
 
     let loaded = Manifest::load(&path).unwrap();
     assert_eq!(loaded.binary, "/app/server");
+    assert_eq!(loaded.binaries, ["/app/server"]);
     assert_eq!(loaded.files.len(), plan.files().len());
     assert!(loaded.verify(&rootfs, &VerifyOptions::default()).is_ok());
 
@@ -128,6 +235,26 @@ fn manifest_records_every_file_and_verifies() {
     let report = loaded.verify(&rootfs, &VerifyOptions::default());
     assert!(!report.is_ok());
     assert!(report.problems.iter().any(|p| p.path == "/app/server"));
+}
+
+#[test]
+fn version_three_manifest_requires_its_complete_binary_list() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let path = output.path().join("elfpak-manifest.json");
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    let mut manifest = Manifest::from_plan(&plan, &sysroot.root, None);
+    manifest.binaries.clear();
+    manifest.write(&path).unwrap();
+
+    let error = Manifest::load(&path).unwrap_err();
+    assert!(error.to_string().contains("binaries"), "{error}");
 }
 
 #[test]
@@ -498,6 +625,7 @@ fn manifests_without_a_policy_section_still_load() {
 
     let manifest = Manifest::load(&path).unwrap();
     assert_eq!(manifest.manifest_version, 1);
+    assert!(manifest.binaries.is_empty());
     assert_eq!(manifest.files.len(), 1);
     assert!(manifest.policy.preset.is_none());
     assert!(!manifest.policy.tmp);

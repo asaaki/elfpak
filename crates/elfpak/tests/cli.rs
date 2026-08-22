@@ -29,6 +29,135 @@ fn subject() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+fn multiple_subjects() -> Option<[PathBuf; 2]> {
+    let mut binaries = ["/usr/bin/ls", "/usr/bin/env", "/bin/cat"]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let first = binaries.next()?;
+    let second = binaries.find(|path| path.file_name() != first.file_name())?;
+    Some([first, second])
+}
+
+#[test]
+fn multiple_binaries_are_installed_under_one_directory_and_recorded() {
+    let Some([first, second]) = multiple_subjects() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = tmp.path().join("rootfs");
+    let archive = tmp.path().join("rootfs.tar");
+
+    let output = elfpak(&[
+        "bundle",
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+        "--output",
+        rootfs.to_str().unwrap(),
+        "--tar",
+        archive.to_str().unwrap(),
+        "--install-dir",
+        "/app",
+        "--no-config",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let first_install = format!("/app/{}", first.file_name().unwrap().to_string_lossy());
+    let second_install = format!("/app/{}", second.file_name().unwrap().to_string_lossy());
+    assert!(rootfs.join(first_install.trim_start_matches('/')).is_file());
+    assert!(
+        rootfs
+            .join(second_install.trim_start_matches('/'))
+            .is_file()
+    );
+    assert!(archive.is_file());
+    let archive_listing = Command::new("tar")
+        .args(["-tf", archive.to_str().unwrap()])
+        .output();
+    if let Ok(listing) = archive_listing {
+        assert!(listing.status.success(), "{}", stderr(&listing));
+        let listing = stdout(&listing);
+        assert!(
+            listing.contains(first_install.trim_start_matches('/')),
+            "{listing}"
+        );
+        assert!(
+            listing.contains(second_install.trim_start_matches('/')),
+            "{listing}"
+        );
+    }
+
+    let manifest_path = tmp.path().join("elfpak-manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["binary"], first_install);
+    assert_eq!(
+        manifest["binaries"],
+        serde_json::json!([first_install, second_install])
+    );
+
+    let verify = elfpak(&["verify", manifest_path.to_str().unwrap()]);
+    assert!(verify.status.success(), "{}", stderr(&verify));
+}
+
+#[test]
+fn multiple_binaries_reject_a_singular_install_path() {
+    let Some([first, second]) = multiple_subjects() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = tmp.path().join("rootfs");
+
+    let output = elfpak(&[
+        "bundle",
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+        "--output",
+        rootfs.to_str().unwrap(),
+        "--install",
+        "/app/server",
+        "--no-config",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("--install-dir"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!rootfs.exists());
+}
+
+#[test]
+fn multiple_binaries_reject_duplicate_preserved_names_before_writing() {
+    let Some([first, second]) = multiple_subjects() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let first_copy = tmp.path().join("one/tool");
+    let second_copy = tmp.path().join("two/tool");
+    std::fs::create_dir_all(first_copy.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(second_copy.parent().unwrap()).unwrap();
+    std::fs::copy(first, &first_copy).unwrap();
+    std::fs::copy(second, &second_copy).unwrap();
+    let rootfs = tmp.path().join("rootfs");
+
+    let output = elfpak(&[
+        "bundle",
+        first_copy.to_str().unwrap(),
+        second_copy.to_str().unwrap(),
+        "--output",
+        rootfs.to_str().unwrap(),
+        "--install-dir",
+        "/app",
+        "--no-config",
+    ]);
+
+    assert!(!output.status.success());
+    let error = stderr(&output);
+    assert!(error.contains("/app/tool"), "{error}");
+    assert!(!rootfs.exists());
+}
+
 #[test]
 fn inspect_reports_architecture_interpreter_and_dependencies() {
     let Some(binary) = subject() else { return };
@@ -220,6 +349,42 @@ fn config_file_supplies_defaults_and_cli_overrides_them() {
     ]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(overridden.join("opt/app").is_file());
+}
+
+#[test]
+fn config_file_can_supply_multiple_binaries_and_an_install_directory() {
+    let Some([first, second]) = multiple_subjects() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("elfpak.toml");
+    let rootfs = tmp.path().join("rootfs");
+    std::fs::write(
+        &config,
+        format!(
+            "[package]\nbinaries = ['{}', '{}']\ninstall_dir = '/app'\noutput = '{}'\n",
+            first.display(),
+            second.display(),
+            rootfs.display()
+        ),
+    )
+    .unwrap();
+
+    let output = elfpak(&["bundle", "--config", config.to_str().unwrap()]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        rootfs
+            .join("app")
+            .join(first.file_name().unwrap())
+            .is_file()
+    );
+    assert!(
+        rootfs
+            .join("app")
+            .join(second.file_name().unwrap())
+            .is_file()
+    );
 }
 
 #[test]

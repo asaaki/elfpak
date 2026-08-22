@@ -1,4 +1,4 @@
-use crate::metadata::Selection;
+use crate::metadata::{BuildScope, SelectionSet};
 use anyhow::{Context, Result, bail};
 use cargo_metadata::Message;
 use std::{
@@ -13,7 +13,7 @@ const CARGO_STDERR_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct BuildRequest<'a> {
-    pub(crate) selection: &'a Selection,
+    pub(crate) selections: &'a SelectionSet,
     pub(crate) current_dir: &'a Path,
     pub(crate) manifest_path: Option<&'a Path>,
     pub(crate) release: bool,
@@ -35,20 +35,14 @@ pub(crate) struct BuildArtifact {
     pub(crate) fresh: bool,
 }
 
-pub(crate) fn run(request: &BuildRequest<'_>) -> Result<BuildArtifact> {
+pub(crate) fn run(request: &BuildRequest<'_>) -> Result<Vec<BuildArtifact>> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(&cargo);
     command
         .current_dir(request.current_dir)
-        .args([
-            "build",
-            "--message-format=json-render-diagnostics",
-            "--package",
-            &request.selection.package_name,
-            "--bin",
-            &request.selection.binary_name,
-        ])
+        .args(["build", "--message-format=json-render-diagnostics"])
         .stdout(Stdio::piped());
+    append_selection(&mut command, request.selections);
     append_path_option(&mut command, "--manifest-path", request.manifest_path);
     append_flag(&mut command, "--release", request.release);
     append_value_option(&mut command, "--profile", request.profile);
@@ -76,17 +70,26 @@ pub(crate) fn run(request: &BuildRequest<'_>) -> Result<BuildArtifact> {
         .with_context(|| format!("could not run `{}`", cargo.to_string_lossy()))?;
     let stdout = child.stdout.take().context("could not read Cargo output")?;
     let stderr_reader = child.stderr.take().map(read_stderr);
-    let mut artifacts = Vec::new();
+    let mut artifacts: Vec<Option<BuildArtifact>> = std::iter::repeat_with(|| None)
+        .take(request.selections.binaries.len())
+        .collect();
 
     for message in Message::parse_stream(BufReader::new(stdout)) {
         match message.context("could not parse Cargo build output")? {
-            Message::CompilerArtifact(artifact)
-                if artifact.package_id == request.selection.package_id
-                    && artifact.target.name == request.selection.binary_name
-                    && artifact.target.is_bin() =>
-            {
-                if let Some(executable) = artifact.executable {
-                    artifacts.push(BuildArtifact {
+            Message::CompilerArtifact(artifact) if artifact.target.is_bin() => {
+                if let Some(index) = request.selections.binaries.iter().position(|selection| {
+                    artifact.package_id == selection.package_id
+                        && artifact.target.name == selection.binary_name
+                }) && let Some(executable) = artifact.executable
+                {
+                    if artifacts[index].is_some() {
+                        bail!(
+                            "Cargo produced more than one executable artifact for package `{}` binary `{}`",
+                            request.selections.binaries[index].package_name,
+                            request.selections.binaries[index].binary_name
+                        );
+                    }
+                    artifacts[index] = Some(BuildArtifact {
                         executable: executable.into_std_path_buf(),
                         fresh: artifact.fresh,
                     });
@@ -110,18 +113,46 @@ pub(crate) fn run(request: &BuildRequest<'_>) -> Result<BuildArtifact> {
         }
         bail!("Cargo build failed with status {status}");
     }
-    match artifacts.len() {
-        1 => Ok(artifacts.remove(0)),
-        0 => bail!(
-            "Cargo produced no executable artifact for package `{}` binary `{}`",
-            request.selection.package_name,
-            request.selection.binary_name
-        ),
-        count => bail!(
-            "Cargo produced {count} executable artifacts for package `{}` binary `{}`",
-            request.selection.package_name,
-            request.selection.binary_name
-        ),
+    let mut completed = Vec::with_capacity(artifacts.len());
+    for (artifact, selection) in artifacts.into_iter().zip(&request.selections.binaries) {
+        completed.push(artifact.with_context(|| {
+            format!(
+                "Cargo produced no executable artifact for package `{}` binary `{}`",
+                selection.package_name, selection.binary_name
+            )
+        })?);
+    }
+    Ok(completed)
+}
+
+fn append_selection(command: &mut Command, selections: &SelectionSet) {
+    match selections.build_scope {
+        BuildScope::WorkspaceAllBins => {
+            command.args(["--workspace", "--bins"]);
+        }
+        BuildScope::PackageAllBins => {
+            let package = &selections.binaries[0].package_name;
+            assert!(
+                selections
+                    .binaries
+                    .iter()
+                    .all(|selection| selection.package_name == *package)
+            );
+            command.args(["--package", package, "--bins"]);
+        }
+        BuildScope::Selected => {
+            let package = &selections.binaries[0].package_name;
+            assert!(
+                selections
+                    .binaries
+                    .iter()
+                    .all(|selection| selection.package_name == *package)
+            );
+            command.args(["--package", package]);
+            for selection in &selections.binaries {
+                command.args(["--bin", &selection.binary_name]);
+            }
+        }
     }
 }
 

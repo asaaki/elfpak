@@ -4,7 +4,7 @@
 //! configuration are one module each.
 
 mod outputs;
-mod paths;
+pub(crate) mod paths;
 mod policy;
 
 use crate::{
@@ -26,12 +26,19 @@ pub(crate) fn run(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()>
     let paths = Paths::resolve(args, &config)?;
     let preset = args.preset.or(config.runtime.preset);
 
-    let mut planner = Planner::new(SourceRoot::new(&paths.root), &paths.binary);
+    let first = paths
+        .inputs
+        .first()
+        .expect("path resolution always produces at least one input");
+    let mut planner =
+        Planner::new(SourceRoot::new(&paths.root), &first.binary).install_as(&first.install);
+    for input in &paths.inputs[1..] {
+        planner = planner.add_binary(&input.binary, &input.install);
+    }
     if let Some(preset) = preset {
         planner = planner.preset(preset);
     }
     let plan = planner
-        .install_as(&paths.install)
         .runtime_policy(runtime_policy(args, &config, preset)?)
         .dependency_policy(dependency_policy(args, &config))
         .library_paths(args.library_paths.clone())
@@ -47,7 +54,7 @@ pub(crate) fn run(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()>
     verbosity.print(|out| {
         render::bundle_summary(
             out,
-            &paths.binary,
+            &paths.inputs,
             &plan,
             render::Destinations {
                 rootfs: paths.output.as_deref(),

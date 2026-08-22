@@ -1,0 +1,75 @@
+# syntax=docker/dockerfile:1
+
+# cargo-elfpak multi-binary smoke test. A real temporary workspace exercises
+# workspace-wide, package-wide and named-subset selection before the complete
+# workspace bundle is copied into a scratch image.
+
+# Pinned by tag and digest; refresh with `docker buildx imagetools inspect`.
+ARG RUST_IMAGE=rust:1.98.0-slim-trixie@sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a82d5b3db078
+
+FROM ${RUST_IMAGE} AS build
+
+ARG TARGETARCH
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Keep the tool build separate from the fixture so editing its tiny sources
+# does not rebuild cargo-elfpak and its dependency graph.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target,id=cargo-elfpak-smoke-${TARGETARCH},sharing=locked \
+    cargo build --release --locked --bin cargo-elfpak \
+    && cp target/release/cargo-elfpak /usr/local/bin/cargo-elfpak
+
+WORKDIR /fixture
+
+COPY tests/docker/fixtures/cargo-multibin/ ./
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/fixture/target,id=cargo-multibin-fixture-${TARGETARCH},sharing=locked <<'SHELL'
+set -eu
+
+cargo elfpak bundle --all --offline \
+    --output /rootfs-all \
+    --install-dir /app \
+    --preset minimal \
+    --no-manifest \
+    --no-config
+
+test "$(chroot /rootfs-all /app/first)" = first
+test "$(chroot /rootfs-all /app/second)" = second
+test "$(chroot /rootfs-all /app/third)" = third
+test "$(chroot /rootfs-all /app/worker)" = worker
+
+cargo elfpak bundle -p tools --all-bins --offline \
+    --output /rootfs-package \
+    --install-dir /app \
+    --preset minimal \
+    --no-manifest \
+    --no-config
+
+test "$(chroot /rootfs-package /app/first)" = first
+test "$(chroot /rootfs-package /app/second)" = second
+test "$(chroot /rootfs-package /app/third)" = third
+test ! -e /rootfs-package/app/worker
+
+cargo elfpak bundle -p tools --bins first,third --offline \
+    --output /rootfs-subset \
+    --install-dir /app \
+    --preset minimal \
+    --no-manifest \
+    --no-config
+
+test "$(chroot /rootfs-subset /app/first)" = first
+test "$(chroot /rootfs-subset /app/third)" = third
+test ! -e /rootfs-subset/app/second
+test ! -e /rootfs-subset/app/worker
+SHELL
+
+FROM scratch
+
+COPY --from=build /rootfs-all /
+
+ENTRYPOINT ["/app/first"]

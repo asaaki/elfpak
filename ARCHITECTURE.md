@@ -9,17 +9,17 @@ library.
 
 ```mermaid
 flowchart TB
-    CargoProject["Cargo project"] --> CargoAdapter["crates/cargo-elfpak<br/>package + binary selection"]
-    CargoAdapter --> CargoBuild["cargo build<br/>freshness + artifact path"]
+    CargoProject["Cargo project"] --> CargoAdapter["crates/cargo-elfpak<br/>package + binary-set selection"]
+    CargoAdapter --> CargoBuild["cargo build<br/>freshness + artifact paths"]
     CargoBuild --> Adapter
     Inputs["CLI arguments<br/>optional elfpak.toml"] --> Adapter["crates/elfpak<br/>application adapter"]
 
     subgraph Core["crates/elfpak-core"]
         Source["SourceRoot<br/>logical target filesystem"] --> Elf["ELF parser"]
         Elf --> Resolver["dynamic-linker resolver"]
-        Resolver --> Graph["DependencyGraph"]
-        Policy["runtime + dependency policy"] -->|"may add NSS modules"| Graph
-        Graph --> Planner["Planner"]
+        Resolver --> Graphs["DependencyGraph<br/>per executable"]
+        Policy["runtime + dependency policy"] -->|"may add NSS modules"| Graphs
+        Graphs --> Planner["multi-root Planner"]
         Policy --> Planner
         Planner --> Plan["BundlePlan<br/>read-only public view"]
     end
@@ -54,24 +54,24 @@ re-resolves dependencies.
 
 Both command crates use small executable entry points around testable libraries.
 `crates/elfpak` dispatches `inspect`, `bundle`, and `verify`; it deliberately
-contains no ELF or resolver logic. `crates/cargo-elfpak` resolves one Cargo
-package and binary, lets Cargo make that artifact fresh, then enters the same
-bundle adapter with the artifact path. Workspace-wide lint policy forbids
+contains no ELF or resolver logic. `crates/cargo-elfpak` resolves a Cargo
+binary set, lets Cargo make those artifacts fresh, then enters the same bundle
+adapter with their artifact paths. Workspace-wide lint policy forbids
 `unsafe` and the release profile favors small binaries (`opt-level = "z"`, LTO,
 stripped, and `panic = "abort"`).
 
 ## Cargo adapter flow
 
-`cargo-elfpak` reads `cargo metadata --no-deps` and requires package selection
-only when the current/root/default package cannot be inferred. Within that
-package it prefers an explicit `--bin`, `default-run`, a package-named binary,
-or a sole binary, in that order. Remaining ambiguity is an error that lists the
-valid selectors.
+`cargo-elfpak` reads `cargo metadata --no-deps`. `--all` selects every binary
+target in the workspace; `--all-bins` and `--bins` select all or a subset from
+the explicit/inferred package. Without a plural selector, the adapter prefers
+an explicit `--bin`, `default-run`, a package-named binary, or a sole binary,
+in that order. Remaining ambiguity is an error that lists valid selectors.
 
-It then executes `cargo build` for exactly that package and binary with JSON
-messages enabled. Cargo owns the freshness decision; the adapter consumes the
-matching `compiler-artifact` message so custom profiles, targets and target
-directories need no path reconstruction. Cargo must succeed before the existing
+It executes one scoped `cargo build` with JSON messages enabled and matches
+every selected `(PackageId, target name)` to one `compiler-artifact` message.
+Cargo owns freshness, so custom profiles, targets, and target directories need
+no path reconstruction. Cargo must succeed and report every artifact before the
 bundle planner or any output destination is touched.
 
 ## Core model and data flow
@@ -115,9 +115,11 @@ the kernel-loaded interpreter, and policy-added dependencies.
 
 ### 3. Planning and policy
 
-`Planner` is the decision point. It converts the graph to a sorted
-`BundlePlan`, after checking the install path, dependency allow-list, and any
-install-path collision with a required library. Planned entries are explicit
+`Planner` is the decision point. It converts one graph per executable to a
+shared sorted `BundlePlan`, after checking install paths, architecture,
+dependency allow-lists, and collisions across every closure. Identical shared
+objects and symlinks are deduplicated; executable destinations and conflicting
+contents must be unique. Planned entries are explicit
 directories, symlinks, source-backed regular files, or generated files. Each
 has a destination, normalized mode, size and digest where applicable, kind,
 and inclusion reason.
@@ -136,10 +138,11 @@ Runtime policy is separate from statically discoverable ELF dependencies:
 - `--user` supplies generated identity data when passwd/group is enabled.
 
 The planner also decides whether to generate `/etc/ld.so.cache`. It does so
-when a resolved library was found through a location the packaged loader would
-not otherwise search, or when relocating an `$ORIGIN`-dependent executable
-would break lookup. The cache is built directly from the planned closure. It
-is intentionally not generated for musl, which does not use this cache.
+when any resolved library was found through a location its packaged loader
+would not otherwise search, or when relocating an `$ORIGIN`-dependent
+executable would break lookup. One cache is built from all compatible glibc
+closures, so every application can resolve its shared objects. It is ignored by
+musl, which does not use this cache.
 
 Static analysis cannot determine `dlopen` dependencies. The plan remains valid
 but carries a stable warning; callers can add known runtime files with
@@ -159,8 +162,9 @@ paths are relative; ordering, ownership, modes, and timestamps are pinned.
 Directory output similarly normalizes modes and pins file/directory timestamps
 using `SOURCE_DATE_EPOCH` (default 0).
 
-`Manifest` records the plan, resolved policy, output locations, warnings, and
-every planned entry's path, kind, reason, mode, size, digest, or link target.
+`Manifest` records every application, the shared plan, resolved policy, output
+locations, warnings, and every planned entry's path, kind, reason, mode, size,
+digest, or link target.
 It is written beside the artifacts, never into a rootfs. `verify` validates the
 manifest before checking a materialized tree; normal verification detects
 missing or altered entries, while `--strict` additionally detects unlisted

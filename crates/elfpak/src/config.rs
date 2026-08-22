@@ -25,7 +25,10 @@ pub(crate) struct Config {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PackageConfig {
     pub(crate) binary: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) binaries: Vec<PathBuf>,
     pub(crate) install: Option<PathBuf>,
+    pub(crate) install_dir: Option<PathBuf>,
     pub(crate) output: Option<PathBuf>,
     pub(crate) tar: Option<PathBuf>,
     pub(crate) root: Option<PathBuf>,
@@ -83,6 +86,9 @@ impl Config {
         // rooted in the source filesystem and are intentionally untouched.
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         rebase_path(&mut config.package.binary, base);
+        for binary in &mut config.package.binaries {
+            rebase_value(binary, base);
+        }
         rebase_path(&mut config.package.output, base);
         rebase_path(&mut config.package.tar, base);
         rebase_path(&mut config.package.root, base);
@@ -105,6 +111,12 @@ fn rebase_path(path: &mut Option<PathBuf>, base: &Path) {
         && value.is_relative()
     {
         *value = base.join(&*value);
+    }
+}
+
+fn rebase_value(path: &mut PathBuf, base: &Path) {
+    if path.is_relative() {
+        *path = base.join(&*path);
     }
 }
 
@@ -148,6 +160,23 @@ allow = ["libc.so.6", "libgcc_s.so.1"]
         let config = Config::parse("").unwrap();
         assert!(config.package.binary.is_none());
         assert!(config.include.paths.is_empty());
+    }
+
+    #[test]
+    fn parses_multiple_binary_package_settings() {
+        let config = Config::parse(
+            "[package]\nbinaries = ['target/release/server', 'target/release/migrate']\ninstall_dir = '/app'\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.package.binaries,
+            [
+                PathBuf::from("target/release/server"),
+                PathBuf::from("target/release/migrate")
+            ]
+        );
+        assert_eq!(config.package.install_dir, Some(PathBuf::from("/app")));
     }
 
     #[test]

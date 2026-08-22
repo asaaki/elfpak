@@ -10,6 +10,8 @@
 #   tests/docker/smoke.sh tar          # the same service delivered as a tar and ADDed
 #   tests/docker/smoke.sh verify       # `elfpak verify` as a build gate
 #   tests/docker/smoke.sh cross        # non-Rust cross-architecture packaging
+#   tests/docker/smoke.sh multi        # multiple inputs in one scratch image
+#   tests/docker/smoke.sh cargo-multi  # cargo-elfpak multi-binary selectors
 #
 #   tests/docker/smoke.sh --fresh [test]   # rebuild everything from nothing
 #
@@ -49,6 +51,8 @@ ldcache_image="elfpak-ldcache:local"
 tar_image="elfpak-tar:local"
 verify_image="elfpak-verify:local"
 cross_image="elfpak-cross:local"
+multi_image="elfpak-multi:local"
+cargo_multi_image="elfpak-cargo-multi:local"
 port="${ELFPAK_SMOKE_PORT:-18080}"
 
 # Appended to every build. A single token or nothing at all, so it is expanded
@@ -257,6 +261,60 @@ test_axum_arm64() {
         return 0
     fi
     test_axum linux/arm64
+}
+
+# Two independent executables bundled in one invocation. Running both from the
+# same scratch image proves that --install-dir preserved both names and that
+# the combined closure is sufficient for either entry point.
+test_multi_binary() {
+    local elfpak_tag image output
+    elfpak_tag="$(elfpak_image_for "$host_platform")"
+    image="$(tag_for "$multi_image" "$host_platform")"
+
+    log "packaging two executables into one scratch image"
+    build_image tests/docker/Dockerfile.multibin "$host_platform" "$multi_image" \
+        --build-arg "ELFPAK_IMAGE=$elfpak_tag"
+
+    output="$(docker run --rm --platform "$host_platform" \
+        --entrypoint /app/echo "$image" first second)"
+    [ "$output" = "first second" ] || fail "the first executable did not run: $output"
+    ok "the first executable runs from the shared scratch image"
+
+    output="$(docker run --rm --platform "$host_platform" \
+        --entrypoint /app/printf "$image" '%s:%s\n' left right)"
+    [ "$output" = "left:right" ] || fail "the second executable did not run: $output"
+    ok "the second executable runs from the shared scratch image"
+}
+
+# A temporary Cargo workspace with two packages and four binary targets. The
+# Dockerfile checks all three selector modes while building; running every
+# workspace binary from its final scratch image proves Cargo's artifacts were
+# passed through the same multi-input bundling path.
+test_cargo_multi_binary() {
+    local image output
+    image="$(tag_for "$cargo_multi_image" "$host_platform")"
+
+    log "packaging a Cargo workspace's binary targets"
+    build_image tests/docker/Dockerfile.cargo-multibin \
+        "$host_platform" "$cargo_multi_image"
+
+    output="$(docker run --rm --platform "$host_platform" \
+        --entrypoint /app/first "$image")"
+    [ "$output" = "first" ] || fail "the first Cargo binary did not run: $output"
+
+    output="$(docker run --rm --platform "$host_platform" \
+        --entrypoint /app/second "$image")"
+    [ "$output" = "second" ] || fail "the second Cargo binary did not run: $output"
+
+    output="$(docker run --rm --platform "$host_platform" \
+        --entrypoint /app/third "$image")"
+    [ "$output" = "third" ] || fail "the third Cargo binary did not run: $output"
+
+    output="$(docker run --rm --platform "$host_platform" \
+        --entrypoint /app/worker "$image")"
+    [ "$output" = "worker" ] || fail "the workspace Cargo binary did not run: $output"
+    ok "--all packages every workspace binary into one runnable scratch image"
+    ok "--all-bins and --bins package exactly their requested package subsets"
 }
 
 # The same application, bundled with `minimal` instead of `web`, must fail to
@@ -508,6 +566,8 @@ tests:
   tar         the same service delivered as a tar and ADDed
   verify      `elfpak verify` as a build gate
   cross       non-Rust cross-architecture packaging
+  multi       multiple inputs installed by name in one scratch image
+  cargo-multi cargo-elfpak workspace, package and named-subset selectors
 
 options:
   --fresh     remove the images this suite owns and build everything with
@@ -565,6 +625,8 @@ case "$test_to_run" in
     tar)        test_tar ;;
     verify)     test_verify ;;
     cross)      test_cross ;;
+    multi)      test_multi_binary ;;
+    cargo-multi) test_cargo_multi_binary ;;
     all)
         test_axum "$(all_platforms)"
         test_ca_policy
@@ -573,6 +635,8 @@ case "$test_to_run" in
         test_tar
         test_verify
         test_cross
+        test_multi_binary
+        test_cargo_multi_binary
         ;;
     *)          usage >&2; fail "unknown test: $test_to_run" ;;
 esac

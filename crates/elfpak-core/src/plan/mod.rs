@@ -15,13 +15,18 @@ use crate::{
     },
     source::SourceRoot,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 mod builder;
 mod model;
 
 use builder::PlanBuilder;
-pub use model::{BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Warning};
+pub use model::{
+    ApplicationPlan, BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Warning,
+};
 
 /// Where the loader looks for its cache, and therefore where a generated one
 /// has to go.
@@ -38,12 +43,17 @@ pub const PLAN_ENTRIES_MAX: usize = 1 << 20;
 #[derive(Debug)]
 pub struct Planner {
     source_root: SourceRoot,
-    binary: PathBuf,
-    install_path: PathBuf,
+    binaries: Vec<PlannerInput>,
     runtime_policy: RuntimePolicy,
     dependency_policy: DependencyPolicy,
     library_paths: Vec<PathBuf>,
     preset: Option<Preset>,
+}
+
+#[derive(Debug)]
+struct PlannerInput {
+    binary: PathBuf,
+    install_path: PathBuf,
 }
 
 impl Planner {
@@ -57,8 +67,10 @@ impl Planner {
         );
         Planner {
             source_root,
-            binary,
-            install_path,
+            binaries: vec![PlannerInput {
+                binary,
+                install_path,
+            }],
             runtime_policy: RuntimePolicy::default(),
             dependency_policy: DependencyPolicy::allow_all(),
             library_paths: Vec::new(),
@@ -74,7 +86,20 @@ impl Planner {
     }
 
     pub fn install_as(mut self, path: impl Into<PathBuf>) -> Planner {
-        self.install_path = normalize_absolute(&path.into());
+        self.binaries[0].install_path = normalize_absolute(&path.into());
+        self
+    }
+
+    /// Add another executable and its destination to this bundle.
+    pub fn add_binary(
+        mut self,
+        binary: impl Into<PathBuf>,
+        install_path: impl Into<PathBuf>,
+    ) -> Planner {
+        self.binaries.push(PlannerInput {
+            binary: binary.into(),
+            install_path: normalize_absolute(&install_path.into()),
+        });
         self
     }
 
@@ -97,47 +122,83 @@ impl Planner {
     /// written until [`crate::RootFsBuilder`] or [`crate::TarBuilder`] gets the
     /// plan.
     pub fn plan(&self) -> Result<BundlePlan> {
-        self.check_install_path()?;
+        let mut resolved = Vec::with_capacity(self.binaries.len());
+        let mut closure_entries = 0usize;
+        for input in &self.binaries {
+            self.check_install_path(input)?;
 
-        let mut resolver =
-            Resolver::new(self.source_root.clone()).with_library_paths(self.library_paths.clone());
-        let mut graph = resolver.closure(&self.binary, &self.install_path)?;
-        if self.runtime_policy.nsswitch {
-            self.attach_nss_modules(&mut resolver, &mut graph)?;
+            let mut resolver = Resolver::new(self.source_root.clone())
+                .with_library_paths(self.library_paths.clone());
+            let mut graph = resolver.closure(&input.binary, &input.install_path)?;
+            if self.runtime_policy.nsswitch {
+                self.attach_nss_modules(&mut resolver, &mut graph)?;
+            }
+            self.validate_dependencies(&graph, &input.install_path)?;
+            self.check_install_collision(&graph, &input.install_path)?;
+            closure_entries = closure_entries
+                .checked_add(graph.node_count())
+                .and_then(|count| {
+                    graph
+                        .nodes
+                        .iter()
+                        .try_fold(count, |total, node| total.checked_add(node.links.len()))
+                })
+                .ok_or_else(|| Error::Config {
+                    message: format!("bundle plan exceeds {PLAN_ENTRIES_MAX} closure entries"),
+                })?;
+            if closure_entries > PLAN_ENTRIES_MAX {
+                return Err(Error::Config {
+                    message: format!("bundle plan exceeds {PLAN_ENTRIES_MAX} closure entries"),
+                });
+            }
+            resolved.push((resolver, graph));
         }
-
-        self.validate_dependencies(&graph)?;
-        self.check_install_collision(&graph)?;
+        let architecture = self.check_architectures(&resolved)?;
+        check_closure_collisions(&resolved)?;
 
         let mut warnings: Vec<Warning> = Vec::new();
         let mut builder = PlanBuilder::new(&self.source_root);
-        self.plan_loader_cache(&graph, &resolver, &mut builder, &mut warnings);
-        self.plan_closure(&graph, &mut builder, &mut warnings)?;
+        self.plan_loader_cache(&resolved, &mut builder, &mut warnings);
+        for (_, graph) in &resolved {
+            self.plan_closure(graph, &mut builder, &mut warnings)?;
+        }
         self.apply_runtime_policy(&mut builder, &mut warnings)?;
+        deduplicate_warnings(&mut warnings);
 
         let files = builder.finish();
-        let executable = files
-            .iter()
-            .find(|f| f.kind == PlannedFileKind::Executable)
-            .cloned()
-            .expect("the plan always contains the executable");
-
-        // Every object in the closure is an entry, and every entry needs its
-        // parent directories, so a plan is never smaller than the graph.
-        assert_eq!(executable.destination, graph.root_node().destination);
-        assert!(files.len() >= graph.node_count());
+        if files.len() > PLAN_ENTRIES_MAX {
+            return Err(Error::Config {
+                message: format!("bundle plan exceeds {PLAN_ENTRIES_MAX} entries"),
+            });
+        }
+        let applications = resolved
+            .into_iter()
+            .map(|(_, graph)| {
+                let destination = &graph.root_node().destination;
+                let executable = files
+                    .iter()
+                    .find(|file| {
+                        file.kind == PlannedFileKind::Executable && &file.destination == destination
+                    })
+                    .cloned()
+                    .expect("every graph root has one planned executable");
+                ApplicationPlan {
+                    executable,
+                    interpreter: graph.declared_interpreter.clone(),
+                    interpreter_resolved: graph
+                        .nodes
+                        .iter()
+                        .find(|node| node.kind == NodeKind::Interpreter)
+                        .map(|node| node.destination.clone()),
+                    graph,
+                }
+            })
+            .collect();
 
         Ok(BundlePlan {
-            executable,
-            architecture: graph.root_node().architecture,
-            interpreter: graph.declared_interpreter.clone(),
-            interpreter_resolved: graph
-                .nodes
-                .iter()
-                .find(|n| n.kind == NodeKind::Interpreter)
-                .map(|n| n.destination.clone()),
+            applications,
+            architecture,
             files,
-            graph,
             preset: self.preset,
             runtime_policy: self.runtime_policy.clone(),
             dependency_policy: self.dependency_policy.clone(),
@@ -146,18 +207,42 @@ impl Planner {
     }
 
     /// The executable has to land somewhere the rootfs can name.
-    fn check_install_path(&self) -> Result<()> {
-        assert!(self.install_path.is_absolute());
+    fn check_install_path(&self, input: &PlannerInput) -> Result<()> {
+        assert!(input.install_path.is_absolute());
 
-        if self.install_path.file_name().is_some() {
+        if input.install_path.file_name().is_some() {
             return Ok(());
         }
         Err(Error::Config {
             message: format!(
                 "install path `{}` does not name a file",
-                self.install_path.display()
+                input.install_path.display()
             ),
         })
+    }
+
+    fn check_architectures(
+        &self,
+        resolved: &[(Resolver, DependencyGraph)],
+    ) -> Result<crate::Architecture> {
+        let first = resolved
+            .first()
+            .expect("a planner always has at least one binary")
+            .1
+            .root_node()
+            .architecture;
+        for (_, graph) in &resolved[1..] {
+            let architecture = graph.root_node().architecture;
+            if architecture != first {
+                return Err(Error::Config {
+                    message: format!(
+                        "executable `{}` has architecture {architecture}, expected {first}",
+                        graph.root_node().logical.display()
+                    ),
+                });
+            }
+        }
+        Ok(first)
     }
 
     /// NSS modules are `dlopen`ed by glibc rather than named by `DT_NEEDED`, so
@@ -199,23 +284,22 @@ impl Planner {
     /// somewhere else. A cache fixes both, and only `elfpak` can write it.
     fn plan_loader_cache(
         &self,
-        graph: &DependencyGraph,
-        resolver: &Resolver,
+        resolved: &[(Resolver, DependencyGraph)],
         builder: &mut PlanBuilder<'_>,
         warnings: &mut Vec<Warning>,
     ) {
-        let unreachable = unreachable_libraries(resolver);
-        let relocated = relocated_search_paths(graph);
-        let needs_cache = !unreachable.is_empty() || !relocated.is_empty();
+        let needs_cache = resolved.iter().any(|(resolver, graph)| {
+            !unreachable_libraries(resolver).is_empty() || !relocated_search_paths(graph).is_empty()
+        });
 
         let cache = self
             .runtime_policy
             .ld_so_cache
             .applies(needs_cache)
-            .then(|| self.ld_so_cache(graph))
+            .then(|| self.ld_so_cache_many(resolved.iter().map(|(_, graph)| graph)))
             .flatten();
 
-        if let Some(bytes) = cache {
+        let wrote_cache = if let Some(bytes) = cache {
             builder.push_generated(
                 Path::new(LD_SO_CACHE),
                 bytes,
@@ -223,15 +307,25 @@ impl Planner {
                     feature: RuntimeFeature::LdSoCache,
                 },
             );
-            return;
-        }
+            true
+        } else {
+            false
+        };
 
-        // No cache: say exactly what the packaged loader will not find.
-        if !unreachable.is_empty() {
-            warnings.push(warn_unreachable(unreachable, uses_glibc_loader(graph)));
-        }
-        if !relocated.is_empty() {
-            warnings.push(warn_relocated(relocated, graph));
+        // A generated cache serves glibc applications only. Other loaders still
+        // need a warning for paths they cannot reproduce inside the bundle.
+        for (resolver, graph) in resolved {
+            if wrote_cache && uses_glibc_loader(graph) {
+                continue;
+            }
+            let unreachable = unreachable_libraries(resolver);
+            let relocated = relocated_search_paths(graph);
+            if !unreachable.is_empty() {
+                warnings.push(warn_unreachable(unreachable, uses_glibc_loader(graph)));
+            }
+            if !relocated.is_empty() {
+                warnings.push(warn_relocated(relocated, graph));
+            }
         }
     }
 
@@ -290,16 +384,23 @@ impl Planner {
     /// `None` when there is nothing to record, or when the target is one the
     /// cache format cannot describe — the caller then reports the problem
     /// instead of writing a cache the loader would reject.
+    #[cfg(test)]
     fn ld_so_cache(&self, graph: &DependencyGraph) -> Option<Vec<u8>> {
-        if !uses_glibc_loader(graph) {
-            // musl resolves libraries through /etc/ld-musl-<arch>.path and
-            // ignores ld.so.cache entirely, so the caller reports instead.
-            return None;
-        }
-        let architecture = graph.root_node().architecture;
-        let entries: Vec<CacheEntry> = graph
-            .nodes
+        self.ld_so_cache_many(std::iter::once(graph))
+    }
+
+    fn ld_so_cache_many<'a>(
+        &self,
+        graphs: impl IntoIterator<Item = &'a DependencyGraph>,
+    ) -> Option<Vec<u8>> {
+        let graphs: Vec<_> = graphs
+            .into_iter()
+            .filter(|graph| uses_glibc_loader(graph))
+            .collect();
+        let architecture = graphs.first()?.root_node().architecture;
+        let entries: Vec<CacheEntry> = graphs
             .iter()
+            .flat_map(|graph| graph.nodes.iter())
             .filter(|node| matches!(node.kind, NodeKind::SharedObject | NodeKind::Interpreter))
             .map(|node| CacheEntry {
                 // A library without DT_SONAME is looked up by file name, which
@@ -322,7 +423,7 @@ impl Planner {
 
     /// The executable would otherwise displace a library that has to keep its
     /// own path, leaving the bundle with a dependency it cannot load.
-    fn check_install_collision(&self, graph: &DependencyGraph) -> Result<()> {
+    fn check_install_collision(&self, graph: &DependencyGraph, install_path: &Path) -> Result<()> {
         let install = &graph.root_node().destination;
         assert!(install.is_absolute());
 
@@ -337,7 +438,7 @@ impl Planner {
                 message: format!(
                     "install path `{}` collides with `{}`, which the closure \
                      needs at that exact path",
-                    self.install_path.display(),
+                    install_path.display(),
                     node.logical.display()
                 ),
             });
@@ -351,7 +452,7 @@ impl Planner {
     /// exempt because it is not a `DT_NEEDED` dependency, and so is anything
     /// runtime policy pulled in: the caller asked for those by name, and cannot
     /// be expected to know the sonames of the NSS modules a source root ships.
-    fn validate_dependencies(&self, graph: &DependencyGraph) -> Result<()> {
+    fn validate_dependencies(&self, graph: &DependencyGraph, install_path: &Path) -> Result<()> {
         if self.dependency_policy.allow.is_none() {
             // No allow-list means no contract to enforce.
             return Ok(());
@@ -373,7 +474,7 @@ impl Planner {
             let required_by = graph
                 .first_dependent(id)
                 .map(|(_, parent)| parent.destination.clone())
-                .unwrap_or_else(|| self.install_path.clone());
+                .unwrap_or_else(|| install_path.to_path_buf());
             return Err(Error::DisallowedLibrary {
                 soname,
                 required_by,
@@ -518,6 +619,113 @@ impl Planner {
         }
         Err(Error::MissingSourcePath { path: logical })
     }
+}
+
+#[derive(Debug)]
+enum ClosureEntry {
+    Regular {
+        digest: String,
+        kind: NodeKind,
+        source: PathBuf,
+    },
+    Symlink {
+        target: PathBuf,
+        source: PathBuf,
+    },
+}
+
+impl ClosureEntry {
+    fn is_compatible_with(&self, other: &ClosureEntry) -> bool {
+        match (self, other) {
+            (
+                ClosureEntry::Regular {
+                    digest: left,
+                    kind: left_kind,
+                    ..
+                },
+                ClosureEntry::Regular {
+                    digest: right,
+                    kind: right_kind,
+                    ..
+                },
+            ) => left_kind == right_kind && *left_kind != NodeKind::Executable && left == right,
+            (
+                ClosureEntry::Symlink { target: left, .. },
+                ClosureEntry::Symlink { target: right, .. },
+            ) => left == right,
+            _ => false,
+        }
+    }
+
+    fn source(&self) -> &Path {
+        match self {
+            ClosureEntry::Regular { source, .. } | ClosureEntry::Symlink { source, .. } => source,
+        }
+    }
+}
+
+/// Every application closure shares one output namespace. Identical libraries
+/// and links are deduplicated, while executable or content collisions would
+/// make at least one application differ from the plan and are rejected.
+fn check_closure_collisions(resolved: &[(Resolver, DependencyGraph)]) -> Result<()> {
+    let mut entries = BTreeMap::<PathBuf, ClosureEntry>::new();
+    for (_, graph) in resolved {
+        for (_, node) in graph.iter() {
+            insert_closure_entry(
+                &mut entries,
+                node.destination.clone(),
+                ClosureEntry::Regular {
+                    digest: node.sha256.0.clone(),
+                    kind: node.kind,
+                    source: node.logical.clone(),
+                },
+            )?;
+            for link in &node.links {
+                insert_closure_entry(
+                    &mut entries,
+                    link.logical.clone(),
+                    ClosureEntry::Symlink {
+                        target: link.target.clone(),
+                        source: link.logical.clone(),
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_closure_entry(
+    entries: &mut BTreeMap<PathBuf, ClosureEntry>,
+    destination: PathBuf,
+    incoming: ClosureEntry,
+) -> Result<()> {
+    if let Some(existing) = entries.get(&destination) {
+        if existing.is_compatible_with(&incoming) {
+            return Ok(());
+        }
+        return Err(Error::Config {
+            message: format!(
+                "bundle path `{}` collides between `{}` and `{}`",
+                destination.display(),
+                existing.source().display(),
+                incoming.source().display()
+            ),
+        });
+    }
+    entries.insert(destination, incoming);
+    Ok(())
+}
+
+fn deduplicate_warnings(warnings: &mut Vec<Warning>) {
+    let mut seen = BTreeSet::new();
+    warnings.retain(|warning| {
+        seen.insert((
+            warning.code,
+            warning.message.clone(),
+            warning.details.clone(),
+        ))
+    });
 }
 
 /// Why an object is in the bundle, as recorded for the manifest.
@@ -736,6 +944,35 @@ mod tests {
 
     fn planner() -> Planner {
         Planner::new(SourceRoot::new("/"), "/app/server")
+    }
+
+    #[test]
+    fn closure_entries_require_matching_regular_file_kinds() {
+        let digest = sha256_bytes(b"same bytes").0;
+        let mut entries = BTreeMap::new();
+        insert_closure_entry(
+            &mut entries,
+            PathBuf::from("/lib/same.so"),
+            ClosureEntry::Regular {
+                digest: digest.clone(),
+                kind: NodeKind::Interpreter,
+                source: PathBuf::from("/lib/ld.so"),
+            },
+        )
+        .unwrap();
+
+        let error = insert_closure_entry(
+            &mut entries,
+            PathBuf::from("/lib/same.so"),
+            ClosureEntry::Regular {
+                digest,
+                kind: NodeKind::SharedObject,
+                source: PathBuf::from("/lib/libsame.so"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("/lib/same.so"), "{error}");
     }
 
     #[test]
