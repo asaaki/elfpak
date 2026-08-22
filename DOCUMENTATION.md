@@ -564,7 +564,7 @@ See the [Docker multi-platform documentation][multi-platform] for the details.
 
 ## Development
 
-Minimum supported Rust version: **1.97**.
+Minimum supported Rust version: **1.98**.
 
 ```console
 $ just check                       # fmt, clippy -D warnings, and the whole suite

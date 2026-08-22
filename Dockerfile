@@ -13,7 +13,7 @@
 # Base images are pinned by tag *and* digest so a build is reproducible and the
 # toolchain never moves under us. Refresh a digest with:
 #   docker buildx imagetools inspect <tag> --format '{{.Manifest.Digest}}'
-ARG RUST_IMAGE=rust:1.97.1-alpine3.24@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900
+ARG RUST_IMAGE=rust:1.98.0-alpine3.24@sha256:a10e64dd139b7387337c7fbe8aca31b959b57b2fd4c8ae20a02cf1d6ea424dce
 
 # The builder always runs natively on the build platform and cross-compiles to
 # the target, so a multi-platform image needs no emulation.
