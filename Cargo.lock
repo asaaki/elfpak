@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "elfpak"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "elfpak-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "goblin",
  "rustix",
