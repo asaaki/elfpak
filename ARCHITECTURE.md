@@ -121,10 +121,21 @@ the kernel-loaded interpreter, and policy-added dependencies.
 shared sorted `BundlePlan`, after checking install paths, architecture,
 dependency allow-lists, and collisions across every closure. Identical shared
 objects and symlinks are deduplicated; executable destinations and conflicting
-contents must be unique. Planned entries are explicit
-directories, symlinks, source-backed regular files, or generated files. Each
-has a destination, normalized mode, size and digest where applicable, kind,
-and inclusion reason.
+contents must be unique.
+
+Each planning phase carries an authority — the closure outranks runtime policy,
+which outranks an `--include` tree — and the plan builder settles a contested
+destination by it. Two entries that both carry content are recorded whichever
+way the contest went, so the planner can fail on a destination the bundle cannot
+express while still allowing the one documented precedence: a generated
+`/etc/passwd` keeps its place against an `--include` of the source root's
+`/etc`. A final pass rejects any entry nested inside something that is not a
+directory, which is what keeps directory, tar and OCI output describing the same
+tree.
+
+Planned entries are explicit directories, symlinks, source-backed regular files,
+or generated files. Each has a destination, normalized mode, size and digest
+where applicable, kind, and inclusion reason.
 
 Planning is one architectural stage but is split internally by role:
 `plan/model.rs` defines the read-only plan data, `plan/builder.rs` owns entry

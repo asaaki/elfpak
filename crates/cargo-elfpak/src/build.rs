@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     io::{BufReader, Read},
     path::{Path, PathBuf},
-    process::{ChildStderr, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command, Stdio},
     thread,
 };
 
@@ -37,7 +37,35 @@ pub(crate) struct BuildArtifact {
 
 pub(crate) fn run(request: &BuildRequest<'_>) -> Result<Vec<BuildArtifact>> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut command = Command::new(&cargo);
+    let mut child = command_for(&cargo, request)
+        .spawn()
+        .with_context(|| format!("could not run `{}`", cargo.to_string_lossy()))?;
+    let stdout = child.stdout.take().context("could not read Cargo output")?;
+    let stderr_reader = child.stderr.take().map(read_stderr);
+
+    // Collected before the child is reaped, and reported only afterwards: a
+    // malformed message stream is usually a symptom of the build failing, and
+    // Cargo's own diagnostics are the useful half of that.
+    let collected = collect_artifacts(stdout, request.selections);
+    finish(child, stderr_reader)?;
+    let artifacts = collected?;
+
+    let mut completed = Vec::with_capacity(artifacts.len());
+    for (artifact, selection) in artifacts.into_iter().zip(&request.selections.binaries) {
+        completed.push(artifact.with_context(|| {
+            format!(
+                "Cargo produced no executable artifact for package `{}` binary `{}`",
+                selection.package_name, selection.binary_name
+            )
+        })?);
+    }
+    Ok(completed)
+}
+
+/// The `cargo build` invocation for one request. Every value is its own argv
+/// element, so nothing a caller supplies can be read as another option.
+fn command_for(cargo: &OsString, request: &BuildRequest<'_>) -> Command {
+    let mut command = Command::new(cargo);
     command
         .current_dir(request.current_dir)
         .args(["build", "--message-format=json-render-diagnostics"])
@@ -64,41 +92,60 @@ pub(crate) fn run(request: &BuildRequest<'_>) -> Result<Vec<BuildArtifact>> {
     if request.quiet {
         command.stderr(Stdio::piped());
     }
+    command
+}
 
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("could not run `{}`", cargo.to_string_lossy()))?;
-    let stdout = child.stdout.take().context("could not read Cargo output")?;
-    let stderr_reader = child.stderr.take().map(read_stderr);
+/// Match every selected `(package, binary)` to the artifact message announcing
+/// it. The slot layout mirrors `selections.binaries`, so a missing artifact is
+/// visible as a `None` rather than as a short list.
+fn collect_artifacts(
+    stdout: ChildStdout,
+    selections: &SelectionSet,
+) -> Result<Vec<Option<BuildArtifact>>> {
     let mut artifacts: Vec<Option<BuildArtifact>> = std::iter::repeat_with(|| None)
-        .take(request.selections.binaries.len())
+        .take(selections.binaries.len())
         .collect();
 
     for message in Message::parse_stream(BufReader::new(stdout)) {
-        match message.context("could not parse Cargo build output")? {
-            Message::CompilerArtifact(artifact) if artifact.target.is_bin() => {
-                if let Some(index) = request.selections.binaries.iter().position(|selection| {
-                    artifact.package_id == selection.package_id
-                        && artifact.target.name == selection.binary_name
-                }) && let Some(executable) = artifact.executable
-                {
-                    if artifacts[index].is_some() {
-                        bail!(
-                            "Cargo produced more than one executable artifact for package `{}` binary `{}`",
-                            request.selections.binaries[index].package_name,
-                            request.selections.binaries[index].binary_name
-                        );
-                    }
-                    artifacts[index] = Some(BuildArtifact {
-                        executable: executable.into_std_path_buf(),
-                        fresh: artifact.fresh,
-                    });
-                }
-            }
-            _ => {}
+        let Message::CompilerArtifact(artifact) =
+            message.context("could not parse Cargo build output")?
+        else {
+            continue;
+        };
+        if !artifact.target.is_bin() {
+            continue;
         }
+        let Some(index) = selections.binaries.iter().position(|selection| {
+            artifact.package_id == selection.package_id
+                && artifact.target.name == selection.binary_name
+        }) else {
+            continue;
+        };
+        let Some(executable) = artifact.executable else {
+            continue;
+        };
+        if artifacts[index].is_some() {
+            bail!(
+                "Cargo produced more than one executable artifact for package `{}` binary `{}`",
+                selections.binaries[index].package_name,
+                selections.binaries[index].binary_name
+            );
+        }
+        artifacts[index] = Some(BuildArtifact {
+            executable: executable.into_std_path_buf(),
+            fresh: artifact.fresh,
+        });
     }
+    Ok(artifacts)
+}
 
+/// Reap the child and turn a failed build into an error carrying Cargo's own
+/// diagnostics. Always runs, so no exit path leaves the child unwaited or the
+/// captured stderr unread.
+fn finish(
+    mut child: Child,
+    stderr_reader: Option<thread::JoinHandle<std::io::Result<CapturedStderr>>>,
+) -> Result<()> {
     let status = child.wait().context("could not wait for Cargo build")?;
     let stderr = match stderr_reader {
         Some(reader) => reader
@@ -106,23 +153,14 @@ pub(crate) fn run(request: &BuildRequest<'_>) -> Result<Vec<BuildArtifact>> {
             .map_err(|_| anyhow::anyhow!("Cargo stderr reader panicked"))??,
         None => CapturedStderr::default(),
     };
-    if !status.success() {
-        eprint!("{}", String::from_utf8_lossy(&stderr.bytes));
-        if stderr.truncated {
-            eprintln!("Cargo stderr was truncated after {CARGO_STDERR_MAX_BYTES} bytes");
-        }
-        bail!("Cargo build failed with status {status}");
+    if status.success() {
+        return Ok(());
     }
-    let mut completed = Vec::with_capacity(artifacts.len());
-    for (artifact, selection) in artifacts.into_iter().zip(&request.selections.binaries) {
-        completed.push(artifact.with_context(|| {
-            format!(
-                "Cargo produced no executable artifact for package `{}` binary `{}`",
-                selection.package_name, selection.binary_name
-            )
-        })?);
+    eprint!("{}", String::from_utf8_lossy(&stderr.bytes));
+    if stderr.truncated {
+        eprintln!("Cargo stderr was truncated after {CARGO_STDERR_MAX_BYTES} bytes");
     }
-    Ok(completed)
+    bail!("Cargo build failed with status {status}");
 }
 
 fn append_selection(command: &mut Command, selections: &SelectionSet) {

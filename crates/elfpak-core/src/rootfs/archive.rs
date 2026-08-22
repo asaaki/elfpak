@@ -47,7 +47,7 @@ impl TarBuilder {
             .prefix(".elfpak-tar-")
             .tempfile_in(parent)
             .map_err(|e| io(parent, e))?;
-        set_output_permissions(stage.path(), &self.path)?;
+        super::set_output_permissions(stage.path(), &self.path)?;
         let report = {
             let writer = std::io::BufWriter::new(stage.as_file_mut());
             let (_, report) = self.write_to(writer, plan)?;
@@ -117,15 +117,6 @@ impl TarBuilder {
     }
 }
 
-fn set_output_permissions(stage: &Path, destination: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let permissions = std::fs::metadata(destination)
-        .map(|metadata| metadata.permissions())
-        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o644));
-    std::fs::set_permissions(stage, permissions).map_err(|e| io(stage, e))
-}
-
 /// A header with ownership and timestamp pinned.
 fn pinned_header(mode: u32, mtime: u64) -> Header {
     let mut header = Header::new_gnu();
@@ -179,15 +170,27 @@ fn append_regular<W: Write>(
 }
 
 /// Tar entries are relative paths: `/app/server` becomes `app/server`.
+///
+/// A destination that is not valid Unicode is reported for what it is. The
+/// directory backend writes such a name without complaint, so calling it a path
+/// escape would send the reader looking for a containment bug that is not there.
 fn archive_name(destination: &Path) -> Result<String> {
     let normalized = crate::paths::normalize_absolute(destination);
     let relative = normalized.strip_prefix("/").unwrap_or(&normalized);
+    if relative.as_os_str().is_empty() {
+        return Err(Error::PathEscape {
+            path: destination.to_path_buf(),
+            kind: "archive",
+        });
+    }
     relative
         .to_str()
         .map(str::to_string)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| Error::PathEscape {
-            path: destination.to_path_buf(),
-            kind: "archive",
+        .ok_or_else(|| Error::Config {
+            message: format!(
+                "`{}` is not valid Unicode and cannot be named in a tar or OCI archive; \
+             directory output has no such restriction",
+                destination.display()
+            ),
         })
 }

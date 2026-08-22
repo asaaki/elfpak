@@ -121,6 +121,36 @@ fn agrees_with_the_loader_that_runpath_is_not_inherited() {
     assert_eq!(soname, "libbase.so.1");
 }
 
+/// glibc guards the whole RPATH phase on the *requesting* object having no
+/// DT_RUNPATH, so a library with DT_RUNPATH cannot reach its dependency through
+/// the RPATH of the executable that loaded it.
+#[test]
+fn agrees_with_the_loader_that_runpath_blocks_an_inherited_rpath() {
+    if !have_cc() {
+        return;
+    }
+    let fixtures = HostFixtures::build();
+    let binary = fixtures.bin("app-rpath-blocked");
+
+    let ldd = ldd_raw(&binary).expect("ldd runs");
+    assert!(
+        ldd.contains("libtop-runpath.so.1 =>") && !ldd.contains("libtop-runpath.so.1 => not found"),
+        "the executable's own RPATH should still resolve its direct dependency:\n{ldd}"
+    );
+    assert!(
+        ldd.contains("libbase.so.1 => not found"),
+        "DT_RUNPATH on the intermediate library should block the inherited RPATH:\n{ldd}"
+    );
+
+    let error = Planner::new(SourceRoot::new("/"), &binary)
+        .plan()
+        .expect_err("elfpak must not resolve what the loader cannot");
+    let Error::UnresolvedLibrary { soname, .. } = &error else {
+        panic!("expected E2001, got {error:?}");
+    };
+    assert_eq!(soname, "libbase.so.1");
+}
+
 #[test]
 fn agrees_with_the_loader_that_rpath_is_inherited() {
     if !have_cc() {

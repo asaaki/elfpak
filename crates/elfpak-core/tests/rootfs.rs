@@ -175,6 +175,75 @@ fn multi_executable_plan_rejects_a_cross_application_library_collision() {
     assert!(message.contains("collides"), "{message}");
 }
 
+/// One file legitimately reaches the plan under two kinds: `--tzdata` copies
+/// the zone database, and `/etc/localtime` is a symlink into it. That is the
+/// same file planned twice, not two entries contesting a destination.
+#[test]
+fn tzdata_survives_a_localtime_symlink_into_the_zone_database() {
+    let Some(sysroot) = sysroot() else { return };
+    std::fs::create_dir_all(sysroot.path("/usr/share/zoneinfo/Etc")).unwrap();
+    std::fs::write(sysroot.path("/usr/share/zoneinfo/Etc/UTC"), b"TZif2fixture").unwrap();
+    std::os::unix::fs::symlink(
+        "/usr/share/zoneinfo/Etc/UTC",
+        sysroot.path("/etc/localtime"),
+    )
+    .unwrap();
+
+    let policy = elfpak_core::RuntimePolicy {
+        tzdata: true,
+        ..Default::default()
+    };
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .runtime_policy(policy)
+    .plan()
+    .expect("a localtime symlink into the zone database is not a conflict");
+
+    let zone = plan
+        .files()
+        .iter()
+        .find(|file| file.destination() == Path::new("/usr/share/zoneinfo/Etc/UTC"))
+        .expect("the zone file is planned once");
+    assert_eq!(zone.size(), b"TZif2fixture".len() as u64);
+    assert!(
+        plan.files()
+            .iter()
+            .any(|file| file.destination() == Path::new("/etc/localtime")
+                && file.kind() == PlannedFileKind::Symlink),
+        "the link itself is preserved"
+    );
+}
+
+/// `--include` of a library directory is the documented escape hatch for
+/// `dlopen`, so it routinely covers objects the closure already planned.
+#[test]
+fn an_include_may_overlap_the_closure() {
+    let Some(sysroot) = sysroot() else { return };
+    let policy = elfpak_core::RuntimePolicy {
+        includes: vec![PathBuf::from("/usr/lib")],
+        ..Default::default()
+    };
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .runtime_policy(policy)
+    .plan()
+    .expect("an include overlapping the closure is not a conflict");
+
+    let library = Path::new("/usr/lib/libbase.so.1.4.2");
+    assert_eq!(
+        plan.files()
+            .iter()
+            .filter(|file| file.destination() == library)
+            .count(),
+        1,
+        "the shared object is planned exactly once"
+    );
+}
+
 #[test]
 fn materializes_files_symlinks_and_directories() {
     let Some(sysroot) = sysroot() else { return };

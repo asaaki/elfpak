@@ -7,24 +7,32 @@ use super::model::{
 };
 use crate::{
     BundlePlan, Digest, Result,
+    error::Error,
     error::io,
     hash::{HashingWriter, sha256_bytes},
     rootfs::{
-        TarBuilder, ensure_directory, guard_output, output_parent, path_exists, publish_directory,
+        STAGE_MODE, TarBuilder, ensure_directory, guard_output, output_parent, path_exists,
+        publish_directory,
     },
 };
 use std::{
     collections::BTreeMap,
     io::{BufWriter, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
 const OCI_LAYOUT_VERSION: &str = "1.0.0";
 
+/// Mode every file in a published layout gets, so that a consumer running as
+/// another user sees one consistent set of permissions.
+const LAYOUT_FILE_MODE: u32 = 0o644;
+
 #[derive(Debug)]
 pub struct OciLayoutBuilder {
     output: PathBuf,
     image: OciImageConfig,
+    clean: bool,
 }
 
 impl OciLayoutBuilder {
@@ -32,11 +40,18 @@ impl OciLayoutBuilder {
         OciLayoutBuilder {
             output: output.into(),
             image: OciImageConfig::default(),
+            clean: false,
         }
     }
 
     pub fn image(mut self, image: OciImageConfig) -> OciLayoutBuilder {
         self.image = image;
+        self
+    }
+
+    /// Permit replacing a destination directory that is not already a layout.
+    pub fn clean(mut self, clean: bool) -> OciLayoutBuilder {
+        self.clean = clean;
         self
     }
 
@@ -46,11 +61,24 @@ impl OciLayoutBuilder {
         std::fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
         let stage = tempfile::Builder::new()
             .prefix(".elfpak-oci-")
+            .permissions(std::fs::Permissions::from_mode(STAGE_MODE))
             .tempdir_in(parent)
             .map_err(|error| io(parent, error))?;
 
         if path_exists(&self.output) {
             ensure_directory(&self.output)?;
+            // Publication replaces the destination wholesale, so anything
+            // already there is deleted. Rebuilding a layout is the ordinary
+            // case; anything else has to be asked for.
+            if !self.clean && !is_replaceable_layout(&self.output)? {
+                return Err(Error::Config {
+                    message: format!(
+                        "`{}` is not an empty directory or an OCI layout; \
+                         publishing there would delete its contents (use --clean)",
+                        self.output.display()
+                    ),
+                });
+            }
         }
 
         set_directory_mode(stage.path(), 0o755)?;
@@ -58,6 +86,16 @@ impl OciLayoutBuilder {
         publish_directory(stage, &self.output)?;
         Ok(report)
     }
+}
+
+/// Whether an existing destination is one this builder may replace on its own:
+/// empty, or already carrying the layout marker `oci-layout`.
+fn is_replaceable_layout(output: &Path) -> Result<bool> {
+    if output.join("oci-layout").is_file() {
+        return Ok(true);
+    }
+    let mut entries = std::fs::read_dir(output).map_err(|error| io(output, error))?;
+    Ok(entries.next().is_none())
 }
 
 #[derive(Debug)]
@@ -192,6 +230,10 @@ fn write_layer(blobs: &Path, plan: &BundlePlan) -> Result<(Digest, u64)> {
     drop(writer);
     stage
         .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(LAYOUT_FILE_MODE))
+        .map_err(|error| io(&stage_path, error))?;
+    stage
+        .as_file()
         .sync_all()
         .map_err(|error| io(&stage_path, error))?;
     let destination = blobs.join(&digest.0);
@@ -218,14 +260,28 @@ fn oci_digest(digest: &Digest) -> String {
 fn write_blob(blobs: &Path, bytes: &[u8]) -> Result<(Digest, u64)> {
     let digest = sha256_bytes(bytes);
     let destination = blobs.join(&digest.0);
-    std::fs::write(&destination, bytes).map_err(|error| io(&destination, error))?;
+    write_layout_file(&destination, bytes)?;
     Ok((digest, bytes.len() as u64))
 }
 
 fn write_json_document(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     let mut bytes = serde_json::to_vec(value).expect("OCI metadata is serializable");
     bytes.push(b'\n');
-    std::fs::write(path, bytes).map_err(|error| io(path, error))
+    write_layout_file(path, &bytes)
+}
+
+/// A layout file with a fixed mode, on disk before the layout is published.
+///
+/// The mode is pinned because a layout is meant to be handed to another tool,
+/// sometimes running as another user, and the umask would otherwise make one
+/// file unreadable while the rest were fine. The sync is what keeps
+/// `index.json` from naming a blob whose bytes never reached the disk.
+fn write_layout_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = std::fs::File::create(path).map_err(|error| io(path, error))?;
+    file.write_all(bytes).map_err(|error| io(path, error))?;
+    file.set_permissions(std::fs::Permissions::from_mode(LAYOUT_FILE_MODE))
+        .map_err(|error| io(path, error))?;
+    file.sync_all().map_err(|error| io(path, error))
 }
 
 fn set_directory_mode(path: &Path, mode: u32) -> Result<()> {

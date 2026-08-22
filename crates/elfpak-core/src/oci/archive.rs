@@ -1,9 +1,14 @@
 //! Deterministic tar transport for an OCI image layout.
 
 use super::{OciImageConfig, OciReport, layout::build_layout_into};
-use crate::{BundlePlan, Result, error::io, rootfs::output_parent};
+use crate::{
+    BundlePlan, Result,
+    error::io,
+    rootfs::{STAGE_MODE, output_parent, set_output_permissions},
+};
 use std::{
     io::{BufWriter, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 use tar::{EntryType, Header};
@@ -32,6 +37,7 @@ impl OciArchiveBuilder {
         std::fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
         let layout = tempfile::Builder::new()
             .prefix(".elfpak-oci-layout-")
+            .permissions(std::fs::Permissions::from_mode(STAGE_MODE))
             .tempdir_in(parent)
             .map_err(|error| io(parent, error))?;
         let report = build_layout_into(layout.path(), plan, &self.image)?;
@@ -142,13 +148,4 @@ fn pinned_header(kind: EntryType, mode: u32, size: u64, timestamp: u64) -> Heade
     header.set_size(size);
     header.set_cksum();
     header
-}
-
-fn set_output_permissions(stage: &Path, destination: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let permissions = std::fs::metadata(destination)
-        .map(|metadata| metadata.permissions())
-        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o644));
-    std::fs::set_permissions(stage, permissions).map_err(|error| io(stage, error))
 }

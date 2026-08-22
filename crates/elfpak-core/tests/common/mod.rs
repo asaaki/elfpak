@@ -500,6 +500,31 @@ impl HostFixtures {
             lib.join("libbase.so.1").to_str().unwrap(),
             &format!("-Wl,-rpath-link,{}", lib.display()),
         ]);
+
+        // The same library, but carrying a DT_RUNPATH of its own that points
+        // nowhere useful. glibc suppresses the entire RPATH phase for an object
+        // with DT_RUNPATH, including its loaders' RPATHs, so this one cannot
+        // reach libbase however the executable that loads it is linked.
+        cc(&[
+            "-shared",
+            "-fPIC",
+            "-nostdlib",
+            "-Wl,-soname,libtop-runpath.so.1",
+            "-o",
+            lib.join("libtop-runpath.so.1").to_str().unwrap(),
+            write(
+                "top-runpath.c",
+                "int base_value(void);\nint top_runpath_value(void) { return base_value(); }\n",
+            )
+            .to_str()
+            .unwrap(),
+            lib.join("libbase.so.1").to_str().unwrap(),
+            &format!("-Wl,-rpath-link,{}", lib.display()),
+            &format!(
+                "-Wl,--enable-new-dtags,-rpath,{}",
+                self.dir.join("nowhere").display()
+            ),
+        ]);
     }
 
     fn populate_executables(&self, lib: &Path, bin: &Path, src: &Path) {
@@ -534,6 +559,24 @@ impl HostFixtures {
             lib.join("libtop.so.1").to_str().unwrap(),
             &format!("-Wl,-rpath-link,{}", lib.display()),
             &format!("-Wl,--enable-new-dtags,-rpath,{}", lib.display()),
+        ]);
+
+        // DT_RPATH on the executable, DT_RUNPATH on the library it loads. The
+        // RPATH covers both libraries, but the loader must not apply it to the
+        // library's own lookup.
+        cc(&[
+            "-nostdlib",
+            "-o",
+            bin.join("app-rpath-blocked").to_str().unwrap(),
+            write(
+                "app-blocked.c",
+                "int top_runpath_value(void);\nvoid _start(void) { top_runpath_value(); }\n",
+            )
+            .to_str()
+            .unwrap(),
+            lib.join("libtop-runpath.so.1").to_str().unwrap(),
+            &format!("-Wl,-rpath-link,{}", lib.display()),
+            &format!("-Wl,--disable-new-dtags,-rpath,{}", lib.display()),
         ]);
 
         // $ORIGIN expansion, against a dependency with no dependencies of its own.

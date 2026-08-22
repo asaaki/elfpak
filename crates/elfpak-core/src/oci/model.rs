@@ -159,7 +159,7 @@ impl OciImageConfig {
             .runtime_policy()
             .user
             .as_ref()
-            .map(|user| format!("{}:{}", user.uid, user.gid));
+            .map(|user| format!("{}:{}", user.uid(), user.gid()));
 
         Ok(ResolvedImageConfig {
             tag: self.tag.clone(),

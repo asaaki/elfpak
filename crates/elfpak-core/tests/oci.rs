@@ -636,7 +636,12 @@ fn failed_layout_builds_do_not_publish_partial_output() {
     std::fs::create_dir(&existing).unwrap();
     std::fs::write(existing.join("sentinel"), b"keep").unwrap();
     let before = layout_snapshot(&existing);
-    let error = OciLayoutBuilder::new(&existing).apply(&plan).unwrap_err();
+    // `--clean` gets past the occupancy check, so the failure under test is the
+    // build itself rather than the refusal to replace a foreign directory.
+    let error = OciLayoutBuilder::new(&existing)
+        .clean(true)
+        .apply(&plan)
+        .unwrap_err();
     assert_eq!(error.code(), "E1006");
     assert_eq!(layout_snapshot(&existing), before);
 
@@ -658,8 +663,22 @@ fn layout_publication_replaces_directories_and_rejects_symlinks() {
     let layout = temp.path().join("image");
     std::fs::create_dir(&layout).unwrap();
     std::fs::write(layout.join("sentinel"), b"old").unwrap();
-    OciLayoutBuilder::new(&layout).apply(&plan).unwrap();
+
+    // Publication replaces the whole directory, so a destination holding
+    // something that is not a layout is refused rather than deleted.
+    let error = OciLayoutBuilder::new(&layout).apply(&plan).unwrap_err();
+    assert_eq!(error.code(), "E4001");
+    assert_eq!(std::fs::read(layout.join("sentinel")).unwrap(), b"old");
+
+    OciLayoutBuilder::new(&layout)
+        .clean(true)
+        .apply(&plan)
+        .unwrap();
     assert!(!layout.join("sentinel").exists());
+    assert!(layout.join("index.json").is_file());
+
+    // Rebuilding over a layout this tool wrote needs no permission.
+    OciLayoutBuilder::new(&layout).apply(&plan).unwrap();
     assert!(layout.join("index.json").is_file());
 
     let target = temp.path().join("target");

@@ -113,12 +113,13 @@ impl Architecture {
     }
 
     /// Value of glibc's `$LIB` token for this architecture.
+    ///
+    /// The token names the word size, not the machine: every 64-bit target
+    /// expands it to `lib64` and every 32-bit one to `lib`.
     pub fn lib_token(&self) -> &'static str {
-        match (self.machine, self.class) {
-            (Machine::X86_64, ElfClass::Elf64) => "lib64",
-            (Machine::Aarch64, ElfClass::Elf64) => "lib64",
-            (_, ElfClass::Elf64) => "lib64",
-            (_, ElfClass::Elf32) => "lib",
+        match self.class {
+            ElfClass::Elf64 => "lib64",
+            ElfClass::Elf32 => "lib",
         }
     }
 }
@@ -173,9 +174,41 @@ const DF_1_ORIGIN: u64 = 0x0000_0080;
 
 const DLOPEN_SYMBOLS: &[&str] = &["dlopen", "dlmopen", "__libc_dlopen_mode"];
 
+/// Upper bound on an object this parser will load.
+///
+/// A shared library or executable is megabytes; hundreds of megabytes means a
+/// candidate that happens to share a soname with something enormous. The
+/// resolver probes files it did not choose, so the size is a property of the
+/// source filesystem rather than of anything the caller asked for.
+pub const ELF_BYTES_MAX: u64 = 512 * 1024 * 1024;
+
 impl ElfMetadata {
     pub fn parse_file(path: &Path) -> Result<ElfMetadata> {
-        let bytes = std::fs::read(path).map_err(|e| io(path, e))?;
+        use std::io::Read;
+
+        // The magic is checked against the first four bytes, before the file is
+        // read, so a large non-ELF file in a searched directory costs one open
+        // rather than its own size in memory.
+        let mut file = std::fs::File::open(path).map_err(|e| io(path, e))?;
+        let mut magic = [0u8; ELF_MAGIC.len()];
+        let read = read_at_most(&mut file, &mut magic).map_err(|e| io(path, e))?;
+        if !Self::looks_like_elf(&magic[..read]) {
+            return Err(Error::NotElf {
+                path: path.to_path_buf(),
+            });
+        }
+
+        let size = file.metadata().map_err(|e| io(path, e))?.len();
+        if size > ELF_BYTES_MAX {
+            return Err(Error::LimitExceeded {
+                resource: "ELF object",
+                limit: usize::try_from(ELF_BYTES_MAX).unwrap_or(usize::MAX),
+            });
+        }
+
+        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        bytes.extend_from_slice(&magic[..read]);
+        file.read_to_end(&mut bytes).map_err(|e| io(path, e))?;
         Self::parse_bytes(path, &bytes)
     }
 
@@ -232,6 +265,20 @@ impl ElfMetadata {
     pub fn runpath_is_authoritative(&self) -> bool {
         self.has_runpath
     }
+}
+
+/// Fill as much of `buffer` as the file has, tolerating short reads.
+fn read_at_most(file: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled)
 }
 
 fn architecture_of(elf: &goblin::elf::Elf<'_>) -> Architecture {

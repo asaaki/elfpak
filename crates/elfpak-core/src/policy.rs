@@ -110,12 +110,19 @@ impl std::fmt::Display for CachePolicy {
 }
 
 /// The identity the packaged application is expected to run as.
+///
+/// The fields are private because the name is rendered verbatim into
+/// `/etc/passwd` and `/etc/group`, which are colon- and newline-delimited. A
+/// value that reached those files unchecked could declare a second account —
+/// including a uid-0 one with a shell — in an image whose whole point is that
+/// it contains nothing unaudited. Construct one with [`UserSpec::parse`] or
+/// [`UserSpec::new`], both of which enforce that invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserSpec {
-    pub uid: u32,
-    pub gid: u32,
-    pub name: String,
-    pub group: String,
+    uid: u32,
+    gid: u32,
+    name: String,
+    group: String,
 }
 
 impl std::fmt::Display for UserSpec {
@@ -129,48 +136,115 @@ impl UserSpec {
     /// Name used when only numeric ids were given; a passwd entry needs one.
     const NAME_DEFAULT: &'static str = "app";
 
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+
+    /// A checked identity. The name must be a portable account name, and must
+    /// not contradict the two accounts every image already has.
+    pub fn new(name: &str, uid: u32, gid: u32) -> Result<UserSpec, Error> {
+        if !is_safe_account_name(name) {
+            return Err(Error::Config {
+                message: format!(
+                    "invalid account name `{name}` \
+                     (1-32 characters of A-Z, a-z, 0-9, `_` or `-`)"
+                ),
+            });
+        }
+        check_reserved_account(name, uid, gid)?;
+        Ok(UserSpec {
+            uid,
+            gid,
+            name: name.to_string(),
+            group: name.to_string(),
+        })
+    }
+
     /// Accepts `uid`, `uid:gid` and `name:uid:gid`.
     pub fn parse(value: &str) -> Result<UserSpec, Error> {
         let invalid = || Error::Config {
             message: format!("invalid --user value `{value}` (expected uid[:gid] or name:uid:gid)"),
         };
+        let number = |text: &str| text.parse::<u32>().map_err(|_| invalid());
+
         let parts: Vec<&str> = value.split(':').collect();
-        match parts.as_slice() {
-            [uid] => {
-                let uid: u32 = uid.parse().map_err(|_| invalid())?;
-                Ok(UserSpec {
-                    uid,
-                    gid: uid,
-                    name: UserSpec::NAME_DEFAULT.to_string(),
-                    group: UserSpec::NAME_DEFAULT.to_string(),
-                })
+        let (name, uid, gid) = match parts.as_slice() {
+            [uid] => (None, number(uid)?, number(uid)?),
+            [uid, gid] => (None, number(uid)?, number(gid)?),
+            [name, uid, gid] => (Some(*name), number(uid)?, number(gid)?),
+            _ => return Err(invalid()),
+        };
+        // A caller that gave only numbers named no account, so naming one is
+        // this function's job: `--user 65534:65534` means `nobody`, and calling
+        // it `app` would be inventing a second account for those ids.
+        let name =
+            name.unwrap_or_else(|| reserved_name(uid, gid).unwrap_or(UserSpec::NAME_DEFAULT));
+        UserSpec::new(name, uid, gid).map_err(|error| match error {
+            // Keep the option in the message; `new` does not know it exists.
+            Error::Config { message } => Error::Config {
+                message: format!("invalid --user value `{value}`: {message}"),
+            },
+            other => other,
+        })
+    }
+}
+
+/// Every image already has `root` and `nobody`. A requested account that reuses
+/// one of their names or ids without being that account would put two entries
+/// with one name, or one id, into `/etc/passwd`; `getpwnam` and `getpwuid` then
+/// disagree with the identity the process actually runs as.
+fn check_reserved_account(name: &str, uid: u32, gid: u32) -> Result<(), Error> {
+    for (account, group, id) in RESERVED_ACCOUNTS {
+        let named = name == *account || name == *group;
+        if named {
+            // Being one of these accounts is fine; redefining it is not.
+            if uid == *id && gid == *id {
+                return Ok(());
             }
-            [uid, gid] => {
-                let uid: u32 = uid.parse().map_err(|_| invalid())?;
-                let gid: u32 = gid.parse().map_err(|_| invalid())?;
-                Ok(UserSpec {
-                    uid,
-                    gid,
-                    name: UserSpec::NAME_DEFAULT.to_string(),
-                    group: UserSpec::NAME_DEFAULT.to_string(),
-                })
-            }
-            [name, uid, gid] => {
-                let uid: u32 = uid.parse().map_err(|_| invalid())?;
-                let gid: u32 = gid.parse().map_err(|_| invalid())?;
-                if !is_safe_account_name(name) {
-                    return Err(invalid());
-                }
-                Ok(UserSpec {
-                    uid,
-                    gid,
-                    name: (*name).to_string(),
-                    group: (*name).to_string(),
-                })
-            }
-            _ => Err(invalid()),
+            return Err(Error::Config {
+                message: format!("`{name}` is the reserved account {account}:{id}:{id}"),
+            });
+        }
+        // A reserved *uid* under another name would leave the requested
+        // account out of `/etc/passwd` entirely, since that file already has an
+        // entry for the id. A reserved *gid* is fine: `/etc/group` already has
+        // that group, and the passwd entry simply refers to it.
+        if uid == *id {
+            return Err(Error::Config {
+                message: format!(
+                    "uid {id} belongs to the reserved account `{account}`, not to `{name}`"
+                ),
+            });
         }
     }
+    Ok(())
+}
+
+/// Accounts every generated `/etc/passwd` and `/etc/group` already contains,
+/// as `(account, group, id)`.
+const RESERVED_ACCOUNTS: &[(&str, &str, u32)] = &[
+    ("root", "root", RuntimePolicy::UID_ROOT),
+    ("nobody", "nogroup", RuntimePolicy::UID_NOBODY),
+];
+
+/// The reserved account a bare `uid[:gid]` names, if it names one.
+fn reserved_name(uid: u32, gid: u32) -> Option<&'static str> {
+    RESERVED_ACCOUNTS
+        .iter()
+        .find(|(_, _, id)| uid == *id && gid == *id)
+        .map(|(account, _, _)| *account)
 }
 
 /// POSIX account names are data embedded in colon-delimited system files.
@@ -231,8 +305,8 @@ impl RuntimePolicy {
     }
 
     /// Two reserved accounts every image gets, whatever `--user` says.
-    const UID_ROOT: u32 = 0;
-    const UID_NOBODY: u32 = 65534;
+    pub(crate) const UID_ROOT: u32 = 0;
+    pub(crate) const UID_NOBODY: u32 = 65534;
 
     /// Locations of a system CA bundle, most common first.
     pub const CA_BUNDLE_CANDIDATES: &'static [&'static str] = &[
@@ -254,13 +328,19 @@ impl RuntimePolicy {
     pub fn passwd_contents(&self) -> Vec<u8> {
         let mut out = String::from("root:x:0:0:root:/root:/sbin/nologin\n");
         out.push_str("nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n");
+        // `UserSpec` refuses any identity that would collide with the two
+        // accounts above, so the only way to reach one of their ids here is by
+        // asking for that account itself, which is already written.
         if let Some(user) = &self.user
-            && user.uid != Self::UID_ROOT
-            && user.uid != Self::UID_NOBODY
+            && user.uid() != Self::UID_ROOT
+            && user.uid() != Self::UID_NOBODY
         {
             out.push_str(&format!(
                 "{}:x:{}:{}:{}:/nonexistent:/sbin/nologin\n",
-                user.name, user.uid, user.gid, user.name
+                user.name(),
+                user.uid(),
+                user.gid(),
+                user.name()
             ));
         }
         out.into_bytes()
@@ -270,10 +350,10 @@ impl RuntimePolicy {
         let mut out = String::from("root:x:0:\n");
         out.push_str("nogroup:x:65534:\n");
         if let Some(user) = &self.user
-            && user.gid != Self::UID_ROOT
-            && user.gid != Self::UID_NOBODY
+            && user.gid() != Self::UID_ROOT
+            && user.gid() != Self::UID_NOBODY
         {
-            out.push_str(&format!("{}:x:{}:\n", user.group, user.gid));
+            out.push_str(&format!("{}:x:{}:\n", user.group(), user.gid()));
         }
         out.into_bytes()
     }
@@ -377,9 +457,60 @@ mod tests {
     #[test]
     fn root_and_nobody_are_not_duplicated() {
         let mut policy = RuntimePolicy::from_preset(Preset::Web);
-        policy.user = Some(UserSpec::parse("65534:65534").unwrap());
+        policy.user = Some(UserSpec::parse("nobody:65534:65534").unwrap());
         let passwd = String::from_utf8(policy.passwd_contents()).unwrap();
         assert_eq!(passwd.lines().count(), 2);
+    }
+
+    /// An identity is rendered into colon- and newline-delimited system files,
+    /// so the type refuses anything that could add a line of its own.
+    #[test]
+    fn an_account_name_cannot_carry_passwd_syntax() {
+        assert!(UserSpec::new("svc:x:0:0::/root:/bin/sh\nbackdoor", 1000, 1000).is_err());
+        assert!(UserSpec::new("with space", 1000, 1000).is_err());
+        assert!(UserSpec::new("", 1000, 1000).is_err());
+        assert!(UserSpec::new(&"a".repeat(33), 1000, 1000).is_err());
+        assert!(UserSpec::new("svc-1_x", 1000, 1000).is_ok());
+    }
+
+    /// Reusing a reserved name or id would put two accounts with one name, or
+    /// one id, into the generated files.
+    #[test]
+    fn reserved_accounts_cannot_be_redefined() {
+        // Reusing a reserved name, or a reserved uid under another name.
+        assert!(UserSpec::parse("root:1000:1000").is_err());
+        assert!(UserSpec::parse("nobody:1000:1000").is_err());
+        assert!(UserSpec::parse("nogroup:1000:1000").is_err());
+        assert!(UserSpec::parse("app:0:0").is_err());
+        assert!(UserSpec::parse("app:65534:65534").is_err());
+
+        // A reserved *group* id under another name is ordinary: the group
+        // already exists and the account simply joins it.
+        assert_eq!(UserSpec::parse("1000:65534").unwrap().gid(), 65534);
+        assert_eq!(UserSpec::parse("app:1000:0").unwrap().gid(), 0);
+    }
+
+    /// A bare `uid[:gid]` names no account, so one that matches a reserved id
+    /// exactly *is* that account rather than a second one under a made-up name.
+    #[test]
+    fn numeric_identities_adopt_the_reserved_name_they_match() {
+        assert_eq!(UserSpec::parse("65534:65534").unwrap().name(), "nobody");
+        assert_eq!(UserSpec::parse("65534").unwrap().name(), "nobody");
+        assert_eq!(UserSpec::parse("0").unwrap().name(), "root");
+        assert_eq!(UserSpec::parse("65532:65532").unwrap().name(), "app");
+
+        // Being a reserved account adds no second entry to either file.
+        let mut policy = RuntimePolicy::from_preset(Preset::Web);
+        policy.user = Some(UserSpec::parse("0").unwrap());
+        let passwd = String::from_utf8(policy.passwd_contents()).unwrap();
+        assert_eq!(passwd.lines().count(), 2);
+        assert_eq!(
+            String::from_utf8(policy.group_contents())
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
     }
 
     #[test]

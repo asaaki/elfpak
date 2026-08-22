@@ -114,6 +114,11 @@ codes! {
         /// `--install` moves an executable that declares `$ORIGIN`-relative
         /// search paths, so those paths no longer point where they did.
         EXECUTABLE_RELOCATED = "E2006";
+        /// Two objects in the bundle share a soname but differ, and one
+        /// generated `/etc/ld.so.cache` can name only one of them. An
+        /// application that reaches the cache — rather than finding its own
+        /// copy through `DT_RPATH`/`DT_RUNPATH` first — may load the other.
+        LOADER_CACHE_AMBIGUOUS = "E2007";
         /// `--user` records an identity in `passwd`/`group`, and neither file
         /// was asked for, so an application that looks its own uid up finds
         /// nothing.

@@ -209,11 +209,24 @@ fn entry_capacity(bytes: &[u8], base: usize, header: usize, entry: usize) -> usi
         .saturating_div(entry)
 }
 
-/// `struct cache_file`: a header followed by `nlibs` fixed-size entries whose
-/// string offsets are relative to the start of the image.
+/// `struct cache_file`: a header followed by `nlibs` fixed-size entries, then
+/// the string table.
+///
+/// Unlike the new format, whose offsets are relative to the start of the image,
+/// these are relative to the string table itself — glibc reads them through
+/// `cache_data = (const char *) &cache->libs[cache->nlibs]`. The declared
+/// `nlibs` is what fixes that base, so it is used even where the entry loop
+/// reads fewer entries than the header claims.
 fn parse_old(bytes: &[u8], nlibs: usize) -> Vec<CacheRecord> {
     let capacity = entry_capacity(bytes, 0, OLD_HEADER_LEN, OLD_ENTRY_LEN);
     let count = nlibs.min(capacity).min(CACHE_ENTRIES_MAX);
+    let Some(strings) = nlibs
+        .checked_mul(OLD_ENTRY_LEN)
+        .and_then(|entries| entries.checked_add(OLD_HEADER_LEN))
+        .filter(|&base| base <= bytes.len())
+    else {
+        return Vec::new();
+    };
     let mut out = Vec::with_capacity(count);
     for index in 0..count {
         let Some(offset) = index
@@ -229,9 +242,10 @@ fn parse_old(bytes: &[u8], nlibs: usize) -> Vec<CacheRecord> {
         ) else {
             break;
         };
-        if let (Some(soname), Some(path)) =
-            (read_string(bytes, 0, key), read_string(bytes, 0, value))
-        {
+        if let (Some(soname), Some(path)) = (
+            read_string(bytes, strings, key),
+            read_string(bytes, strings, value),
+        ) {
             out.push(CacheRecord {
                 soname,
                 path: PathBuf::from(path),
@@ -367,6 +381,35 @@ fn encode_strings(entries: &[&CacheEntry], base: usize) -> Option<StringTable> {
     })
 }
 
+/// Whether both of an entry's strings survive a round trip through the reader,
+/// which bounds every string it accepts.
+fn is_encodable(entry: &CacheEntry) -> bool {
+    entry.soname.len() <= CACHE_STRING_LEN_MAX
+        && entry
+            .path
+            .to_str()
+            .is_some_and(|path| path.len() <= CACHE_STRING_LEN_MAX)
+}
+
+/// Whether any soname has more alternatives than the reader keeps.
+///
+/// Counted by exact name over the whole set, which is how the reader groups
+/// them. Adjacency in the written order would not do: entries are sorted by
+/// [`libcmp`], which compares digit runs numerically, so `libx.so.1` and
+/// `libx.so.01` are `Equal` there and a run of one name can be split by the
+/// other while the reader still sees them as one oversized group.
+fn candidates_per_soname_exceeded(entries: &[&CacheEntry]) -> bool {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for entry in entries {
+        let count = counts.entry(entry.soname.as_str()).or_insert(0);
+        *count += 1;
+        if *count > CACHE_CANDIDATES_PER_SONAME_MAX {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build a `glibc-ld.so.cache1.1` image for `entries`.
 ///
 /// Returns `None` for a target this function cannot encode faithfully, so the
@@ -374,6 +417,13 @@ fn encode_strings(entries: &[&CacheEntry], base: usize) -> Option<StringTable> {
 /// loader would reject.
 pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<u8>> {
     if entries.iter().any(|entry| !entry.path.is_absolute()) {
+        return None;
+    }
+    // Sonames and paths come out of ELF files and the source filesystem, so
+    // they can be longer than the reader — and therefore the loader's own
+    // lookup — will accept. An image whose entries would be dropped on the way
+    // back in is not a cache this bundle can use.
+    if !entries.iter().all(is_encodable) {
         return None;
     }
 
@@ -397,6 +447,10 @@ pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<
             .all(|pair| libcmp(&pair[0].soname, &pair[1].soname) != Ordering::Less),
         "the loader binary-searches downwards and needs descending order"
     );
+
+    if entries.len() > CACHE_ENTRIES_MAX || candidates_per_soname_exceeded(&entries) {
+        return None;
+    }
 
     let base = NEW_HEADER_LEN + entries.len() * NEW_ENTRY_LEN;
     let StringTable {
@@ -424,6 +478,9 @@ pub fn build(architecture: &Architecture, entries: &[CacheEntry]) -> Option<Vec<
     assert_eq!(out.len(), base);
     out.extend_from_slice(&strings);
     assert_eq!(out.len(), base + strings.len());
+    if u64::try_from(out.len()).is_ok_and(|len| len > CACHE_BYTES_MAX) {
+        return None;
+    }
 
     // Read the image back with the same reader the loader's format is modelled
     // on. A cache the bundle cannot use would be worse than none.
@@ -487,6 +544,66 @@ fn libcmp(left: &str, right: &str) -> Ordering {
 mod tests {
     use super::*;
 
+    fn little_endian_x86_64() -> Architecture {
+        Architecture {
+            machine: Machine::X86_64,
+            class: ElfClass::Elf64,
+            endianness: Endianness::Little,
+        }
+    }
+
+    /// `libcmp` compares digit runs numerically, so two spellings of one
+    /// version sort as equals while the reader still groups them by exact
+    /// name. Counting adjacent runs would miss the group that overflows.
+    #[test]
+    fn candidate_counting_uses_the_readers_grouping_not_the_written_order() {
+        let architecture = little_endian_x86_64();
+        let mut entries: Vec<CacheEntry> = (0..=CACHE_CANDIDATES_PER_SONAME_MAX)
+            .map(|index| CacheEntry {
+                soname: "libx.so.1".to_string(),
+                path: PathBuf::from(format!("/usr/lib/{index:04}/libx.so.1")),
+            })
+            .collect();
+        // Sorts as an equal of `libx.so.1`, into the middle of the run above.
+        entries.push(CacheEntry {
+            soname: "libx.so.01".to_string(),
+            path: PathBuf::from("/usr/lib/0128a/libx.so.01"),
+        });
+        assert!(build(&architecture, &entries).is_none());
+    }
+
+    /// Sonames come out of ELF string tables, so `build` is handed input it
+    /// cannot always encode. It has to answer `None`, never abort.
+    #[test]
+    fn unencodable_entries_are_refused_rather_than_asserted() {
+        let architecture = little_endian_x86_64();
+
+        let long_soname = CacheEntry {
+            soname: "a".repeat(CACHE_STRING_LEN_MAX + 1),
+            path: PathBuf::from("/usr/lib/libx.so.1"),
+        };
+        assert!(build(&architecture, std::slice::from_ref(&long_soname)).is_none());
+
+        let long_path = CacheEntry {
+            soname: "libx.so.1".to_string(),
+            path: PathBuf::from(format!("/usr/lib/{}", "b".repeat(CACHE_STRING_LEN_MAX))),
+        };
+        assert!(build(&architecture, &[long_path]).is_none());
+
+        // More alternatives for one soname than the reader keeps.
+        let crowded: Vec<CacheEntry> = (0..=CACHE_CANDIDATES_PER_SONAME_MAX)
+            .map(|index| CacheEntry {
+                soname: "libx.so.1".to_string(),
+                path: PathBuf::from(format!("/usr/lib/{index}/libx.so.1")),
+            })
+            .collect();
+        assert!(build(&architecture, &crowded).is_none());
+
+        // One below the cap still builds, so the bound is the only thing
+        // separating the two answers.
+        assert!(build(&architecture, &crowded[..CACHE_CANDIDATES_PER_SONAME_MAX]).is_some());
+    }
+
     fn offset(value: usize) -> u32 {
         u32::try_from(value).expect("fixture offsets fit in u32")
     }
@@ -541,6 +658,48 @@ mod tests {
             [PathBuf::from("/lib/x86_64-linux-gnu/libc.so.6")]
         );
         assert!(cache.lookup("libnope.so.1").is_empty());
+    }
+
+    /// glibc reads an old-format cache's strings through
+    /// `&cache->libs[cache->nlibs]`, so its offsets are relative to the string
+    /// table, not to the start of the image like the new format's.
+    #[test]
+    fn old_format_string_offsets_are_relative_to_the_string_table() {
+        let entries = [
+            ("libz.so.1", "/usr/lib/libz.so.1"),
+            ("libc.so.6", "/lib/libc.so.6"),
+        ];
+        let nlibs = entries.len();
+        let mut strings: Vec<u8> = Vec::new();
+        let mut offsets = Vec::new();
+        for (soname, path) in entries {
+            let key = offset(strings.len());
+            strings.extend_from_slice(soname.as_bytes());
+            strings.push(0);
+            let value = offset(strings.len());
+            strings.extend_from_slice(path.as_bytes());
+            strings.push(0);
+            offsets.push((key, value));
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(OLD_MAGIC);
+        bytes.push(0); // padding to the u32 boundary
+        bytes.extend_from_slice(&offset(nlibs).to_le_bytes());
+        for (key, value) in &offsets {
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // flags
+            bytes.extend_from_slice(&key.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(bytes.len(), OLD_HEADER_LEN + nlibs * OLD_ENTRY_LEN);
+        bytes.extend_from_slice(&strings);
+
+        let cache = LdCache::parse(&bytes);
+        assert_eq!(
+            cache.lookup("libz.so.1"),
+            [PathBuf::from("/usr/lib/libz.so.1")]
+        );
+        assert_eq!(cache.lookup("libc.so.6"), [PathBuf::from("/lib/libc.so.6")]);
     }
 
     #[test]

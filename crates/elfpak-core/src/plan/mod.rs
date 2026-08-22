@@ -23,7 +23,7 @@ use std::{
 mod builder;
 mod model;
 
-use builder::PlanBuilder;
+use builder::{Authority, Conflict, PlanBuilder};
 pub use model::{
     ApplicationPlan, BundlePlan, InclusionReason, PlannedFile, PlannedFileKind, Warning,
 };
@@ -158,19 +158,25 @@ impl Planner {
 
         let mut warnings: Vec<Warning> = Vec::new();
         let mut builder = PlanBuilder::new(&self.source_root);
-        self.plan_loader_cache(&resolved, &mut builder, &mut warnings);
+        // The closure is planned first: its objects have to sit exactly where
+        // the loader will look, so nothing may displace them.
+        builder.acting_as(Authority::Closure);
         for (_, graph) in &resolved {
             self.plan_closure(graph, &mut builder, &mut warnings)?;
         }
+        builder.acting_as(Authority::RuntimePolicy);
+        self.plan_loader_cache(&resolved, &mut builder, &mut warnings)?;
         self.apply_runtime_policy(&mut builder, &mut warnings)?;
         deduplicate_warnings(&mut warnings);
 
-        let files = builder.finish();
+        let (files, conflicts) = builder.finish();
         if files.len() > PLAN_ENTRIES_MAX {
             return Err(Error::Config {
                 message: format!("bundle plan exceeds {PLAN_ENTRIES_MAX} entries"),
             });
         }
+        check_destination_conflicts(&conflicts)?;
+        check_nesting(&files)?;
         let applications = resolved
             .into_iter()
             .map(|(_, graph)| {
@@ -287,15 +293,16 @@ impl Planner {
         resolved: &[(Resolver, DependencyGraph)],
         builder: &mut PlanBuilder<'_>,
         warnings: &mut Vec<Warning>,
-    ) {
+    ) -> Result<()> {
         let needs_cache = resolved.iter().any(|(resolver, graph)| {
             !unreachable_libraries(resolver).is_empty() || !relocated_search_paths(graph).is_empty()
         });
 
-        let cache = self
-            .runtime_policy
-            .ld_so_cache
-            .applies(needs_cache)
+        let writing_cache = self.runtime_policy.ld_so_cache.applies(needs_cache);
+        if writing_cache {
+            warn_ambiguous_sonames(resolved.iter().map(|(_, graph)| graph), warnings);
+        }
+        let cache = writing_cache
             .then(|| self.ld_so_cache_many(resolved.iter().map(|(_, graph)| graph)))
             .flatten();
 
@@ -327,6 +334,7 @@ impl Planner {
                 warnings.push(warn_relocated(relocated, graph));
             }
         }
+        Ok(())
     }
 
     /// Turn every object in the closure into a plan entry, together with the
@@ -403,14 +411,7 @@ impl Planner {
             .flat_map(|graph| graph.nodes.iter())
             .filter(|node| matches!(node.kind, NodeKind::SharedObject | NodeKind::Interpreter))
             .map(|node| CacheEntry {
-                // A library without DT_SONAME is looked up by file name, which
-                // is also what its dependents will have recorded.
-                soname: node.soname.clone().unwrap_or_else(|| {
-                    node.destination
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                }),
+                soname: cache_soname(node),
                 path: node.destination.clone(),
             })
             .filter(|entry| !entry.soname.is_empty())
@@ -519,9 +520,11 @@ impl Planner {
         if policy.tzdata {
             self.plan_tzdata(builder)?;
         }
+        builder.acting_as(Authority::IncludedTree);
         for include in &policy.includes {
             self.plan_include(builder, include)?;
         }
+        builder.acting_as(Authority::RuntimePolicy);
 
         if policy.user.is_some() && !policy.passwd_group {
             warnings.push(Warning {
@@ -619,6 +622,140 @@ impl Planner {
         }
         Err(Error::MissingSourcePath { path: logical })
     }
+}
+
+/// Report objects the generated `/etc/ld.so.cache` cannot describe unambiguously.
+///
+/// One cache serves every application in the bundle. If two closures hold
+/// different files under the same soname, the cache can name only one, and an
+/// application that reaches the cache loads a library it was never analyzed
+/// against. This is a warning rather than an error because the cache is the
+/// *last* place glibc looks: a closure that finds its own copy through
+/// `DT_RPATH` or `DT_RUNPATH` never consults it and is unaffected.
+fn warn_ambiguous_sonames<'a>(
+    graphs: impl IntoIterator<Item = &'a DependencyGraph>,
+    warnings: &mut Vec<Warning>,
+) {
+    let mut by_soname: BTreeMap<String, Vec<(&Path, &crate::graph::Digest)>> = BTreeMap::new();
+    for graph in graphs {
+        if !uses_glibc_loader(graph) {
+            continue;
+        }
+        for node in &graph.nodes {
+            if !matches!(node.kind, NodeKind::SharedObject | NodeKind::Interpreter) {
+                continue;
+            }
+            let soname = cache_soname(node);
+            if soname.is_empty() {
+                continue;
+            }
+            let candidates = by_soname.entry(soname).or_default();
+            let candidate = (node.destination.as_path(), &node.sha256);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    let details: Vec<String> = by_soname
+        .into_iter()
+        .filter(|(_, candidates)| {
+            // Identical bytes at two paths are not ambiguous: either answer is
+            // the same library.
+            candidates
+                .iter()
+                .any(|(_, digest)| *digest != candidates[0].1)
+        })
+        .map(|(soname, candidates)| {
+            let paths: Vec<String> = candidates
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect();
+            format!("{soname}: {}", paths.join(", "))
+        })
+        .collect();
+
+    if details.is_empty() {
+        return;
+    }
+    warnings.push(Warning {
+        code: code::LOADER_CACHE_AMBIGUOUS,
+        message: format!(
+            "{} soname(s) name different files; the generated /etc/ld.so.cache lists one of each",
+            details.len()
+        ),
+        details,
+    });
+}
+
+/// The name a cache entry is looked up by: `DT_SONAME`, or the file name for a
+/// library that declares none, which is what its dependents recorded.
+///
+/// This is the single definition of that rule; [`Planner::ld_so_cache_many`]
+/// builds its entries from it, so the warning above and the cache itself can
+/// never disagree about what a library is called.
+fn cache_soname(node: &Node) -> String {
+    match node.soname.as_deref() {
+        Some(soname) if !soname.is_empty() => soname.to_string(),
+        _ => node
+            .destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// Reject a destination two entries that both carry content wanted.
+///
+/// One case is legitimate and stays silent: a file runtime policy generates
+/// keeps its place against the same path arriving inside an `--include` tree,
+/// which is what lets `--include /etc` coexist with a generated `/etc/passwd`.
+/// Everything else means the caller asked for two different things in one
+/// place, and the bundle can only express one of them.
+fn check_destination_conflicts(conflicts: &[Conflict]) -> Result<()> {
+    for conflict in conflicts {
+        let documented = conflict.kept.1 == Authority::RuntimePolicy
+            && conflict.dropped.1 == Authority::IncludedTree;
+        if documented {
+            continue;
+        }
+        return Err(Error::Config {
+            message: format!(
+                "`{}` is planned both as {} and as {}; only one entry can occupy a path",
+                conflict.destination.display(),
+                conflict.kept.0.as_str(),
+                conflict.dropped.0.as_str(),
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Reject a plan whose entries nest inside something that is not a directory.
+///
+/// Directory output would fail part-way through and tar output would silently
+/// write through the symlink or file instead, so the two backends would stop
+/// describing the same tree. Entries are sorted by destination, so every parent
+/// has already been seen by the time its children are.
+fn check_nesting(files: &[PlannedFile]) -> Result<()> {
+    let mut by_destination: BTreeMap<&Path, PlannedFileKind> = BTreeMap::new();
+    for file in files {
+        let parent = logical_parent(&file.destination);
+        if let Some(&kind) = by_destination.get(parent.as_path())
+            && kind != PlannedFileKind::Directory
+        {
+            return Err(Error::Config {
+                message: format!(
+                    "`{}` would be created inside `{}`, which is planned as {}",
+                    file.destination.display(),
+                    parent.display(),
+                    kind.as_str(),
+                ),
+            });
+        }
+        by_destination.insert(&file.destination, file.kind);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

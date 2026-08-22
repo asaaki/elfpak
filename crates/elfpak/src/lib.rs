@@ -22,6 +22,8 @@ use elfpak_core::Error;
 use std::{io::Write, path::PathBuf};
 
 pub use cli::BundleArgs;
+/// Re-exported so adapters can classify paths the same way this crate does.
+pub use elfpak_core::paths;
 
 /// Run the command line: parse, dispatch, and turn the outcome into an exit
 /// code.

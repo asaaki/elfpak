@@ -12,13 +12,42 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Who asked for a destination, which is what settles a contest between two
+/// entries that both want it.
+///
+/// The order is the order of authority, weakest first. Scaffolding exists only
+/// to hold something else, an `--include` tree is a bulk request, runtime
+/// policy names its files one at a time, and the closure's objects must sit
+/// exactly where the loader will look for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Authority {
+    Scaffolding,
+    IncludedTree,
+    RuntimePolicy,
+    Closure,
+}
+
+/// Two entries that both carry content wanted the same destination.
+#[derive(Debug, Clone)]
+pub(super) struct Conflict {
+    pub(super) destination: PathBuf,
+    pub(super) kept: (PlannedFileKind, Authority),
+    pub(super) dropped: (PlannedFileKind, Authority),
+}
+
 /// Accumulates plan entries, deduplicating destinations and creating the
 /// directory scaffolding each entry needs.
 #[derive(Debug)]
 pub(super) struct PlanBuilder<'a> {
     root: &'a SourceRoot,
-    entries: BTreeMap<PathBuf, PlannedFile>,
+    entries: BTreeMap<PathBuf, (PlannedFile, Authority)>,
     digests: DigestCache,
+    /// Destinations two content entries wanted, in insertion order. The planner
+    /// decides which of these are legitimate precedence and which are errors.
+    conflicts: Vec<Conflict>,
+    /// Authority applied to entries pushed from here on, so that each planning
+    /// phase does not have to pass it to every call.
+    authority: Authority,
 }
 
 impl<'a> PlanBuilder<'a> {
@@ -27,27 +56,64 @@ impl<'a> PlanBuilder<'a> {
             root,
             entries: BTreeMap::new(),
             digests: DigestCache::new(),
+            conflicts: Vec::new(),
+            authority: Authority::Closure,
         }
+    }
+
+    /// Set the authority the next planning phase's entries carry.
+    pub(super) fn acting_as(&mut self, authority: Authority) {
+        self.authority = authority;
     }
 
     /// Add an entry, settling a destination that two of them want.
     ///
-    /// Directories never displace real content, and real content always
-    /// displaces a directory that was only scaffolding. Between two entries
-    /// that both carry content the first one planned wins, and the phases run
-    /// in the order their paths are fixed: the ELF closure, whose objects must
-    /// sit where the loader will look, then runtime policy, then `--include`.
-    /// A generated `/etc/passwd` therefore keeps its place against an
-    /// `--include` of the source root's `/etc`.
+    /// Content always displaces a directory, because a directory is either
+    /// scaffolding or an empty shell and the entry with bytes is the one the
+    /// caller asked for. Otherwise the stronger [`Authority`] wins, and between
+    /// equals the entry planned first keeps its place.
+    ///
+    /// Whenever two entries that both carry content want one destination, the
+    /// loser is recorded as a [`Conflict`] whichever way it went. The planner
+    /// decides which of those are legitimate precedence and which mean the
+    /// bundle cannot express what was asked for.
     fn insert(&mut self, file: PlannedFile) {
+        self.insert_with(file, self.authority);
+    }
+
+    fn insert_with(&mut self, file: PlannedFile, authority: Authority) {
         file.assert_well_formed();
 
-        match self.entries.get(&file.destination) {
-            Some(existing) if existing.kind != PlannedFileKind::Directory => {}
-            Some(_) if file.kind == PlannedFileKind::Directory => {}
-            _ => {
-                self.entries.insert(file.destination.clone(), file);
-            }
+        let Some((existing, existing_authority)) = self.entries.get(&file.destination) else {
+            self.entries
+                .insert(file.destination.clone(), (file, authority));
+            return;
+        };
+
+        let existing_is_dir = existing.kind == PlannedFileKind::Directory;
+        let candidate_is_dir = file.kind == PlannedFileKind::Directory;
+        let wins = match (existing_is_dir, candidate_is_dir) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => authority > *existing_authority,
+        };
+
+        if !existing_is_dir && !candidate_is_dir && !describes_the_same_entry(existing, &file) {
+            let (kept, dropped) = if wins {
+                ((file.kind, authority), (existing.kind, *existing_authority))
+            } else {
+                ((existing.kind, *existing_authority), (file.kind, authority))
+            };
+            self.conflicts.push(Conflict {
+                destination: file.destination.clone(),
+                kept,
+                dropped,
+            });
+        }
+
+        if wins {
+            self.entries
+                .insert(file.destination.clone(), (file, authority));
         }
     }
 
@@ -57,17 +123,20 @@ impl<'a> PlanBuilder<'a> {
         assert!(path.is_absolute());
 
         for dir in ancestor_dirs(path) {
-            self.insert(PlannedFile {
-                source: None,
-                destination: dir,
-                kind: PlannedFileKind::Directory,
-                reason: reason.clone(),
-                mode: 0o755,
-                size: 0,
-                sha256: None,
-                link_target: None,
-                content: None,
-            });
+            self.insert_with(
+                PlannedFile {
+                    source: None,
+                    destination: dir,
+                    kind: PlannedFileKind::Directory,
+                    reason: reason.clone(),
+                    mode: 0o755,
+                    size: 0,
+                    sha256: None,
+                    link_target: None,
+                    content: None,
+                },
+                Authority::Scaffolding,
+            );
         }
     }
 
@@ -253,8 +322,25 @@ impl<'a> PlanBuilder<'a> {
     }
 
     /// Entries sorted by destination, which is what makes a parent directory
-    /// precede everything inside it when the plan is written out.
-    pub(super) fn finish(self) -> Vec<PlannedFile> {
-        self.entries.into_values().collect()
+    /// precede everything inside it when the plan is written out, together with
+    /// the destinations two content entries contested.
+    pub(super) fn finish(self) -> (Vec<PlannedFile>, Vec<Conflict>) {
+        let entries = self.entries.into_values().map(|(file, _)| file).collect();
+        (entries, self.conflicts)
     }
+}
+
+/// Whether re-planning `candidate` over `existing` would change nothing.
+///
+/// What lands on disk is the mode, the bytes and, for a link, its target.
+/// `kind` and `reason` say why an entry is in the bundle, not what it is, and
+/// one file legitimately arrives under two of them: `/etc/localtime` resolves
+/// into the zone database `--tzdata` already copied, and an `--include` of a
+/// library directory covers objects the closure also needs. Those are the same
+/// file planned twice, not a contest over a destination.
+fn describes_the_same_entry(existing: &PlannedFile, candidate: &PlannedFile) -> bool {
+    existing.mode == candidate.mode
+        && existing.size == candidate.size
+        && existing.sha256 == candidate.sha256
+        && existing.link_target == candidate.link_target
 }

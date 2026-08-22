@@ -47,9 +47,20 @@ pub(crate) fn run(args: &BundleArgs, verbosity: Verbosity) -> anyhow::Result<()>
 
     let image = if paths.oci_layout.is_some() || paths.oci_archive.is_some() {
         let image = image::resolve(args, &config)?;
+        // Validate now, so a bad tag or entrypoint fails before anything is
+        // written. The builders resolve it again from the same inputs.
         image.resolve(&plan)?;
         Some(image)
     } else {
+        // Nothing would consume it, and silently dropping an entrypoint or tag
+        // leaves a pipeline believing it configured an image it never built.
+        if image::was_requested_on_the_command_line(args) {
+            anyhow::bail!(elfpak_core::Error::Config {
+                message: "image options need --oci-layout or --oci-archive; \
+                          no OCI destination was given"
+                    .to_string(),
+            });
+        }
         None
     };
 

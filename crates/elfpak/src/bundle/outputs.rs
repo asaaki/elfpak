@@ -24,7 +24,6 @@ pub(crate) fn write_outputs(
     image: Option<&OciImageConfig>,
     manifest_path: Option<&Path>,
 ) -> anyhow::Result<Outputs> {
-    validate_output_layout(paths, manifest_path)?;
     let mut outputs = Outputs::default();
     if let Some(output) = &paths.output {
         outputs.rootfs = Some(RootFsBuilder::new(output).clean(args.clean).apply(plan)?);
@@ -37,6 +36,7 @@ pub(crate) fn write_outputs(
         outputs.oci_layout = Some(
             OciLayoutBuilder::new(layout)
                 .image(image.clone())
+                .clean(args.clean)
                 .apply(plan)?,
         );
     }
@@ -46,6 +46,21 @@ pub(crate) fn write_outputs(
             OciArchiveBuilder::new(archive)
                 .image(image.clone())
                 .apply(plan)?,
+        );
+    }
+    // The reports count what each backend actually wrote. Comparing them with
+    // the plan is what proves the two directory backends and the plan agree,
+    // rather than assuming they do because they share a data structure.
+    if let Some(rootfs) = &outputs.rootfs {
+        assert_eq!(
+            rootfs.files + rootfs.directories + rootfs.symlinks,
+            entry_count(plan)
+        );
+    }
+    if let Some(tar) = &outputs.tar {
+        assert_eq!(
+            tar.files + tar.directories + tar.symlinks,
+            entry_count(plan)
         );
     }
     if let (Some(layout), Some(archive)) = (&outputs.oci_layout, &outputs.oci_archive) {
@@ -75,6 +90,12 @@ pub(crate) fn write_outputs(
     Ok(outputs)
 }
 
+/// Entries a backend is expected to produce for a plan, saturated at `u32::MAX`
+/// to match the counters the reports use.
+fn entry_count(plan: &BundlePlan) -> u32 {
+    u32::try_from(plan.files().len()).unwrap_or(u32::MAX)
+}
+
 /// A rootfs is a directory tree. Publishing a tar or manifest inside it would
 /// either add an unplanned file to the bundle or be overwritten during a
 /// subsequent rootfs replacement. Keep every requested artifact separate.
@@ -90,6 +111,19 @@ pub(crate) fn validate_output_layout(paths: &Paths, manifest: Option<&Path>) -> 
     ];
     let directories = normalize_artifacts(&directories)?;
     let files = normalize_artifacts(&files)?;
+
+    // Publishing replaces a directory output wholesale, and `--clean` deletes
+    // what was there. Either would destroy the filesystem being packaged.
+    let root = resolved_path(&paths.root)?;
+    for (kind, directory) in &directories {
+        if root.starts_with(directory) {
+            return Err(output_layout_error(&format!(
+                "{kind} `{}` contains the source root `{}`; the source filesystem is read-only",
+                directory.display(),
+                root.display()
+            )));
+        }
+    }
 
     for (index, (left_kind, left)) in directories.iter().enumerate() {
         for (right_kind, right) in &directories[index + 1..] {
@@ -127,8 +161,34 @@ fn normalize_artifacts(
     artifacts
         .iter()
         .filter_map(|(kind, path)| path.map(|path| (*kind, path)))
-        .map(|(kind, path)| absolute_path(path).map(|path| (kind, path)))
+        .map(|(kind, path)| resolved_path(path).map(|path| (kind, path)))
         .collect()
+}
+
+/// Absolute, symlink-resolved where the path already exists. Comparing two
+/// artifact paths lexically misses an alias: `out` and a symlink `alias -> out`
+/// normalize differently but name one directory.
+fn resolved_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+    // Not created yet: resolve the deepest ancestor that does exist, so a
+    // destination under an aliased parent is still compared correctly.
+    let absolute = absolute_path(path)?;
+    let mut suffix = Vec::new();
+    let mut current = absolute.as_path();
+    while let Some(parent) = current.parent() {
+        let Some(name) = current.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        if let Ok(canonical) = parent.canonicalize() {
+            suffix.reverse();
+            return Ok(suffix.iter().fold(canonical, |path, part| path.join(part)));
+        }
+        current = parent;
+    }
+    Ok(absolute)
 }
 
 fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {

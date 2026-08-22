@@ -39,7 +39,7 @@ elfpak bundle <binary>...
     --preset <minimal|web>    runtime policy preset
     --include <path>          extra file or directory, location preserved
     --allow-library <soname>  dependency allow-list (repeatable)
-    --user <uid[:gid]>        identity the application runs as
+    --user <uid[:gid]|name:uid:gid>  identity the application runs as
     --library-path <dir>      extra search directory, like LD_LIBRARY_PATH
     --ca-certificates[=BOOL] --tmp[=BOOL] --passwd-group[=BOOL]
     --nsswitch[=BOOL] --tzdata[=BOOL] --ld-so-cache[=BOOL]
@@ -239,7 +239,7 @@ env = { RUST_LOG = "info" }
 labels = { "org.opencontainers.image.source" = "https://github.com/example/server" }
 ```
 
-`--user <uid[:gid]>` continues to control generated identity files and also
+`--user` continues to control generated identity files and also
 sets the OCI process user to the resolved numeric `uid:gid`. It does not change
 layer file ownership, which is normalized to `0:0`.
 
@@ -372,6 +372,14 @@ For rootfs and rootfs-tar consumers, `--user` records an identity in
 `passwd`/`group` but the container runtime still decides who runs the process.
 OCI output additionally records the numeric identity in its runtime config.
 
+`--user` accepts `uid`, `uid:gid` and `name:uid:gid`. A name is 1-32 characters
+of `A-Z`, `a-z`, `0-9`, `_` or `-`, because it is written into colon- and
+newline-delimited system files. Every image already contains `root:0:0` and
+`nobody:65534:65534`, so a bare `uid[:gid]` matching one of those ids *is* that
+account and adds no second entry; naming one of them with different ids, or
+claiming uid `0` or `65534` under another name, is rejected. Sharing a reserved
+*group* id is ordinary — `--user 1000:65534` puts the account in `nogroup`.
+
 ### When two features want the same path
 
 Every entry is planned before anything is written, so a destination two features
@@ -383,9 +391,18 @@ loader will look for them, then runtime policy, then `--include`. A generated
 `/etc/passwd` therefore keeps its place against an `--include` of the source
 root's `/etc`, and `elfpak bundle -v` lists the winner with its reason.
 
-The one case that is an error rather than a precedence is `--install` landing on
-a library the closure needs at that exact path: the bundle would be left unable
-to load it, so `E4001` reports the collision instead.
+Two entries that both carry content and are not the same file are an error
+rather than a precedence, because the bundle can only express one of them:
+`--install` landing on a library the closure needs at that exact path, or on a
+file runtime policy generates. `E4001` names both entries. The same check
+rejects a plan whose entries would nest inside something that is not a
+directory, which directory output cannot create and tar output would silently
+write through.
+
+One file legitimately reaches the plan more than once — `/etc/localtime`
+resolving into the zone database `--tzdata` already copied, or an `--include`
+of a library directory the closure also needs. Identical mode, size, contents
+and link target make those the same entry, not a contest.
 
 ## Configuration file
 
@@ -496,8 +513,10 @@ configuration is part of the record rather than something the caller has to
 remember.
 
 Manifest version 3 records every installed application in `binaries` while
-retaining `binary` as the primary/first application for compatibility. Older
-manifests without `binaries` continue to verify as singular bundles.
+retaining `binary` as the primary/first application for compatibility. Version 4
+adds the `image` object, which records the resolved OCI image configuration and
+its manifest digest whenever an OCI output was written. Older manifests without
+`binaries` or `image` continue to verify.
 
 ```console
 $ elfpak verify /out/elfpak-manifest.json
@@ -749,7 +768,15 @@ Path handling is defensive throughout: destinations are normalized lexically,
 `..` can never escape the output root, writes through a symlinked parent are
 refused, and anything already occupying a destination is unlinked before it is
 written — a leftover symlink is never followed out of the output root.
-`--clean` refuses to delete a filesystem root.
+`--clean` refuses to delete a filesystem root, and no directory output may
+contain or equal `--root`, because publishing replaces that directory and would
+destroy the filesystem being packaged.
+
+`--oci-layout` publishes by replacing its destination, so it accepts only a
+destination that does not exist, is empty, or already holds an `oci-layout`
+marker. Pass `--clean` to replace a directory holding anything else. Files
+inside a published layout are written with mode `0644` and are on disk before
+`index.json` names them.
 
 ## Repository layout
 

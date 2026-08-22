@@ -9,7 +9,10 @@ use crate::{
     hash::{HashingReader, ensure_matches_plan},
     plan::{BundlePlan, PlannedFile, PlannedFileKind},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 /// Explicit reproducible-build timestamp, when configured by the caller.
 fn source_date_epoch() -> Result<Option<std::time::SystemTime>> {
@@ -79,6 +82,7 @@ impl RootFsBuilder {
 
         let stage = tempfile::Builder::new()
             .prefix(".elfpak-rootfs-")
+            .permissions(std::fs::Permissions::from_mode(STAGE_MODE))
             .tempdir_in(parent)
             .map_err(|e| io(parent, e))?;
 
@@ -88,9 +92,9 @@ impl RootFsBuilder {
         if path_exists(&self.output) && !self.clean {
             clone_tree(&self.output, stage.path())?;
         } else {
-            // Temporary directories start as 0700. The root of a generated
-            // filesystem should have the same normalized mode as its ordinary
-            // directory entries.
+            // The stage is built private and only widened at publication: the
+            // root of a generated filesystem takes the same normalized mode as
+            // its ordinary directory entries.
             set_mode(stage.path(), 0o755)?;
         }
         if self.clean && path_exists(&self.output) {
@@ -171,7 +175,7 @@ impl RootFsBuilder {
             });
         }
         if let Some(parent) = target.parent() {
-            if has_symlinked_ancestor(output, parent) {
+            if crate::paths::has_symlinked_ancestor(output, parent) {
                 return Err(Error::PathEscape {
                     path: file.destination.clone(),
                     kind: "output",
@@ -430,6 +434,24 @@ fn write_file(target: &Path, file: &PlannedFile) -> Result<u64> {
     }
 }
 
+/// Give a staged artifact the mode its destination already had, so replacing a
+/// file does not silently change who can read it. A destination that is not
+/// there yet gets the ordinary `0644`.
+pub(crate) fn set_output_permissions(stage: &Path, destination: &Path) -> Result<()> {
+    let permissions = std::fs::metadata(destination)
+        .map(|metadata| metadata.permissions())
+        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o644));
+    std::fs::set_permissions(stage, permissions).map_err(|e| io(stage, e))
+}
+
+/// Mode a staging directory is created with.
+///
+/// Staging happens beside the destination, which can be a shared directory such
+/// as `/tmp` or a group-writable CI workspace. `tempfile` would otherwise apply
+/// the ambient umask, leaving a window in which another user could plant an
+/// entry that publication then makes part of the finished output.
+pub(crate) const STAGE_MODE: u32 = 0o700;
+
 /// Refuse the filesystem root as an output even when `--clean` was not
 /// requested. Materializing there would turn logical bundle destinations such
 /// as `/app/server` into writes to the host filesystem.
@@ -475,31 +497,6 @@ fn remove_existing(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(io(path, e)),
     }
-}
-
-/// Reject any existing symlink between the output root and `path`. Checking
-/// only the immediate parent lets `create_dir_all` follow a pre-existing
-/// symlink higher in the path.
-fn has_symlinked_ancestor(output: &Path, path: &Path) -> bool {
-    // Every step drops one component, so the walk is bounded by the depth of
-    // the path it starts from.
-    let depth = path.components().count();
-    let mut steps = 0usize;
-    let mut current = path;
-    while current != output {
-        steps += 1;
-        assert!(steps <= depth);
-
-        match std::fs::symlink_metadata(current) {
-            Ok(metadata) if metadata.is_symlink() => return true,
-            Ok(_) | Err(_) => {}
-        }
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        current = parent;
-    }
-    false
 }
 
 /// What was written, counted as it was written.
@@ -555,8 +552,9 @@ fn pin_times(path: &Path, time: std::time::SystemTime) {
 mod tests {
     use super::{
         ensure_directory, finish_exchange, finish_noreplace, guard_clean, guard_output,
-        has_symlinked_ancestor, remove_existing,
+        remove_existing,
     };
+    use crate::paths::has_symlinked_ancestor;
     use std::path::Path;
 
     #[test]

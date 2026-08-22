@@ -14,6 +14,13 @@ use std::{
 };
 
 pub const MANIFEST_VERSION: u32 = 4;
+
+/// Upper bound on a manifest file `verify` will read.
+///
+/// One entry costs a few hundred bytes, so this comfortably covers a plan at
+/// [`crate::plan::PLAN_ENTRIES_MAX`] while keeping an arbitrary file handed to
+/// `verify` from being loaded whole.
+const MANIFEST_BYTES_MAX: u64 = 512 * 1024 * 1024;
 const MANIFEST_SHA256_VERSION: u32 = 2;
 /// Name of the manifest written beside a bundle.
 pub const MANIFEST_NAME_DEFAULT: &str = "elfpak-manifest.json";
@@ -269,7 +276,7 @@ impl Manifest {
             .prefix(".elfpak-manifest-")
             .tempfile_in(parent)
             .map_err(|e| io(parent, e))?;
-        set_output_permissions(stage.path(), path)?;
+        crate::rootfs::set_output_permissions(stage.path(), path)?;
         stage.write_all(json.as_bytes()).map_err(|e| io(path, e))?;
         stage.as_file().sync_all().map_err(|e| io(path, e))?;
         stage.persist(path).map_err(|e| io(path, e.error))?;
@@ -277,6 +284,21 @@ impl Manifest {
     }
 
     pub fn load(path: &Path) -> Result<Manifest> {
+        // A manifest is an index of a bundle, not a data container. `verify`
+        // is pointed at files this process did not write, so the size is
+        // checked before the bytes are held in memory.
+        let metadata = std::fs::metadata(path).map_err(|e| io(path, e))?;
+        if !metadata.is_file() {
+            // A FIFO reports a length of zero and then yields bytes forever, so
+            // the size check below would wave it through.
+            return Err(invalid_manifest(path, "not a regular file".to_string()));
+        }
+        if metadata.len() > MANIFEST_BYTES_MAX {
+            return Err(Error::LimitExceeded {
+                resource: "manifest",
+                limit: usize::try_from(MANIFEST_BYTES_MAX).unwrap_or(usize::MAX),
+            });
+        }
         let bytes = std::fs::read(path).map_err(|e| io(path, e))?;
         let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::Manifest {
             path: path.to_path_buf(),
@@ -445,7 +467,7 @@ impl Manifest {
             let target = crate::paths::join_under(rootfs, Path::new(&file.path));
             assert!(target.starts_with(rootfs));
 
-            if has_symlinked_ancestor(rootfs, &target) {
+            if crate::paths::has_symlinked_ancestor(rootfs, target.parent().unwrap_or(rootfs)) {
                 report.problems.push(Problem {
                     path: file.path.clone(),
                     detail: "path traverses a symlinked directory inside the rootfs".to_string(),
@@ -495,8 +517,20 @@ impl Manifest {
         while let Some(current) = stack.pop() {
             assert!(current.starts_with(rootfs), "the walk stays in the rootfs");
 
-            let Ok(entries) = std::fs::read_dir(&current) else {
-                continue;
+            let entries = match std::fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    // Strict verification claims the rootfs holds nothing but
+                    // planned entries. A subtree it could not enumerate is a
+                    // gap in that claim, not an absence of problems.
+                    report.problems.push(Problem {
+                        path: logical_within(rootfs, &current),
+                        detail: format!(
+                            "could not be read while checking for unlisted entries: {error}"
+                        ),
+                    });
+                    continue;
+                }
             };
             // Sorted, so that the problems of a failing verification are
             // reported in the same order on every run.
@@ -508,8 +542,15 @@ impl Manifest {
                     continue;
                 };
                 let logical = crate::paths::normalize_absolute(&Path::new("/").join(relative));
-                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                    continue;
+                let metadata = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        report.problems.push(Problem {
+                            path: logical.display().to_string(),
+                            detail: format!("could not be inspected: {error}"),
+                        });
+                        continue;
+                    }
                 };
                 // Never descend into a symlink: it is an entry in its own right,
                 // and its target is checked where the target lives.
@@ -536,6 +577,15 @@ impl Manifest {
     }
 }
 
+/// A path inside the rootfs, named the way the manifest names it, so every
+/// problem in one report is keyed in the same path space.
+fn logical_within(rootfs: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(rootfs).unwrap_or(path);
+    crate::paths::normalize_absolute(&Path::new("/").join(relative))
+        .display()
+        .to_string()
+}
+
 fn invalid_manifest(path: &Path, message: String) -> Error {
     Error::Manifest {
         path: path.to_path_buf(),
@@ -548,32 +598,6 @@ fn is_sha256(digest: &str) -> bool {
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
-
-/// A final symlink is a valid manifest entry; only ancestor symlinks would
-/// redirect metadata reads or hashing outside the supplied rootfs.
-fn has_symlinked_ancestor(rootfs: &Path, target: &Path) -> bool {
-    let mut current = target.parent();
-    while let Some(path) = current {
-        if path == rootfs {
-            return false;
-        }
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_symlink() => return true,
-            Ok(_) | Err(_) => {}
-        }
-        current = path.parent();
-    }
-    true
-}
-
-fn set_output_permissions(stage: &Path, destination: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let permissions = std::fs::metadata(destination)
-        .map(|metadata| metadata.permissions())
-        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o644));
-    std::fs::set_permissions(stage, permissions).map_err(|e| io(stage, e))
 }
 
 /// Check one entry against what the manifest recorded for it. `None` means the

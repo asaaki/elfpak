@@ -4,6 +4,19 @@ use crate::{cli::BundleArgs, config::Config};
 use elfpak_core::{Error, OciImageConfig};
 use std::{collections::BTreeMap, path::Path};
 
+/// Whether image metadata was named on the command line, which is a statement
+/// about *this* invocation. A configured `[image]` table is a standing
+/// declaration that need not apply to a rootfs-only build, so it is not
+/// counted here and continues to be ignored when no image is produced.
+pub(crate) fn was_requested_on_the_command_line(args: &BundleArgs) -> bool {
+    args.image_tag.is_some()
+        || !args.entrypoint.is_empty()
+        || !args.cmd.is_empty()
+        || args.working_dir.is_some()
+        || !args.env.is_empty()
+        || !args.label.is_empty()
+}
+
 pub(crate) fn resolve(args: &BundleArgs, config: &Config) -> anyhow::Result<OciImageConfig> {
     let tag = args
         .image_tag

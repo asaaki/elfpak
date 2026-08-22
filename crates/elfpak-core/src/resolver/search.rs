@@ -16,7 +16,20 @@ const CONF_DEPTH_MAX: usize = 8;
 /// Upper bound on the files one `ld.so.conf` may pull in, and on the
 /// directories it may name. Both bound the work a hostile sysroot can ask for.
 const CONF_FILES_MAX: usize = 256;
-const CONF_DIRECTORIES_MAX: usize = 256;
+/// Directories `/etc/ld.so.conf` may contribute.
+///
+/// Deliberately well below [`crate::resolver::SEARCH_DIRECTORIES_MAX`]: these
+/// are added to every lookup *alongside* the object's own search paths and the
+/// built-in directories, so a configuration that consumed the whole budget
+/// would make each lookup fail on a limit rather than report the one library it
+/// could not find.
+const CONF_DIRECTORIES_MAX: usize = 128;
+/// Directives held while walking the include graph. A single `include *` can
+/// name a whole directory, and the file limit below only bounds how many are
+/// read, not how many are queued.
+const CONF_PENDING_MAX: usize = 4096;
+/// Bytes read from one configuration file. It is a short list of directories.
+const CONF_BYTES_MAX: usize = 1024 * 1024;
 
 /// glibc's built-in trusted directories, plus the Debian/Fedora conventions that
 /// are configured on every mainstream distribution.
@@ -72,6 +85,9 @@ pub fn parse_ld_so_conf(root: &SourceRoot) -> Vec<PathBuf> {
         visited.push(file.clone());
 
         for directive in read_conf(root, &file).into_iter().rev() {
+            if pending.len() >= CONF_PENDING_MAX {
+                break;
+            }
             pending.push((directive, depth + 1));
         }
     }
@@ -85,7 +101,7 @@ pub fn parse_ld_so_conf(root: &SourceRoot) -> Vec<PathBuf> {
 fn read_conf(root: &SourceRoot, logical: &Path) -> Vec<Directive> {
     assert!(logical.is_absolute());
 
-    let Ok(Some(bytes)) = root.read(logical) else {
+    let Ok(Some(bytes)) = root.read_bounded(logical, CONF_BYTES_MAX) else {
         return Vec::new();
     };
     let Ok(text) = String::from_utf8(bytes) else {
@@ -142,6 +158,7 @@ fn expand_include(root: &SourceRoot, current: &Path, pattern: &str) -> Vec<PathB
     let (prefix, suffix) = name.split_once('*').unwrap_or((name, ""));
     entries
         .into_iter()
+        .take(CONF_PENDING_MAX)
         .filter_map(|entry| {
             let entry = entry.to_str()?.to_string();
             // The two halves must not overlap, or `lib*.conf` would match

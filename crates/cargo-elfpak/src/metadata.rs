@@ -204,15 +204,25 @@ fn select_package<'a>(metadata: &'a Metadata, context: &SelectionContext) -> Res
         };
     }
 
+    // An explicit --manifest-path names one package. Falling through to cwd
+    // inference when it does not match would build a different package than the
+    // one the caller pointed at, and Cargo would accept the mismatched pair.
     if let Some(manifest_path) = context.manifest_path.as_deref() {
         let manifest_path = absolute_path(manifest_path, &context.current_dir);
-        if let Some(package) = workspace_packages
+        return workspace_packages
             .iter()
             .copied()
-            .find(|package| package.manifest_path.as_std_path() == manifest_path)
-        {
-            return Ok(package);
-        }
+            .find(|package| {
+                absolute_path(package.manifest_path.as_std_path(), &context.current_dir)
+                    == manifest_path
+            })
+            .with_context(|| {
+                format!(
+                    "`{}` is not the manifest of a workspace member; available packages: {}",
+                    manifest_path.display(),
+                    package_names(&workspace_packages)
+                )
+            });
     }
 
     if let Some(package) = package_containing(&workspace_packages, &context.current_dir) {
@@ -324,12 +334,16 @@ fn binary_targets(package: &Package) -> Result<Vec<&Target>> {
     Ok(binaries)
 }
 
+/// Absolute *and* lexically normalized. `Path` equality compares components and
+/// keeps `..`, so `ws/worker/../tools/Cargo.toml` would otherwise never equal
+/// the `ws/tools/Cargo.toml` Cargo reports.
 fn absolute_path(path: &Path, current_dir: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         current_dir.join(path)
-    }
+    };
+    elfpak::paths::normalize_absolute(&absolute)
 }
 
 fn package_names(packages: &[&Package]) -> String {

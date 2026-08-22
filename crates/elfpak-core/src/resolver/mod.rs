@@ -104,7 +104,7 @@ pub trait DynamicLinkerResolver {
 /// A request consults the object's own search paths, `--library-path`, the
 /// cache and the default directories; hundreds would mean a pathological
 /// `DT_RPATH`, and an unbounded list would mean an unbounded lookup.
-const SEARCH_DIRECTORIES_MAX: usize = 256;
+pub(crate) const SEARCH_DIRECTORIES_MAX: usize = 256;
 
 #[derive(Debug)]
 pub struct Resolver {
@@ -122,7 +122,7 @@ pub struct Resolver {
 impl Resolver {
     pub fn new(root: SourceRoot) -> Resolver {
         let cache = root
-            .resolve(Path::new("/etc/ld.so.cache"))
+            .probe(Path::new("/etc/ld.so.cache"))
             .ok()
             .flatten()
             .filter(|r| r.kind == EntryKind::File)
@@ -163,12 +163,22 @@ impl Resolver {
         if origin.survives_packaging() {
             return;
         }
+        // How a library was found stops mattering once it sits somewhere the
+        // packaged loader searches on its own.
+        //
+        // `search::default_library_paths` is a union of distro conventions,
+        // which is right for *finding* a candidate but only approximates any
+        // one loader's built-in list: glibc fixes that list when it is built,
+        // and nothing in a source filesystem states it. A sysroot that places a
+        // loader somewhere other than its own `slibdir` — assembled by hand
+        // rather than by a package manager — can therefore be exempted here for
+        // a directory its loader will not actually search. Reading the list out
+        // of the loader binary is the only way to close that gap, and it cannot
+        // be done portably; `--ld-so-cache=true` is the answer meanwhile.
         let is_default = search::default_library_paths(&request.architecture)
             .iter()
             .any(|default| default == directory);
         if is_default {
-            // The packaged loader searches this directory anyway, so it does not
-            // matter how the library was found here.
             return;
         }
         let note = ResolutionNote {
@@ -307,11 +317,21 @@ impl Resolver {
                 );
             }
             chain.extend(inherited);
+            // glibc guards the whole RPATH phase on the *requesting* object:
+            // `if (loader->l_info[DT_RUNPATH] == NULL)` wraps the walk up the
+            // loader chain, not just that object's own RPATH. An object with
+            // DT_RUNPATH therefore sees no RPATH at all, its loaders' included,
+            // while its children still inherit the chain unchanged.
+            let search_chain = if meta.runpath_is_authoritative() {
+                Vec::new()
+            } else {
+                chain.clone()
+            };
             for soname in &meta.needed {
                 let request = LibraryRequest {
                     soname: soname.clone(),
                     requester: requester.clone(),
-                    rpath_chain: chain.clone(),
+                    rpath_chain: search_chain.clone(),
                     runpath: meta.runpath.clone(),
                     nodeflib: meta.nodeflib,
                     architecture,
@@ -484,15 +504,13 @@ impl Resolver {
         Ok(dirs)
     }
 
-    /// Optional glibc-hwcaps subdirectories are deliberately not selected.
-    /// Their availability is a property of the deployment CPU, not the ELF
-    /// target or sysroot. Picking the highest variant while planning can make
-    /// an otherwise portable bundle fault on older CPUs.
-    fn hwcaps_subdirs(architecture: &Architecture) -> &'static [&'static str] {
-        let _ = architecture;
-        &[]
-    }
-
+    /// One directory of the search list.
+    ///
+    /// glibc would first look in this directory's `glibc-hwcaps` subdirectories.
+    /// `elfpak` deliberately does not: which of them the loader accepts is a
+    /// property of the CPU the image ends up on, not of the ELF target or the
+    /// source filesystem, so selecting the best variant while planning can make
+    /// an otherwise portable bundle fault on an older machine.
     fn try_directory(
         &mut self,
         dir: &Path,
@@ -500,17 +518,6 @@ impl Resolver {
         searched: &mut Vec<PathBuf>,
         mismatch: &mut Option<(PathBuf, Architecture)>,
     ) -> Result<Option<ResolvedLibrary>> {
-        for hwcap in Self::hwcaps_subdirs(&request.architecture) {
-            let hwcap_dir = dir.join("glibc-hwcaps").join(hwcap);
-            if let Some(found) = self.try_path(
-                &hwcap_dir.join(&request.soname),
-                request,
-                searched,
-                mismatch,
-            )? {
-                return Ok(Some(found));
-            }
-        }
         self.try_path(&dir.join(&request.soname), request, searched, mismatch)
     }
 
@@ -525,7 +532,9 @@ impl Resolver {
         if !searched.contains(&dir) {
             searched.push(dir);
         }
-        let Some(resolved) = self.root.resolve(logical)? else {
+        // A candidate, not a path anyone named: every failure to stat it just
+        // means the loader would try the next directory.
+        let Some(resolved) = self.root.probe(logical)? else {
             return Ok(None);
         };
         if resolved.kind != EntryKind::File {

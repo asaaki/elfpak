@@ -58,6 +58,34 @@ pub fn ancestor_dirs(path: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Whether any component between `root` and `path` is a symlink.
+///
+/// Checking only the immediate parent is not enough: `create_dir_all` and the
+/// verification walk both follow a symlink planted higher up. A walk that
+/// reaches the filesystem root without meeting `root` answers `true`, because a
+/// path that is not under the root it was supposed to be under is exactly the
+/// situation both callers exist to refuse.
+pub fn has_symlinked_ancestor(root: &Path, path: &Path) -> bool {
+    // `path` need not be under `root`: a manifest naming `/` produces a shorter
+    // path than the rootfs it is checked against. Every step drops one
+    // component, so the walk terminates on its own; the running of it off the
+    // top is the "not under the root" answer, not a broken invariant.
+    let mut current = path;
+    while current != root {
+        if std::fs::symlink_metadata(current).is_ok_and(|metadata| metadata.is_symlink()) {
+            return true;
+        }
+        let Some(parent) = current.parent() else {
+            return true;
+        };
+        if parent == current {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 /// Render bytes as lowercase hex (used for digests).
 pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
