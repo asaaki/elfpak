@@ -12,14 +12,11 @@ description = "Core library for elfpak: ELF analysis, loader-faithful resolution
 workspace = true
 
 [dependencies]
-goblin.workspace = true
+goblin = { version = "0.10", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-tar.workspace = true
+sha2 = "0.11"
+tar = "0.4"
 tempfile.workspace = true
-rustix.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
-tar.workspace = true
+rustix = { version = "1", features = ["fs"] }
+thiserror = "2"

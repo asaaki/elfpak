@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/elfpak", "crates/elfpak-core"]
+members = ["crates/cargo-elfpak", "crates/elfpak", "crates/elfpak-core"]
 
 [workspace.package]
 version = "0.1.4"
@@ -26,19 +26,11 @@ cast_lossless = "warn"
 undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
-elfpak-core = { path = "crates/elfpak-core", version = "0.1.4" }
-
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-goblin = { version = "0.10", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.11"
-tar = "0.4"
-thiserror = "2"
-toml = "1"
 tempfile = "3"
-rustix = { version = "1", features = ["fs"] }
 
 [profile.release]
 opt-level = "z"

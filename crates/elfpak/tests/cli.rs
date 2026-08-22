@@ -1,5 +1,6 @@
 //! End-to-end CLI tests against the host filesystem.
 
+use clap::Parser;
 use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -399,4 +400,33 @@ fn strict_verify_rejects_an_unlisted_file() {
         "{}",
         stderr(&strict)
     );
+}
+
+#[test]
+fn reusable_bundle_entry_point_forces_the_supplied_binary() {
+    #[derive(Parser)]
+    struct BundleCli {
+        #[command(flatten)]
+        bundle: elfpak::BundleArgs,
+    }
+
+    let Some(binary) = subject() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("elfpak.toml");
+    let rootfs = tmp.path().join("rootfs");
+    std::fs::write(&config, "[package]\nbinary = '/does/not/exist'\n").unwrap();
+
+    let args = BundleCli::parse_from([
+        "bundle",
+        "--config",
+        config.to_str().unwrap(),
+        "--output",
+        rootfs.to_str().unwrap(),
+        "--dry-run",
+    ])
+    .bundle;
+    let status = elfpak::run_bundle(args, binary, false, 0);
+
+    assert_eq!(status, std::process::ExitCode::SUCCESS);
+    assert!(!rootfs.exists(), "dry-run must not materialize the rootfs");
 }

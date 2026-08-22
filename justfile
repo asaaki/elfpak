@@ -35,9 +35,14 @@ bump kind:
         echo "workspace version is missing or is not simple SemVer: ${current:-<missing>}" >&2
         exit 1
     fi
-    core_dependency_version="$(tomli query --strip-trailing-newline --filepath Cargo.toml workspace.dependencies.elfpak-core.version | tr -d '[:space:]\"')"
+    core_dependency_version="$(tomli query --strip-trailing-newline --filepath crates/elfpak/Cargo.toml dependencies.elfpak-core.version | tr -d '[:space:]\"')"
     if [[ "$core_dependency_version" != "$current" ]]; then
         echo "elfpak-core dependency version ${core_dependency_version:-<missing>} does not match workspace version $current" >&2
+        exit 1
+    fi
+    elfpak_dependency_version="$(tomli query --strip-trailing-newline --filepath crates/cargo-elfpak/Cargo.toml dependencies.elfpak.version | tr -d '[:space:]\"')"
+    if [[ "$elfpak_dependency_version" != "$current" ]]; then
+        echo "elfpak dependency version ${elfpak_dependency_version:-<missing>} does not match workspace version $current" >&2
         exit 1
     fi
 
@@ -56,16 +61,23 @@ bump kind:
         exit 1
     fi
 
-    manifest_next="$(mktemp --tmpdir=. .Cargo.toml.XXXXXX)"
-    trap 'rm -f "$manifest_next"' EXIT
-    tomli set --strip-trailing-newline workspace.package.version "$new_version" < Cargo.toml |
-        tomli set --strip-trailing-newline workspace.dependencies.elfpak-core.version "$new_version" > "$manifest_next"
-    chmod --reference=Cargo.toml "$manifest_next"
-    mv "$manifest_next" Cargo.toml
+    workspace_manifest_next="$(mktemp --tmpdir=. .Cargo.toml.XXXXXX)"
+    elfpak_manifest_next="$(mktemp --tmpdir=crates/elfpak .Cargo.toml.XXXXXX)"
+    cargo_elfpak_manifest_next="$(mktemp --tmpdir=crates/cargo-elfpak .Cargo.toml.XXXXXX)"
+    trap 'rm -f "$workspace_manifest_next" "$elfpak_manifest_next" "$cargo_elfpak_manifest_next"' EXIT
+    tomli set --strip-trailing-newline workspace.package.version "$new_version" < Cargo.toml > "$workspace_manifest_next"
+    tomli set --strip-trailing-newline dependencies.elfpak-core.version "$new_version" < crates/elfpak/Cargo.toml > "$elfpak_manifest_next"
+    tomli set --strip-trailing-newline dependencies.elfpak.version "$new_version" < crates/cargo-elfpak/Cargo.toml > "$cargo_elfpak_manifest_next"
+    chmod --reference=Cargo.toml "$workspace_manifest_next"
+    chmod --reference=crates/elfpak/Cargo.toml "$elfpak_manifest_next"
+    chmod --reference=crates/cargo-elfpak/Cargo.toml "$cargo_elfpak_manifest_next"
+    mv "$workspace_manifest_next" Cargo.toml
+    mv "$elfpak_manifest_next" crates/elfpak/Cargo.toml
+    mv "$cargo_elfpak_manifest_next" crates/cargo-elfpak/Cargo.toml
     trap - EXIT
     cargo update --workspace --offline
 
-    git add Cargo.toml Cargo.lock
+    git add Cargo.toml Cargo.lock crates/elfpak/Cargo.toml crates/cargo-elfpak/Cargo.toml
     git commit -S -m "Release $tag"
     git tag -s "$tag" -m "Release $tag"
     git push origin main --follow-tags

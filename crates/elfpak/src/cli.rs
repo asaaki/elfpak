@@ -28,7 +28,7 @@ pub(crate) enum Command {
     /// Analyze an executable and print its runtime closure without copying files
     Inspect(InspectArgs),
     /// Build a minimal rootfs for an executable
-    Bundle(BundleArgs),
+    Bundle(Box<StandaloneBundleArgs>),
     /// Check a materialized rootfs against a manifest
     Verify(VerifyArgs),
 }
@@ -52,8 +52,24 @@ pub(crate) struct InspectArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct BundleArgs {
+pub(crate) struct StandaloneBundleArgs {
     /// Executable to package
+    pub(crate) binary: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub(crate) bundle: BundleArgs,
+}
+
+impl StandaloneBundleArgs {
+    pub(crate) fn into_bundle(mut self) -> BundleArgs {
+        self.bundle.binary = self.binary;
+        self.bundle
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct BundleArgs {
+    #[arg(skip)]
     pub(crate) binary: Option<PathBuf>,
 
     /// Directory the rootfs is written to

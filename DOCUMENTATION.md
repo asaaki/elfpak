@@ -3,6 +3,7 @@
 Reference for `elfpak`. See [README.md](README.md) for the short version.
 
 - [Commands](#commands)
+  - [`cargo elfpak bundle`](#cargo-elfpak-bundle)
 - [Presets and runtime policy](#presets-and-runtime-policy)
 - [Configuration file](#configuration-file)
 - [Dependency policy](#dependency-policy)
@@ -46,6 +47,50 @@ every planned file with the reason it was included.
 
 `inspect` and `bundle --dry-run` perform the complete discovery, resolution and
 planning work without touching the output filesystem.
+
+### `cargo elfpak bundle`
+
+`cargo-elfpak` adapts the bundle command to a Cargo project. Install it and run
+the packaging options directly from the project:
+
+```console
+$ cargo install cargo-elfpak
+$ cargo elfpak bundle --release -p api --bin server \
+    --output rootfs --install /app/server --preset web
+```
+
+Package selection uses `-p/--package` when supplied. Otherwise the command uses
+the package selected by `--manifest-path`, the package containing the working
+directory, Cargo's root package, or a sole workspace default member, in that
+order. An ambiguous virtual workspace fails and lists the packages accepted by
+`-p`.
+
+Binary selection uses `--bin` when supplied. Otherwise it honors `default-run`,
+then a binary named like the package, then a sole binary target. If multiple
+binaries remain, the command fails and lists the names accepted by `--bin`.
+
+Before bundling, the adapter always runs a narrowly selected `cargo build`.
+Cargo's own fingerprinting decides whether the executable is fresh or needs to
+be rebuilt, covering dependencies, build scripts, features, profiles, compiler
+options and configuration. The executable path comes from Cargo's JSON artifact
+message rather than from a guessed `target/` layout.
+
+The Cargo build options are:
+
+```text
+-p, --package <PACKAGE>  --bin <NAME>
+--release | --profile <NAME>
+--target <TRIPLE>        --target-dir <DIR>
+--manifest-path <PATH>
+--features <FEATURES>    --all-features    --no-default-features
+--locked                 --offline         --frozen
+```
+
+All other options are the standalone `elfpak bundle` options documented below.
+The Cargo artifact replaces any `binary` value in `elfpak.toml`; every other
+configuration and CLI precedence rule is unchanged. `cargo-elfpak` accepts one
+package, binary and target per invocation because one bundle has one application
+executable.
 
 ### `inspect`
 
@@ -461,6 +506,11 @@ Supported target architectures are x86_64 and aarch64. Anything else fails with
   creating missing artifact parent directories when needed
 * records every included file and why
 
+These guarantees describe the standalone packaging phase. `cargo elfpak bundle`
+deliberately invokes Cargo first and may therefore perform whatever
+local build work that Cargo requires; after Cargo reports the executable, the
+same standalone planning and output guarantees apply.
+
 Each directory, tar, and manifest artifact is assembled in a sibling temporary
 path and published only after that artifact is complete. If an individual
 artifact write fails, its previous version remains untouched and no partial
@@ -512,6 +562,7 @@ written — a leftover symlink is never followed out of the output root.
 ## Repository layout
 
 ```text
+crates/cargo-elfpak/  Cargo adapter: selection, freshness-aware build, dispatch
 crates/elfpak/        CLI: argument parsing, config loading, rendering
 crates/elfpak-core/   library: elf, resolver, graph, policy, plan, rootfs, manifest
 fixtures/axum-server/ integration fixture: a real Axum service
@@ -695,7 +746,8 @@ The Docker smoke tests:
 
 ## Status
 
-Implemented (roadmap 0.1/0.2, plus parts of 0.3 and 1.0): workspace, CLI, ELF
+Implemented (roadmap 0.1/0.2, plus parts of 0.3 and 1.0): workspace, standalone
+and Cargo-subcommand CLIs, ELF
 parsing, architecture detection, full static closure,
 RPATH/RUNPATH/token/cache/conf resolution, path and symlink preservation,
 presets, manifest with recorded policy, hashes, dependency allow-list, `verify`

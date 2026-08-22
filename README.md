@@ -51,6 +51,24 @@ ENTRYPOINT ["/app/server"]
 The resulting image contains the application, its ELF closure, and whatever the
 runtime policy asked for.
 
+## Cargo workflow
+
+Install the Cargo adapter when packaging a binary from its Rust project:
+
+```console
+$ cargo install cargo-elfpak
+$ cargo elfpak bundle --release \
+    --output rootfs \
+    --install /app/server \
+    --preset web
+```
+
+`cargo-elfpak` asks Cargo to build the selected binary. Cargo reuses it when it
+is fresh and rebuilds it when any tracked input changed; the exact executable
+path Cargo reports is then passed to the normal `elfpak bundle` implementation.
+Use `-p <package>` in an ambiguous workspace and `--bin <name>` when the package
+has no inferable default binary.
+
 ## Commands
 
 ```text
@@ -118,6 +136,8 @@ $ just check              # fmt, clippy -D warnings, and the whole test suite
 $ just test               # unit, integration and loader-oracle tests
 $ just smoke              # Docker smoke tests (see DOCUMENTATION.md)
 $ just smoke --fresh      # ... with nothing reused from a previous run
+
+$ cargo run -p cargo-elfpak -- bundle --help
 
 $ docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
 ```

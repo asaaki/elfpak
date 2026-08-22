@@ -101,6 +101,10 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked -p elfpak
+      - name: Publish cargo-elfpak
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked -p cargo-elfpak
 
   build-binaries:
     name: Build ${{ matrix.platform }} binary

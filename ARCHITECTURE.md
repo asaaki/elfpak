@@ -2,13 +2,16 @@
 
 `elfpak` packages a Linux ELF executable and its runtime closure into a small,
 deterministic root filesystem suitable for `FROM scratch` images. It is a Rust
-workspace with an adapter-focused command-line crate over a reusable core
+workspace with standalone and Cargo-project adapters over a reusable core
 library.
 
 ## System at a glance
 
 ```mermaid
 flowchart TB
+    CargoProject["Cargo project"] --> CargoAdapter["crates/cargo-elfpak<br/>package + binary selection"]
+    CargoAdapter --> CargoBuild["cargo build<br/>freshness + artifact path"]
+    CargoBuild --> Adapter
     Inputs["CLI arguments<br/>optional elfpak.toml"] --> Adapter["crates/elfpak<br/>application adapter"]
 
     subgraph Core["crates/elfpak-core"]
@@ -41,6 +44,7 @@ re-resolves dependencies.
 
 | Location | Responsibility |
 |---|---|
+| `crates/cargo-elfpak` | Cargo adapter: workspace/package and binary selection, Cargo build option forwarding, freshness-aware artifact discovery, and dispatch into `elfpak bundle`. |
 | `crates/elfpak` | Application boundary: Clap argument definitions, `elfpak.toml` parsing and precedence, command dispatch, output-path validation, and terminal rendering. |
 | `crates/elfpak-core` | Reusable domain library: ELF parsing, source-root abstraction, loader-faithful dependency resolution, policy, graphing, plan construction, materialization, archives, manifests, and verification. |
 | `fixtures/` | Small real programs used by integration and Docker tests: Axum, musl, and an off-path vendor library. |
@@ -48,11 +52,27 @@ re-resolves dependencies.
 | `tests/docker/` | End-to-end scratch-image smoke scenarios. |
 | `fuzz/` | Separate nightly `cargo-fuzz` harness for the ELF parser boundary. |
 
-`crates/elfpak/src/main.rs` is only the executable entry point. Its library
-dispatches `inspect`, `bundle`, and `verify`; it deliberately contains no ELF
-or resolver logic. Workspace-wide lint policy forbids `unsafe` and the release
-profile favors a small static utility (`opt-level = "z"`, LTO, stripped,
-`panic = "abort"`).
+Both command crates use small executable entry points around testable libraries.
+`crates/elfpak` dispatches `inspect`, `bundle`, and `verify`; it deliberately
+contains no ELF or resolver logic. `crates/cargo-elfpak` resolves one Cargo
+package and binary, lets Cargo make that artifact fresh, then enters the same
+bundle adapter with the artifact path. Workspace-wide lint policy forbids
+`unsafe` and the release profile favors small binaries (`opt-level = "z"`, LTO,
+stripped, and `panic = "abort"`).
+
+## Cargo adapter flow
+
+`cargo-elfpak` reads `cargo metadata --no-deps` and requires package selection
+only when the current/root/default package cannot be inferred. Within that
+package it prefers an explicit `--bin`, `default-run`, a package-named binary,
+or a sole binary, in that order. Remaining ambiguity is an error that lists the
+valid selectors.
+
+It then executes `cargo build` for exactly that package and binary with JSON
+messages enabled. Cargo owns the freshness decision; the adapter consumes the
+matching `compiler-artifact` message so custom profiles, targets and target
+directories need no path reconstruction. Cargo must succeed before the existing
+bundle planner or any output destination is touched.
 
 ## Core model and data flow
 
