@@ -159,8 +159,9 @@ the finished staged tree replaces the old rootfs.
 
 `TarBuilder` writes directly from the plan, not from the directory output. Tar
 paths are relative; ordering, ownership, modes, and timestamps are pinned.
-Directory output similarly normalizes modes and pins file/directory timestamps
-using `SOURCE_DATE_EPOCH` (default 0).
+Directory output similarly normalizes modes. Its planned files and directories
+share one materialization timestamp by default, or the explicit
+`SOURCE_DATE_EPOCH` when reproducible directory metadata is required.
 
 `Manifest` records every application, the shared plan, resolved policy, output
 locations, warnings, and every planned entry's path, kind, reason, mode, size,
@@ -176,9 +177,9 @@ entries and mode changes.
   planned before materialization.
 - Original library paths and symlink topology are preserved rather than
   relocated behind `LD_LIBRARY_PATH`.
-- Output entries are deterministic for equal inputs and tool version. Tar
-  output is byte-stable; directory symlink timestamps are the documented
-  platform limitation.
+- Tar output is byte-stable for equal inputs and tool version. Directory output
+  applies `SOURCE_DATE_EPOCH` to planned files and directories on a best-effort
+  basis; symlink timestamps are the documented platform limitation.
 - Bounded graph, cache, search-path, directory-walk, and symlink processing
   protect against malformed or unexpectedly large inputs.
 - Stable diagnostic codes are centralized in `diagnostics.rs` and shared by

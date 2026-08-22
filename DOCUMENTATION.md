@@ -593,13 +593,15 @@ sequenceDiagram
     Note over Rootfs,Manifest: Each artifact is staged completely; the set is published sequentially
 ```
 
-Output is deterministic for the same application binaries, source root,
+Tar output is deterministic for the same application binaries, source root,
 configuration and `elfpak` version: entries are ordered by destination, file
-modes are normalized to `0755`/`0644`, and file *and directory* timestamps are
-pinned to `SOURCE_DATE_EPOCH` (default: the Unix epoch), so an image layer built
-from the directory output does not change from run to run either. Symlink
-timestamps are the one thing that cannot be pinned portably; the tar backend has
-no such limitation and is byte-identical.
+modes are normalized to `0755`/`0644`, and timestamps use `SOURCE_DATE_EPOCH`
+(default: the Unix epoch). Directory output uses one materialization timestamp
+for its planned files and directories by default. Set `SOURCE_DATE_EPOCH` to
+request a fixed timestamp instead. Directory timestamp changes are best-effort
+because not every filesystem supports them, and symlink timestamps cannot be
+pinned portably; use the byte-identical tar backend when reproducibility is a
+hard requirement.
 
 Path handling is defensive throughout: destinations are normalized lexically,
 `..` can never escape the output root, writes through a symlinked parent are

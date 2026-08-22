@@ -8,11 +8,40 @@ use elfpak_core::{
 };
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     path::{Path, PathBuf},
 };
 
 fn sysroot() -> Option<Sysroot> {
     have_cc().then(Sysroot::build)
+}
+
+/// Run an environment-sensitive test body in a child test process so parallel
+/// tests never mutate or inherit `SOURCE_DATE_EPOCH` accidentally.
+fn isolated_source_date_epoch(test_name: &str, value: Option<&str>) -> bool {
+    const MARKER: &str = "ELFPAK_SOURCE_DATE_EPOCH_TEST";
+    if std::env::var_os(MARKER).as_deref() == Some(OsStr::new(test_name)) {
+        return true;
+    }
+
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([test_name, "--exact", "--nocapture"])
+        .env(MARKER, test_name);
+    if let Some(value) = value {
+        command.env("SOURCE_DATE_EPOCH", value);
+    } else {
+        command.env_remove("SOURCE_DATE_EPOCH");
+    }
+
+    let output = command.output().expect("child test process runs");
+    assert!(
+        output.status.success(),
+        "child test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
 }
 
 /// Snapshot every path under `dir` with its type and size.
@@ -458,6 +487,9 @@ fn tar_archive_describes_the_same_tree_as_the_directory() {
 
 #[test]
 fn tar_metadata_is_pinned_and_paths_are_relative() {
+    if !isolated_source_date_epoch("tar_metadata_is_pinned_and_paths_are_relative", None) {
+        return;
+    }
     let Some(sysroot) = sysroot() else { return };
     let output = tempfile::tempdir().unwrap();
     let archive = output.path().join("rootfs.tar");
@@ -752,7 +784,56 @@ fn materialization_rejects_a_source_file_changed_after_planning() {
 }
 
 #[test]
-fn timestamps_are_pinned_for_files_and_directories() {
+fn directory_timestamps_default_to_materialization_time() {
+    if !isolated_source_date_epoch("directory_timestamps_default_to_materialization_time", None) {
+        return;
+    }
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    let earliest = std::time::SystemTime::now() - std::time::Duration::from_secs(2);
+    RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
+    let latest = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+
+    let entries = [
+        rootfs.join("app/server"),
+        rootfs.join("app"),
+        rootfs.join("usr/lib"),
+    ];
+    let timestamp = std::fs::metadata(&entries[0]).unwrap().modified().unwrap();
+    for entry in entries {
+        let modified = std::fs::metadata(&entry).unwrap().modified().unwrap();
+        assert_eq!(
+            modified,
+            timestamp,
+            "{} has a different time",
+            entry.display()
+        );
+        assert!(
+            (earliest..=latest).contains(&modified),
+            "{} has {modified:?}, outside the materialization window {earliest:?}..={latest:?}",
+            entry.display()
+        );
+    }
+}
+
+#[test]
+fn directory_timestamps_honor_source_date_epoch() {
+    const EPOCH: u64 = 1_234_567_890;
+    if !isolated_source_date_epoch(
+        "directory_timestamps_honor_source_date_epoch",
+        Some("1234567890"),
+    ) {
+        return;
+    }
     let Some(sysroot) = sysroot() else { return };
     let output = tempfile::tempdir().unwrap();
     let rootfs = output.path().join("rootfs");
@@ -766,19 +847,44 @@ fn timestamps_are_pinned_for_files_and_directories() {
     .unwrap();
     RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
 
+    let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(EPOCH);
     for entry in [
         rootfs.join("app/server"),
         rootfs.join("app"),
         rootfs.join("usr/lib"),
     ] {
-        let modified = std::fs::metadata(&entry).unwrap().modified().unwrap();
         assert_eq!(
-            modified,
-            std::time::UNIX_EPOCH,
-            "{} keeps a build-time timestamp",
+            std::fs::metadata(&entry).unwrap().modified().unwrap(),
+            expected,
+            "{} does not honor SOURCE_DATE_EPOCH",
             entry.display()
         );
     }
+}
+
+#[test]
+fn invalid_source_date_epoch_fails_before_directory_publication() {
+    if !isolated_source_date_epoch(
+        "invalid_source_date_epoch_fails_before_directory_publication",
+        Some("not-a-timestamp"),
+    ) {
+        return;
+    }
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    let error = RootFsBuilder::new(&rootfs).apply(&plan).unwrap_err();
+
+    assert!(error.to_string().contains("SOURCE_DATE_EPOCH"), "{error}");
+    assert!(!rootfs.exists(), "invalid input must publish no directory");
 }
 
 #[test]

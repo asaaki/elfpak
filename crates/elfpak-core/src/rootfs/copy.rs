@@ -11,22 +11,35 @@ use crate::{
 };
 use std::path::{Path, PathBuf};
 
-/// Fixed mtime for every entry, so repeated runs are byte-identical.
-/// Overridable through `SOURCE_DATE_EPOCH`.
-fn source_date_epoch() -> Result<std::time::SystemTime> {
+/// Explicit reproducible-build timestamp, when configured by the caller.
+fn source_date_epoch() -> Result<Option<std::time::SystemTime>> {
+    let Some(seconds) = configured_source_date_epoch_secs()? else {
+        return Ok(None);
+    };
     std::time::UNIX_EPOCH
-        .checked_add(std::time::Duration::from_secs(source_date_epoch_secs()?))
+        .checked_add(std::time::Duration::from_secs(seconds))
+        .map(Some)
         .ok_or_else(|| Error::Config {
             message: "SOURCE_DATE_EPOCH is outside the supported system-time range".to_string(),
         })
 }
 
 pub(crate) fn source_date_epoch_secs() -> Result<u64> {
+    Ok(configured_source_date_epoch_secs()?.unwrap_or(0))
+}
+
+fn configured_source_date_epoch_secs() -> Result<Option<u64>> {
     match std::env::var("SOURCE_DATE_EPOCH") {
-        Ok(value) => value.trim().parse::<u64>().map_err(|_| Error::Config {
-            message: format!("invalid SOURCE_DATE_EPOCH `{value}` (expected an unsigned integer)"),
-        }),
-        Err(std::env::VarError::NotPresent) => Ok(0),
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| Error::Config {
+                message: format!(
+                    "invalid SOURCE_DATE_EPOCH `{value}` (expected an unsigned integer)"
+                ),
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(Error::Config {
             message: "SOURCE_DATE_EPOCH is not valid Unicode".to_string(),
         }),
@@ -57,8 +70,9 @@ impl RootFsBuilder {
     /// A failed build leaves an existing output untouched and exposes no new
     /// output when the destination did not exist.
     pub fn apply(&self, plan: &BundlePlan) -> Result<RootFsReport> {
-        // Validate this shared reproducibility input before touching output.
-        let _ = source_date_epoch()?;
+        // Capture one time for all planned entries. Reproducible-build callers
+        // can override the ordinary materialization time through SOURCE_DATE_EPOCH.
+        let timestamp = source_date_epoch()?.unwrap_or_else(std::time::SystemTime::now);
         guard_output(&self.output)?;
         let parent = output_parent(&self.output);
         std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
@@ -83,13 +97,18 @@ impl RootFsBuilder {
             guard_clean(&self.output)?;
         }
 
-        let report = self.apply_into(plan, stage.path())?;
+        let report = self.apply_into(plan, stage.path(), timestamp)?;
         publish_directory(stage, &self.output)?;
         Ok(report)
     }
 
     /// Apply a plan to an isolated directory that is not externally visible.
-    fn apply_into(&self, plan: &BundlePlan, output: &Path) -> Result<RootFsReport> {
+    fn apply_into(
+        &self,
+        plan: &BundlePlan,
+        output: &Path,
+        timestamp: std::time::SystemTime,
+    ) -> Result<RootFsReport> {
         let output = output.canonicalize().map_err(|e| io(output, e))?;
 
         let mut report = RootFsReport::default();
@@ -114,7 +133,7 @@ impl RootFsBuilder {
                     remove_existing(&target)?;
                     report.bytes += write_file(&target, file)?;
                     set_mode(&target, file.mode)?;
-                    pin_times(&target);
+                    pin_times(&target, timestamp);
                     report.files += 1;
                 }
             }
@@ -128,7 +147,10 @@ impl RootFsBuilder {
             .rev()
             .filter(|f| f.kind == PlannedFileKind::Directory)
         {
-            pin_times(&crate::paths::join_under(&output, &file.destination));
+            pin_times(
+                &crate::paths::join_under(&output, &file.destination),
+                timestamp,
+            );
         }
 
         let entries = report.files + report.directories + report.symlinks;
@@ -485,14 +507,11 @@ fn set_times_from(path: &Path, metadata: &std::fs::Metadata) {
     );
 }
 
-/// Pin access and modification times. Not every filesystem supports this, and
-/// symlink timestamps cannot be set through `std` at all, so this is
-/// best-effort: the tar backend is the byte-reproducible artifact.
-fn pin_times(path: &Path) {
+/// Give every entry the materialization timestamp. Not every filesystem
+/// supports this, and symlink timestamps cannot be set through `std` at all,
+/// so this is best-effort: the tar backend is the byte-reproducible artifact.
+fn pin_times(path: &Path, time: std::time::SystemTime) {
     let Ok(file) = std::fs::File::open(path) else {
-        return;
-    };
-    let Ok(time) = source_date_epoch() else {
         return;
     };
     let _ = file.set_times(

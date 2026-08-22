@@ -125,8 +125,10 @@ Docker. It treats the source filesystem as read-only and writes only to the
 requested directory, tar and manifest destinations and their temporary
 siblings.
 
-Output is deterministic for the same binaries, source root, configuration and
-`elfpak` version.
+Tar output is deterministic for the same binaries, source root, configuration
+and `elfpak` version. Set `SOURCE_DATE_EPOCH` to request pinned timestamps for
+planned files and directories; tar remains the portable byte-reproducible
+output.
 
 Directory, tar and manifest outputs are staged beside their destinations and
 published only when complete, so a failed build leaves the previous artifact
