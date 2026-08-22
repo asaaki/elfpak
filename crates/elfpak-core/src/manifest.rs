@@ -336,7 +336,11 @@ fn verify_regular(
     // to compare, and the mode check still applies.
     let expected = file.sha256.as_ref()?;
     match sha256_file(target) {
-        Ok((actual, _)) if &actual.0 == expected => None,
+        Ok((actual, size)) if &actual.0 == expected && size == file.size => None,
+        Ok((_actual, size)) if size != file.size => Some(Problem {
+            path: file.path.clone(),
+            detail: format!("size is {size} bytes, expected {}", file.size),
+        }),
         Ok((actual, _)) => Some(Problem {
             path: file.path.clone(),
             detail: format!("sha256 mismatch (found {}, expected {expected})", actual.0),

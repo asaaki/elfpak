@@ -131,6 +131,38 @@ fn manifest_records_every_file_and_verifies() {
 }
 
 #[test]
+fn verification_checks_a_recorded_file_size() {
+    let Some(sysroot) = sysroot() else { return };
+    let output = tempfile::tempdir().unwrap();
+    let rootfs = output.path().join("rootfs");
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/app/server")
+    .plan()
+    .unwrap();
+    RootFsBuilder::new(&rootfs).apply(&plan).unwrap();
+
+    let mut manifest = Manifest::from_plan(&plan, &sysroot.root, Some(&rootfs));
+    let application = manifest
+        .files
+        .iter_mut()
+        .find(|file| file.path == "/app/server")
+        .unwrap();
+    application.size += 1;
+
+    let report = manifest.verify(&rootfs, &VerifyOptions::default());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.path == "/app/server" && problem.detail.contains("size is"))
+    );
+}
+
+#[test]
 fn install_paths_cannot_escape_the_output_directory() {
     let Some(sysroot) = sysroot() else { return };
     let output = tempfile::tempdir().unwrap();

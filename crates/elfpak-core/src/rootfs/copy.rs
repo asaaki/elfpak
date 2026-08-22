@@ -45,6 +45,7 @@ impl RootFsBuilder {
 
     /// Materialize a plan: create, link and copy, in plan order.
     pub fn apply(&self, plan: &BundlePlan) -> Result<RootFsReport> {
+        guard_output(&self.output)?;
         if self.clean && self.output.exists() {
             guard_clean(&self.output)?;
             std::fs::remove_dir_all(&self.output).map_err(|e| io(&self.output, e))?;
@@ -179,6 +180,27 @@ fn write_file(target: &Path, file: &PlannedFile) -> Result<u64> {
     }
 }
 
+/// Refuse the filesystem root as an output even when `--clean` was not
+/// requested. Materializing there would turn logical bundle destinations such
+/// as `/app/server` into writes to the host filesystem.
+fn guard_output(output: &Path) -> Result<()> {
+    // `canonicalize` cannot resolve a path that has not been created yet, so
+    // normalize an absolute spelling first. Otherwise `/new/..` would evade
+    // the guard and become `/` after `create_dir_all`.
+    let absolute = std::path::absolute(output).map_err(|e| io(output, e))?;
+    let lexical = crate::paths::normalize_absolute(&absolute);
+    let resolved = output.canonicalize().unwrap_or(lexical);
+    if resolved.parent().is_none() {
+        return Err(Error::Config {
+            message: format!(
+                "refusing to materialize a bundle at filesystem root `{}`",
+                resolved.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Refuse to delete something that is obviously not a previous bundle: `--clean`
 /// is meant to replace an output directory, not to wipe a filesystem.
 fn guard_clean(output: &Path) -> Result<()> {
@@ -263,7 +285,7 @@ fn pin_times(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{guard_clean, has_symlinked_ancestor, remove_existing};
+    use super::{guard_clean, guard_output, has_symlinked_ancestor, remove_existing};
     use std::path::Path;
 
     #[test]
@@ -303,5 +325,15 @@ mod tests {
         assert_eq!(err.code(), "E4001");
         let temp = tempfile::tempdir().unwrap();
         guard_clean(&temp.path().join("rootfs")).unwrap();
+    }
+
+    #[test]
+    fn materialization_refuses_a_filesystem_root() {
+        let err = guard_output(Path::new("/")).unwrap_err();
+        assert_eq!(err.code(), "E4001");
+        let err = guard_output(Path::new("/new-rootfs/..")).unwrap_err();
+        assert_eq!(err.code(), "E4001");
+        let temp = tempfile::tempdir().unwrap();
+        guard_output(&temp.path().join("rootfs")).unwrap();
     }
 }
