@@ -47,12 +47,13 @@ WORKDIR /src
 COPY --from=elfpak /elfpak /usr/local/bin/elfpak
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked && cp target/release/my-server /my-server
+RUN cargo build --release --locked && \
+    cp target/release/my-server /my-server
 RUN elfpak bundle /my-server \
-        --output /rootfs \
-        --install /app/server \
-        --preset web \
-        --user 65532:65532
+    --output /rootfs \
+    --install /app/server \
+    --preset web \
+    --user 65532:65532
 
 FROM scratch
 COPY --from=build /rootfs /
@@ -65,13 +66,20 @@ ENTRYPOINT ["/app/server"]
 
 The resulting image contains the application, its ELF closure, and whatever the runtime policy asked for.
 
+If you want to work with `elfpak` outside of a Docker build, install it with `cargo binstall`.
+
+```console
+cargo binstall elfpak
+```
+
 ## Cargo workflow
 
 Install the Cargo adapter when packaging binaries from a Rust project:
 
 ```console
-$ cargo install cargo-elfpak
-$ cargo elfpak bundle --release \
+cargo binstall cargo-elfpak
+
+cargo elfpak bundle --release \
     --output rootfs \
     --install /app/server \
     --preset web
@@ -80,8 +88,11 @@ $ cargo elfpak bundle --release \
 `cargo-elfpak` asks Cargo to build the selected binaries. Cargo reuses each one when it is fresh and rebuilds it when any tracked input changed; the exact executable paths Cargo reports are passed to the normal `elfpak bundle` implementation. Use `-p <package>` in an ambiguous workspace and `--bin <name>` when the package has no inferable default binary. Multi-binary projects can select a subset with `-p <package> --bins server,migrate`, every binary in one package with `-p <package> --all-bins`, or every binary in the workspace with `--all`; use `--install-dir` to preserve their names under one directory:
 
 ```console
-$ cargo elfpak bundle --release --all \
-    --output rootfs --install-dir /app --preset web
+cargo elfpak bundle --release \
+  --all \
+  --output rootfs \
+  --install-dir /app \
+  --preset web
 ```
 
 ## Commands
@@ -97,12 +108,14 @@ elfpak verify  <manifest>  check a materialized rootfs against its manifest
 Build a runnable image without Docker or a container daemon:
 
 ```console
-$ cargo elfpak bundle --release --bin server \
-    --oci-archive dist/server.oci.tar \
-    --install /app/server \
-    --image-tag ci \
-    --entrypoint /app/server
-$ skopeo copy \
+cargo elfpak bundle --release \
+  --bin server \
+  --oci-archive dist/server.oci.tar \
+  --install /app/server \
+  --image-tag ci \
+  --entrypoint /app/server
+
+skopeo copy \
     oci-archive:$PWD/dist/server.oci.tar:ci \
     docker://ghcr.io/example/server:latest
 ```

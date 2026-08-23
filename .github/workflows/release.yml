@@ -150,6 +150,8 @@ jobs:
     name: Publish multi-architecture container image
     needs: verify-version
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
@@ -170,7 +172,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest
-      - uses: docker/build-push-action@v7
+      - id: push
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -215,8 +218,45 @@ jobs:
             exit 1
           fi
           sha256sum -c -- *.sha256
+      - name: Compose release body
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          PACKAGE_URL: ${{ github.server_url }}/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}
+          DIGEST: ${{ needs.publish-container.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Packages"
+            echo
+            echo "### crates.io"
+            echo
+            for crate in elfpak cargo-elfpak elfpak-core; do
+              echo "* [\`${crate}\` ${VERSION}](https://crates.io/crates/${crate}/${VERSION}) — [docs](https://docs.rs/${crate}/${VERSION})"
+            done
+            echo
+            echo "\`\`\`sh"
+            echo "cargo install elfpak@${VERSION}"
+            echo "cargo install cargo-elfpak@${VERSION}"
+            echo "\`\`\`"
+            echo
+            echo "### Container image"
+            echo
+            echo "[\`${IMAGE}\`](${PACKAGE_URL}) — tags \`${VERSION}\` and \`latest\`"
+            echo
+            echo "\`\`\`sh"
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo "\`\`\`"
+            if [[ -n "${DIGEST}" ]]; then
+              echo
+              echo "Image digest: \`${DIGEST}\`"
+            fi
+          } > "${RUNNER_TEMP}/release-body.md"
+          cat "${RUNNER_TEMP}/release-body.md"
       - uses: softprops/action-gh-release@v3
         with:
+          body_path: ${{ runner.temp }}/release-body.md
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: release-assets/*
