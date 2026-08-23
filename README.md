@@ -4,7 +4,7 @@
 
 <h1 align="center">elfpak</h1>
 
-<h2 align="center">Everything your app needs. Nothing else.</h2>
+<p align="center"><b>Everything your app needs. Nothing else.</b></p>
 
 -----
 
