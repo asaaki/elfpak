@@ -7,7 +7,7 @@
 use crate::{
     error::{Error, Result, io},
     hash::{HashingReader, ensure_matches_plan},
-    plan::{BundlePlan, PlannedFile, PlannedFileKind},
+    plan::{BundlePlan, PLAN_ENTRIES_MAX, PlannedFile, PlannedFileKind},
 };
 use std::{
     os::unix::fs::PermissionsExt,
@@ -220,14 +220,26 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
 /// unplanned file in the newly published rootfs sharing an inode with the old
 /// rootfs, so a later writer of the old tree could mutate the new snapshot.
 fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
+    clone_tree_with_limit(source, destination, PLAN_ENTRIES_MAX)
+}
+
+fn clone_tree_with_limit(source: &Path, destination: &Path, limit: usize) -> Result<()> {
     let mut stack = vec![(source.to_path_buf(), destination.to_path_buf())];
     let mut directories = Vec::new();
+    let mut entries = 0usize;
 
     while let Some((source_dir, destination_dir)) = stack.pop() {
         let source_metadata = std::fs::metadata(&source_dir).map_err(|e| io(&source_dir, e))?;
         directories.push((destination_dir.clone(), source_metadata));
 
         for entry in std::fs::read_dir(&source_dir).map_err(|e| io(&source_dir, e))? {
+            if entries == limit {
+                return Err(Error::LimitExceeded {
+                    resource: "existing output tree",
+                    limit,
+                });
+            }
+            entries += 1;
             let entry = entry.map_err(|e| io(&source_dir, e))?;
             let source_path = entry.path();
             let destination_path = destination_dir.join(entry.file_name());
@@ -551,8 +563,8 @@ fn pin_times(path: &Path, time: std::time::SystemTime) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_directory, finish_exchange, finish_noreplace, guard_clean, guard_output,
-        remove_existing,
+        clone_tree_with_limit, ensure_directory, finish_exchange, finish_noreplace, guard_clean,
+        guard_output, remove_existing,
     };
     use crate::paths::has_symlinked_ancestor;
     use std::path::Path;
@@ -615,6 +627,26 @@ mod tests {
         std::os::unix::fs::symlink(&target, &output).unwrap();
 
         assert!(ensure_directory(&output).is_err());
+    }
+
+    #[test]
+    fn cloning_an_existing_output_stops_at_its_entry_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("one"), b"one").unwrap();
+        std::fs::write(source.join("two"), b"two").unwrap();
+
+        let error = clone_tree_with_limit(&source, &destination, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::LimitExceeded {
+                resource: "existing output tree",
+                limit: 1,
+            }
+        ));
     }
 
     #[test]

@@ -5,11 +5,11 @@ use crate::{
     graph::Digest,
     hash::sha256_file,
     oci::ResolvedImageConfig,
-    plan::{BundlePlan, InclusionReason, PlannedFileKind},
+    plan::{BundlePlan, InclusionReason, PLAN_ENTRIES_MAX, PlannedFileKind},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -20,7 +20,7 @@ pub const MANIFEST_VERSION: u32 = 4;
 /// One entry costs a few hundred bytes, so this comfortably covers a plan at
 /// [`crate::plan::PLAN_ENTRIES_MAX`] while keeping an arbitrary file handed to
 /// `verify` from being loaded whole.
-const MANIFEST_BYTES_MAX: u64 = 512 * 1024 * 1024;
+const MANIFEST_BYTES_MAX: usize = 512 * 1024 * 1024;
 const MANIFEST_SHA256_VERSION: u32 = 2;
 /// Name of the manifest written beside a bundle.
 pub const MANIFEST_NAME_DEFAULT: &str = "elfpak-manifest.json";
@@ -57,6 +57,7 @@ pub struct Manifest {
     /// the same configuration, so the configuration is part of the record.
     #[serde(default)]
     pub policy: ManifestPolicy,
+    #[serde(deserialize_with = "deserialize_manifest_files")]
     pub files: Vec<ManifestFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -96,6 +97,62 @@ pub struct ManifestFile {
     pub mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+}
+
+const MANIFEST_ENTRY_LIMIT_MESSAGE: &str = "manifest entries exceed the supported limit";
+
+fn deserialize_manifest_files<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ManifestFile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_manifest_files(deserializer, PLAN_ENTRIES_MAX)
+}
+
+/// Deserialize manifest entries without first trusting the sequence's size.
+///
+/// The post-deserialization validation remains as defense in depth, but this
+/// visitor is the allocation boundary: it retains at most `limit` entries and
+/// rejects the first additional one.
+fn deserialize_bounded_manifest_files<'de, D>(
+    deserializer: D,
+    limit: usize,
+) -> std::result::Result<Vec<ManifestFile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedManifestFilesVisitor {
+        limit: usize,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for BoundedManifestFilesVisitor {
+        type Value = Vec<ManifestFile>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of manifest entries")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let capacity = sequence.size_hint().unwrap_or(0).min(self.limit);
+            let mut files = Vec::with_capacity(capacity);
+            while let Some(file) = sequence.next_element()? {
+                if files.len() == self.limit {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "{MANIFEST_ENTRY_LIMIT_MESSAGE} of {}",
+                        self.limit
+                    )));
+                }
+                files.push(file);
+            }
+            Ok(files)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedManifestFilesVisitor { limit })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,16 +350,20 @@ impl Manifest {
             // the size check below would wave it through.
             return Err(invalid_manifest(path, "not a regular file".to_string()));
         }
-        if metadata.len() > MANIFEST_BYTES_MAX {
-            return Err(Error::LimitExceeded {
-                resource: "manifest",
-                limit: usize::try_from(MANIFEST_BYTES_MAX).unwrap_or(usize::MAX),
-            });
-        }
-        let bytes = std::fs::read(path).map_err(|e| io(path, e))?;
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::Manifest {
-            path: path.to_path_buf(),
-            message: e.to_string(),
+        let bytes = read_manifest_with_limit(path, MANIFEST_BYTES_MAX)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+            let message = error.to_string();
+            if message.contains(MANIFEST_ENTRY_LIMIT_MESSAGE) {
+                Error::LimitExceeded {
+                    resource: "manifest entries",
+                    limit: PLAN_ENTRIES_MAX,
+                }
+            } else {
+                Error::Manifest {
+                    path: path.to_path_buf(),
+                    message,
+                }
+            }
         })?;
         manifest.validate(path)?;
         Ok(manifest)
@@ -318,6 +379,7 @@ impl Manifest {
                 format!("unsupported manifest version {}", self.manifest_version),
             ));
         }
+        validate_manifest_entry_count(self.files.len())?;
         let binaries = self.validate_binaries(manifest_path)?;
         let mut paths = std::collections::HashSet::new();
         for file in &self.files {
@@ -513,6 +575,7 @@ impl Manifest {
             .map(|f| crate::paths::normalize_absolute(Path::new(&f.path)))
             .collect();
 
+        let mut budget = VerificationBudget::new(PLAN_ENTRIES_MAX);
         let mut stack = vec![rootfs.to_path_buf()];
         while let Some(current) = stack.pop() {
             assert!(current.starts_with(rootfs), "the walk stays in the rootfs");
@@ -532,12 +595,40 @@ impl Manifest {
                     continue;
                 }
             };
+            // Keep the deterministic ordering without allowing one hostile
+            // directory to allocate an unbounded list before the walk's limit
+            // has a chance to stop it. One extra entry proves the limit was
+            // crossed, and no further names need to be retained or inspected.
+            let mut found = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) => found.push(entry.path()),
+                    Err(error) => {
+                        if !budget.visit(report) {
+                            return;
+                        }
+                        report.problems.push(Problem {
+                            path: logical_within(rootfs, &current),
+                            detail: format!(
+                                "could not be read while checking for unlisted entries: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                if found.len() > budget.remaining() {
+                    budget.exhaust(report);
+                    return;
+                }
+            }
             // Sorted, so that the problems of a failing verification are
             // reported in the same order on every run.
-            let mut found: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
             found.sort();
 
             for path in found {
+                if !budget.visit(report) {
+                    return;
+                }
                 let Ok(relative) = path.strip_prefix(rootfs) else {
                     continue;
                 };
@@ -574,6 +665,93 @@ impl Manifest {
             .iter()
             .filter(|f| f.kind != PlannedFileKind::Directory.as_str())
             .count()
+    }
+}
+
+fn read_manifest_with_limit(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    let metadata = std::fs::metadata(path).map_err(|error| io(path, error))?;
+    if metadata.len() > limit_u64 {
+        return Err(Error::LimitExceeded {
+            resource: "manifest",
+            limit,
+        });
+    }
+
+    let file = std::fs::File::open(path).map_err(|error| io(path, error))?;
+    let capacity = usize::try_from(metadata.len()).unwrap_or(limit).min(limit);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(limit_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| io(path, error))?;
+    if bytes.len() > limit {
+        return Err(Error::LimitExceeded {
+            resource: "manifest",
+            limit,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Reject a manifest that could not have been emitted from a valid plan.
+///
+/// The byte limit on the JSON document prevents one oversized allocation; this
+/// entry limit prevents a small-enough document made from millions of tiny
+/// entries from consuming unbounded memory and verification time.
+fn validate_manifest_entry_count(entry_count: usize) -> Result<()> {
+    if entry_count > PLAN_ENTRIES_MAX {
+        return Err(Error::LimitExceeded {
+            resource: "manifest entries",
+            limit: PLAN_ENTRIES_MAX,
+        });
+    }
+    Ok(())
+}
+
+/// Shared budget for strict filesystem discovery.
+///
+/// A manifest already bounds verification of recorded entries. The strict
+/// walk additionally sees entries the manifest does not name, so it needs the
+/// same cap before retaining directory names or growing the problem report.
+struct VerificationBudget {
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl VerificationBudget {
+    fn new(limit: usize) -> VerificationBudget {
+        VerificationBudget {
+            remaining: limit,
+            exhausted: false,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    /// Consume one discovered filesystem entry. `false` means verification
+    /// has recorded the limit problem and must stop the walk.
+    fn visit(&mut self, report: &mut VerifyReport) -> bool {
+        if self.remaining == 0 {
+            self.exhaust(report);
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    fn exhaust(&mut self, report: &mut VerifyReport) {
+        if self.exhausted {
+            return;
+        }
+        self.exhausted = true;
+        report.problems.push(Problem {
+            path: "/".to_string(),
+            detail: format!(
+                "strict verification exceeded the supported limit of {PLAN_ENTRIES_MAX} verification entries"
+            ),
+        });
     }
 }
 
@@ -726,5 +904,60 @@ impl VerifyReport {
     /// Problems found, saturated at `u32::MAX`.
     pub fn failure_count(&self) -> u32 {
         u32::try_from(self.problems.len()).unwrap_or(u32::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_entry_validation_rejects_a_count_over_the_plan_limit() {
+        let error = validate_manifest_entry_count(PLAN_ENTRIES_MAX + 1).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "manifest entries",
+                limit: PLAN_ENTRIES_MAX,
+            }
+        ));
+    }
+
+    #[test]
+    fn manifest_file_deserialization_stops_at_its_entry_limit() {
+        let json = r#"[
+            {"path":"/one","kind":"directory","reason":"include","size":0,"mode":"0755"},
+            {"path":"/two","kind":"directory","reason":"include","size":0,"mode":"0755"}
+        ]"#;
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+
+        let error = deserialize_bounded_manifest_files(&mut deserializer, 1).unwrap_err();
+        assert!(error.to_string().contains("manifest entries"), "{error}");
+    }
+
+    #[test]
+    fn manifest_read_stops_at_its_byte_limit() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"12345").unwrap();
+
+        let error = read_manifest_with_limit(temp.path(), 4).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "manifest",
+                limit: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn verification_budget_stops_before_recording_unbounded_problems() {
+        let mut budget = VerificationBudget::new(1);
+        let mut report = VerifyReport::default();
+
+        assert!(budget.visit(&mut report));
+        assert!(!budget.visit(&mut report));
+        assert_eq!(report.problems.len(), 1);
+        assert!(report.problems[0].detail.contains("verification entries"));
     }
 }

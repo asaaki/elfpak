@@ -27,7 +27,7 @@ pub(super) enum Authority {
     Closure,
 }
 
-/// Two entries that both carry content wanted the same destination.
+/// Two non-scaffolding entries wanted incompatible representations of one destination.
 #[derive(Debug, Clone)]
 pub(super) struct Conflict {
     pub(super) destination: PathBuf,
@@ -42,8 +42,8 @@ pub(super) struct PlanBuilder<'a> {
     root: &'a SourceRoot,
     entries: BTreeMap<PathBuf, (PlannedFile, Authority)>,
     digests: DigestCache,
-    /// Destinations two content entries wanted, in insertion order. The planner
-    /// decides which of these are legitimate precedence and which are errors.
+    /// Destinations two incompatible real entries wanted, in insertion order.
+    /// The planner decides which are legitimate precedence and which are errors.
     conflicts: Vec<Conflict>,
     /// Authority applied to entries pushed from here on, so that each planning
     /// phase does not have to pass it to every call.
@@ -68,15 +68,15 @@ impl<'a> PlanBuilder<'a> {
 
     /// Add an entry, settling a destination that two of them want.
     ///
-    /// Content always displaces a directory, because a directory is either
-    /// scaffolding or an empty shell and the entry with bytes is the one the
-    /// caller asked for. Otherwise the stronger [`Authority`] wins, and between
-    /// equals the entry planned first keeps its place.
+    /// Content always displaces a scaffolding directory. A directory explicitly
+    /// requested by runtime policy or an include tree is a real plan entry, so
+    /// it competes by [`Authority`] like every other entry. Between equal
+    /// authorities the entry planned first keeps its place.
     ///
-    /// Whenever two entries that both carry content want one destination, the
-    /// loser is recorded as a [`Conflict`] whichever way it went. The planner
-    /// decides which of those are legitimate precedence and which mean the
-    /// bundle cannot express what was asked for.
+    /// Whenever two non-scaffolding entries want incompatible representations
+    /// of one destination, the loser is recorded as a [`Conflict`] whichever
+    /// way it went. The planner decides which contests are documented
+    /// precedence and which mean the bundle cannot express what was asked for.
     fn insert(&mut self, file: PlannedFile) {
         self.insert_with(file, self.authority);
     }
@@ -92,13 +92,19 @@ impl<'a> PlanBuilder<'a> {
 
         let existing_is_dir = existing.kind == PlannedFileKind::Directory;
         let candidate_is_dir = file.kind == PlannedFileKind::Directory;
-        let wins = match (existing_is_dir, candidate_is_dir) {
+        let existing_is_scaffolding =
+            existing_is_dir && *existing_authority == Authority::Scaffolding;
+        let candidate_is_scaffolding = candidate_is_dir && authority == Authority::Scaffolding;
+        let wins = match (existing_is_scaffolding, candidate_is_scaffolding) {
             (true, false) => true,
             (false, true) => false,
             _ => authority > *existing_authority,
         };
 
-        if !existing_is_dir && !candidate_is_dir && !describes_the_same_entry(existing, &file) {
+        if !existing_is_scaffolding
+            && !candidate_is_scaffolding
+            && !describes_the_same_entry(existing, &file)
+        {
             let (kept, dropped) = if wins {
                 ((file.kind, authority), (existing.kind, *existing_authority))
             } else {

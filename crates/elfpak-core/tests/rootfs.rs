@@ -245,6 +245,54 @@ fn an_include_may_overlap_the_closure() {
 }
 
 #[test]
+fn a_runtime_directory_cannot_silently_lose_to_an_executable() {
+    let Some(sysroot) = sysroot() else { return };
+    let policy = elfpak_core::RuntimePolicy {
+        tmp: true,
+        ..Default::default()
+    };
+
+    let error = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .install_as("/tmp")
+    .runtime_policy(policy)
+    .plan()
+    .expect_err("one path cannot be both the application and the requested /tmp directory");
+
+    assert_eq!(error.code(), "E4001");
+    assert!(error.to_string().contains("/tmp"), "{error}");
+}
+
+#[test]
+fn a_runtime_directory_keeps_precedence_over_an_included_file() {
+    let Some(sysroot) = sysroot() else { return };
+    std::fs::write(sysroot.path("/tmp"), b"not a directory").unwrap();
+    let policy = elfpak_core::RuntimePolicy {
+        tmp: true,
+        includes: vec![PathBuf::from("/tmp")],
+        ..Default::default()
+    };
+
+    let plan = Planner::new(
+        SourceRoot::new(&sysroot.root),
+        sysroot.path("/bin/app-default"),
+    )
+    .runtime_policy(policy)
+    .plan()
+    .expect("runtime policy has documented precedence over an include tree");
+
+    let tmp = plan
+        .files()
+        .iter()
+        .find(|file| file.destination() == Path::new("/tmp"))
+        .expect("/tmp is planned");
+    assert_eq!(tmp.kind(), PlannedFileKind::Directory);
+    assert_eq!(tmp.mode(), 0o1777);
+}
+
+#[test]
 fn materializes_files_symlinks_and_directories() {
     let Some(sysroot) = sysroot() else { return };
     let output = tempfile::tempdir().unwrap();

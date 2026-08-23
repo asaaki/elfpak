@@ -670,6 +670,39 @@ fn layout_publication_replaces_directories_and_rejects_symlinks() {
     assert_eq!(error.code(), "E4001");
     assert_eq!(std::fs::read(layout.join("sentinel")).unwrap(), b"old");
 
+    // A foreign directory must not become replaceable merely by naming one
+    // of its files like the OCI marker.
+    let fake_layout = temp.path().join("fake-image");
+    std::fs::create_dir(&fake_layout).unwrap();
+    std::fs::write(fake_layout.join("oci-layout"), b"not an OCI marker").unwrap();
+    std::fs::write(fake_layout.join("sentinel"), b"keep").unwrap();
+    let error = OciLayoutBuilder::new(&fake_layout)
+        .apply(&plan)
+        .unwrap_err();
+    assert_eq!(error.code(), "E4001");
+    assert_eq!(
+        std::fs::read(fake_layout.join("oci-layout")).unwrap(),
+        b"not an OCI marker"
+    );
+    assert_eq!(
+        std::fs::read(fake_layout.join("sentinel")).unwrap(),
+        b"keep"
+    );
+
+    std::fs::write(
+        fake_layout.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
+    let error = OciLayoutBuilder::new(&fake_layout)
+        .apply(&plan)
+        .unwrap_err();
+    assert_eq!(error.code(), "E4001");
+    assert_eq!(
+        std::fs::read(fake_layout.join("sentinel")).unwrap(),
+        b"keep"
+    );
+
     OciLayoutBuilder::new(&layout)
         .clean(true)
         .apply(&plan)

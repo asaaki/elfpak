@@ -383,21 +383,21 @@ claiming uid `0` or `65534` under another name, is rejected. Sharing a reserved
 ### When two features want the same path
 
 Every entry is planned before anything is written, so a destination two features
-both claim is settled once, in the plan. Directory scaffolding never displaces
-real content, and content always replaces scaffolding. Between two entries that
-both carry content, the phases decide, in order of how little choice there was
-about the path: the ELF closure first, whose objects must sit exactly where the
-loader will look for them, then runtime policy, then `--include`. A generated
-`/etc/passwd` therefore keeps its place against an `--include` of the source
-root's `/etc`, and `elfpak bundle -v` lists the winner with its reason.
+both claim is settled once, in the plan. Implicit directory scaffolding never
+displaces a real entry, and a real entry always replaces scaffolding. Explicit
+directories requested by runtime policy or `--include` compete like files and
+symlinks. Between real entries, the phases decide in order of how little choice
+there was about the path: the ELF closure first, whose objects must sit exactly
+where the loader will look for them, then runtime policy, then `--include`. A
+generated `/etc/passwd` therefore keeps its place against an `--include` of the
+source root's `/etc`, and `elfpak bundle -v` lists the winner with its reason.
 
-Two entries that both carry content and are not the same file are an error
-rather than a precedence, because the bundle can only express one of them:
-`--install` landing on a library the closure needs at that exact path, or on a
-file runtime policy generates. `E4001` names both entries. The same check
-rejects a plan whose entries would nest inside something that is not a
-directory, which directory output cannot create and tar output would silently
-write through.
+Two incompatible real entries are an error rather than a precedence, because
+the bundle can only express one of them: `--install` landing on a library the
+closure needs at that exact path, on a file runtime policy generates, or on a
+directory policy requires. `E4001` names both entries. The same check rejects a
+plan whose entries would nest inside something that is not a directory, which
+directory output cannot create and tar output would silently write through.
 
 One file legitimately reaches the plan more than once — `/etc/localtime`
 resolving into the zone database `--tzdata` already copied, or an `--include`
@@ -431,6 +431,8 @@ allow = ["libc.so.6", "libgcc_s.so.1"]
 ```
 
 Unknown keys are rejected rather than ignored, so typos surface immediately.
+The selected configuration must be a regular file no larger than 1 MiB; special
+files and oversized input are rejected before parsing.
 
 For a standalone multi-binary bundle, replace the singular package keys with:
 
@@ -526,6 +528,9 @@ ok: 25 entries verified in /out/rootfs
 `verify` checks that every entry exists, that regular files hash as recorded,
 and that symlinks still point where they did. It needs no Docker. Pass
 `--rootfs` to check a tree other than the one recorded in the manifest.
+Manifest input and strict filesystem discovery are bounded; inputs exceeding
+the supported byte or entry limits fail instead of growing memory or work
+without limit.
 
 By default that proves nothing was **removed or altered**. `--strict` also walks
 the rootfs and fails on anything the manifest does not list, so files *added*
@@ -773,10 +778,11 @@ contain or equal `--root`, because publishing replaces that directory and would
 destroy the filesystem being packaged.
 
 `--oci-layout` publishes by replacing its destination, so it accepts only a
-destination that does not exist, is empty, or already holds an `oci-layout`
-marker. Pass `--clean` to replace a directory holding anything else. Files
-inside a published layout are written with mode `0644` and are on disk before
-`index.json` names them.
+destination that does not exist, is empty, or already holds both a valid regular
+`oci-layout` JSON marker for layout version `1.0.0` and a valid bounded
+`index.json`. Pass `--clean` to replace a directory holding anything else.
+Files inside a published layout are written with mode `0644` and are on disk
+before `index.json` names them.
 
 ## Repository layout
 

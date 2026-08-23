@@ -10,6 +10,9 @@ use std::{
 
 /// Name of the configuration file discovered beside the working directory.
 const CONFIG_NAME_DEFAULT: &str = "elfpak.toml";
+/// A configuration names a few paths and options; anything larger is almost
+/// certainly the wrong file and must not be read into memory without a bound.
+const CONFIG_BYTES_MAX: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,16 +89,49 @@ pub(crate) struct DependencyConfig {
 
 impl Config {
     pub(crate) fn parse(text: &str) -> Result<Config> {
+        validate_config_size(text.len())?;
         toml::from_str(text).map_err(|e| Error::Config {
             message: e.to_string(),
         })
     }
 
     pub(crate) fn load(path: &Path) -> Result<Config> {
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
+        use std::io::Read;
+
+        // Inspect before opening: opening a FIFO for reading can block waiting
+        // for a writer, while metadata lookup is non-blocking.
+        let metadata = std::fs::metadata(path).map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
         })?;
+        if !metadata.is_file() {
+            return Err(Error::Config {
+                message: format!("configuration `{}` is not a regular file", path.display()),
+            });
+        }
+        let limit = u64::try_from(CONFIG_BYTES_MAX).expect("configuration byte limit fits u64");
+        if metadata.len() > limit {
+            return Err(config_size_error());
+        }
+
+        let file = std::fs::File::open(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        // Recheck the stream length in case the file grows after its metadata
+        // was inspected. The retained allocation never exceeds the limit plus
+        // the one byte needed to prove it was crossed.
+        let capacity = usize::try_from(metadata.len())
+            .unwrap_or(CONFIG_BYTES_MAX)
+            .min(CONFIG_BYTES_MAX);
+        let mut text = String::with_capacity(capacity);
+        file.take(limit + 1)
+            .read_to_string(&mut text)
+            .map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_config_size(text.len())?;
         let mut config = Config::parse(&text).map_err(|e| match e {
             Error::Config { message } => Error::Config {
                 message: format!("{}: {message}", path.display()),
@@ -127,6 +163,20 @@ impl Config {
         }
         let config = Config::load(&candidate)?;
         Ok(Some((candidate, config)))
+    }
+}
+
+fn validate_config_size(size: usize) -> Result<()> {
+    if size > CONFIG_BYTES_MAX {
+        return Err(config_size_error());
+    }
+    Ok(())
+}
+
+fn config_size_error() -> Error {
+    Error::LimitExceeded {
+        resource: "configuration file",
+        limit: CONFIG_BYTES_MAX,
     }
 }
 
@@ -184,6 +234,40 @@ allow = ["libc.so.6", "libgcc_s.so.1"]
         let config = Config::parse("").unwrap();
         assert!(config.package.binary.is_none());
         assert!(config.include.paths.is_empty());
+    }
+
+    #[test]
+    fn an_oversized_config_is_rejected_before_parsing() {
+        let text = " ".repeat(CONFIG_BYTES_MAX + 1);
+        let error = Config::parse(&text).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "configuration file",
+                limit: CONFIG_BYTES_MAX,
+            }
+        ));
+    }
+
+    #[test]
+    fn a_fifo_config_is_rejected_without_waiting_for_a_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("elfpak.toml");
+        let created = std::process::Command::new("mkfifo").arg(&path).status();
+        if !created.is_ok_and(|status| status.success()) {
+            return;
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(Config::load(&path));
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("configuration validation must not block while opening a FIFO");
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), "E4001");
+        assert!(error.to_string().contains("regular file"), "{error}");
     }
 
     #[test]

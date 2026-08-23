@@ -17,12 +17,14 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
 const OCI_LAYOUT_VERSION: &str = "1.0.0";
+const OCI_LAYOUT_MARKER_BYTES_MAX: u64 = 1_024;
+const OCI_LAYOUT_INDEX_BYTES_MAX: u64 = 16 * 1024 * 1024;
 
 /// Mode every file in a published layout gets, so that a consumer running as
 /// another user sees one consistent set of permissions.
@@ -89,13 +91,57 @@ impl OciLayoutBuilder {
 }
 
 /// Whether an existing destination is one this builder may replace on its own:
-/// empty, or already carrying the layout marker `oci-layout`.
+/// empty, or already carrying a valid layout marker `oci-layout`.
 fn is_replaceable_layout(output: &Path) -> Result<bool> {
-    if output.join("oci-layout").is_file() {
-        return Ok(true);
+    let marker = output.join("oci-layout");
+    if path_exists(&marker) {
+        return Ok(valid_layout_marker(&marker)? && valid_layout_index(&output.join("index.json"))?);
     }
     let mut entries = std::fs::read_dir(output).map_err(|error| io(output, error))?;
     Ok(entries.next().is_none())
+}
+
+fn valid_layout_marker(marker: &Path) -> Result<bool> {
+    let Some(marker) = read_bounded_json(marker, OCI_LAYOUT_MARKER_BYTES_MAX)? else {
+        return Ok(false);
+    };
+    Ok(marker
+        .get("imageLayoutVersion")
+        .and_then(|value| value.as_str())
+        == Some(OCI_LAYOUT_VERSION))
+}
+
+fn valid_layout_index(index: &Path) -> Result<bool> {
+    let Some(index) = read_bounded_json(index, OCI_LAYOUT_INDEX_BYTES_MAX)? else {
+        return Ok(false);
+    };
+    Ok(
+        index.get("schemaVersion").and_then(|value| value.as_u64()) == Some(2)
+            && index.get("manifests").is_some_and(|value| value.is_array()),
+    )
+}
+
+fn read_bounded_json(path: &Path, limit: u64) -> Result<Option<serde_json::Value>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io(path, error)),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > limit {
+        return Ok(None);
+    }
+
+    let file = std::fs::File::open(path).map_err(|error| io(path, error))?;
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io(path, error))?;
+    if bytes.len() as u64 > limit {
+        return Ok(None);
+    }
+
+    Ok(serde_json::from_slice(&bytes).ok())
 }
 
 #[derive(Debug)]

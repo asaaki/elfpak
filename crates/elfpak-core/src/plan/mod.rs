@@ -705,11 +705,11 @@ fn cache_soname(node: &Node) -> String {
     }
 }
 
-/// Reject a destination two entries that both carry content wanted.
+/// Reject a destination two non-scaffolding entries wanted incompatibly.
 ///
-/// One case is legitimate and stays silent: a file runtime policy generates
-/// keeps its place against the same path arriving inside an `--include` tree,
-/// which is what lets `--include /etc` coexist with a generated `/etc/passwd`.
+/// One case is legitimate and stays silent: runtime policy keeps its place
+/// against the same path arriving inside an `--include` tree, which is what
+/// lets `--include /etc` coexist with generated files and policy directories.
 /// Everything else means the caller asked for two different things in one
 /// place, and the bundle can only express one of them.
 fn check_destination_conflicts(conflicts: &[Conflict]) -> Result<()> {
