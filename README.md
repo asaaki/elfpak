@@ -1,13 +1,16 @@
-# elfpak
+<p align="center">
+  <img src=".assets/elfpak.svg" alt="elfpak logo" width="256" height="256">
+</p>
 
-Analyze a Linux ELF application, determine its runtime closure the way the glibc
-loader would, and package that closure for a `FROM scratch` container.
+<h1 align="center">elfpak</h1>
+
+<p align="center">Analyze a Linux ELF application, determine its runtime closure the way the glibc loader would, and package that closure for a `FROM scratch` container.</p>
+
+-----
 
 > `cargo vendor`, but for an executable's Linux runtime.
 
-`elfpak` is a Rust replacement for [`magicpak`](https://github.com/coord-e/magicpak),
-narrowly focused on turning a compiled binary plus the filesystem it was built
-against into a deterministic minimal rootfs.
+`elfpak` is an alternative for [`magicpak`](https://github.com/coord-e/magicpak), narrowly focused on turning a compiled binary plus the filesystem it was built against into a deterministic minimal rootfs. Which can be used to produce a reasonably small `FROM scratch` container or OCI image, with no unnecessary cruft. That leads to much more secure container images, leaving only your application and its system dependencies exposed to potential security vulnerabilities.
 
 ```mermaid
 flowchart TB
