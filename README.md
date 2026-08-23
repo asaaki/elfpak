@@ -68,7 +68,7 @@ The resulting image contains the application, its ELF closure, and whatever the 
 
 If you want to work with `elfpak` outside of a Docker build, install it with `cargo binstall`.
 
-```console
+```sh
 cargo binstall elfpak
 ```
 
@@ -76,7 +76,7 @@ cargo binstall elfpak
 
 Install the Cargo adapter when packaging binaries from a Rust project:
 
-```console
+```sh
 cargo binstall cargo-elfpak
 
 cargo elfpak bundle --release \
@@ -87,7 +87,7 @@ cargo elfpak bundle --release \
 
 `cargo-elfpak` asks Cargo to build the selected binaries. Cargo reuses each one when it is fresh and rebuilds it when any tracked input changed; the exact executable paths Cargo reports are passed to the normal `elfpak bundle` implementation. Use `-p <package>` in an ambiguous workspace and `--bin <name>` when the package has no inferable default binary. Multi-binary projects can select a subset with `-p <package> --bins server,migrate`, every binary in one package with `-p <package> --all-bins`, or every binary in the workspace with `--all`; use `--install-dir` to preserve their names under one directory:
 
-```console
+```sh
 cargo elfpak bundle --release \
   --all \
   --output rootfs \
@@ -107,7 +107,7 @@ elfpak verify  <manifest>  check a materialized rootfs against its manifest
 
 Build a runnable image without Docker or a container daemon:
 
-```console
+```sh
 cargo elfpak bundle --release \
   --bin server \
   --oci-archive dist/server.oci.tar \
@@ -148,16 +148,16 @@ Directory, tar, OCI, and manifest outputs are staged beside their destinations a
 
 ## Development
 
-```console
-$ just check              # fmt, clippy -D warnings, and the whole test suite
-$ just test               # unit, integration and loader-oracle tests
-$ just smoke              # Docker smoke tests (see DOCUMENTATION.md)
-$ just smoke --fresh      # ... with nothing reused from a previous run
-$ just oci-smoke          # Skopeo + Podman interoperability, no Docker
+```sh
+just check              # fmt, clippy -D warnings, and the whole test suite
+just test               # unit, integration and loader-oracle tests
+just smoke              # Docker smoke tests (see DOCUMENTATION.md)
+just smoke --fresh      # ... with nothing reused from a previous run
+just oci-smoke          # Skopeo + Podman interoperability, no Docker
 
-$ cargo run -p cargo-elfpak -- bundle --help
+cargo run -p cargo-elfpak -- bundle --help
 
-$ docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
+docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
 ```
 
 The design is inspired by [TigerStyle](https://tigerstyle.dev/): safety first, bounded work, explicit invariants, deterministic output, and performance that does not come at the cost of readable Rust. [STYLE.md](STYLE.md) records the project's adaptation without imposing mechanical line-count rules.

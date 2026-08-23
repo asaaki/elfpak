@@ -1,5 +1,9 @@
 # elfpak documentation
 
+```sh
+cargo binstall elfpak
+```
+
 Reference for `elfpak`. See [README.md](README.md) for the short version.
 
 - [Commands](#commands)
@@ -59,9 +63,9 @@ Global flags: `-q/--quiet`, `-v`/`-vv` for verbosity. `-v` on `bundle` prints ev
 
 `cargo-elfpak` adapts the bundle command to a Cargo project. Install it and run the packaging options directly from the project:
 
-```console
-$ cargo install cargo-elfpak
-$ cargo elfpak bundle --release -p api --bin server \
+```sh
+cargo binstall cargo-elfpak
+cargo elfpak bundle --release -p api --bin server \
     --output rootfs --install /app/server --preset web
 ```
 
@@ -94,8 +98,8 @@ All other options are the standalone `elfpak bundle` options documented below. T
 
 ### `inspect`
 
-```console
-$ elfpak inspect ./server
+```sh
+elfpak inspect ./server
 ./server
   ELF64 LSB x86_64
 
@@ -122,8 +126,8 @@ $ elfpak inspect ./server
 
 ### `bundle`
 
-```console
-$ elfpak bundle ./server \
+```sh
+elfpak bundle ./server \
     --output /out/rootfs \
     --install /app/server \
     --preset web \
@@ -134,8 +138,8 @@ The executable is installed at `--install`; every other file keeps the path it h
 
 Pass multiple executables with `--install-dir` to create one bundle. Their basenames are preserved and shared libraries are stored once:
 
-```console
-$ elfpak bundle ./server ./migrate \
+```sh
+elfpak bundle ./server ./migrate \
     --output /out/rootfs \
     --install-dir /app \
     --preset web
@@ -147,8 +151,8 @@ With no install option, binaries land at `/<basename>`. Singular `--install` can
 
 `--tar` writes a tar archive instead of, or in addition to, a directory:
 
-```console
-$ elfpak bundle ./server --tar /out/rootfs.tar --install /app/server --preset web
+```sh
+elfpak bundle ./server --tar /out/rootfs.tar --install /app/server --preset web
 ```
 
 ```dockerfile
@@ -165,8 +169,8 @@ Symlinks are stored as symlink entries and directories keep their modes, includi
 
 `--oci-layout` and `--oci-archive` produce a runnable OCI image without Docker, a daemon, network access, or registry credentials:
 
-```console
-$ cargo elfpak bundle --release --bin server \
+```sh
+cargo elfpak bundle --release --bin server \
     --oci-layout dist/server.oci \
     --oci-archive dist/server.oci.tar \
     --install /app/server \
@@ -204,10 +208,10 @@ The directory contains `oci-layout`, `index.json`, and content-addressed blobs u
 
 The local tag is part of transport syntax in the following examples:
 
-```console
-$ skopeo inspect oci:$PWD/dist/server.oci:ci
-$ skopeo inspect oci-archive:$PWD/dist/server.oci.tar:ci
-$ skopeo copy oci-archive:$PWD/dist/server.oci.tar:ci \
+```sh
+skopeo inspect oci:$PWD/dist/server.oci:ci
+skopeo inspect oci-archive:$PWD/dist/server.oci.tar:ci
+skopeo copy oci-archive:$PWD/dist/server.oci.tar:ci \
     docker://ghcr.io/example/server:sha-0123456789abcdef
 
 $ oras cp --from-oci-layout \
@@ -283,8 +287,8 @@ ELF analysis can prove which shared objects a program loads. It cannot prove whi
 
 Presets are convenience configuration, never hidden behaviour. Every feature is also independently switchable, and the preset only supplies the defaults:
 
-```console
-$ elfpak bundle ./server -o /rootfs --preset web --tzdata --tmp=false
+```sh
+elfpak bundle ./server -o /rootfs --preset web --tzdata --tmp=false
 ```
 
 * `--ca-certificates` — the system CA bundle, found at its usual location and copied there, with its symlink chain intact.
@@ -402,8 +406,8 @@ The `policy` object records the *resolved* runtime and dependency policy — pre
 
 Manifest version 3 records every installed application in `binaries` while retaining `binary` as the primary/first application for compatibility. Version 4 adds the `image` object, which records the resolved OCI image configuration and its manifest digest whenever an OCI output was written. Older manifests without `binaries` or `image` continue to verify.
 
-```console
-$ elfpak verify /out/elfpak-manifest.json
+```sh
+elfpak verify /out/elfpak-manifest.json
 ok: 25 entries verified in /out/rootfs
 ```
 
@@ -411,8 +415,8 @@ ok: 25 entries verified in /out/rootfs
 
 By default that proves nothing was **removed or altered**. `--strict` also walks the rootfs and fails on anything the manifest does not list, so files *added* after the bundle was built are caught too, and compares permission bits, which a content digest cannot see (a file that became setuid still hashes the same):
 
-```console
-$ elfpak verify /out/elfpak-manifest.json --strict
+```sh
+elfpak verify /out/elfpak-manifest.json --strict
   /opt/payload/extra.so: present in the rootfs but not listed in the manifest
 error[E5001]:
   verification failed: 1 problem(s) across 25 manifest entries
@@ -459,8 +463,8 @@ The loader finds a library in one of three ways: a directory the object itself n
 
 A bundle has no `ldconfig` — and copying the build host's cache would describe the host's filesystem, not the bundle's. So `elfpak` writes the cache itself, straight from the plan:
 
-```console
-$ elfpak bundle ./server -o /rootfs --install /app/server --library-path /opt/vendor/lib -v
+```sh
+elfpak bundle ./server -o /rootfs --install /app/server --library-path /opt/vendor/lib -v
     - /etc/ld.so.cache                       runtime policy: ld-so-cache
     ...
 ```
@@ -519,8 +523,8 @@ A warning never fails a build. It reports something static analysis found that t
 
 The source filesystem is abstracted behind `--root`, which the resolver treats as the logical `/`. An x86_64 `elfpak` can therefore package an aarch64 application from an aarch64 sysroot without executing anything:
 
-```console
-$ elfpak bundle /sysroot/app/server \
+```sh
+elfpak bundle /sysroot/app/server \
     --root /sysroot \
     --output /rootfs \
     --install /app/server
@@ -601,8 +605,8 @@ Base images are pinned by tag and digest, and no build step installs packages fr
 
 The distribution image is multi-platform and cross-compiled. Its builder stage runs on the *build* platform (`FROM --platform=$BUILDPLATFORM`) and targets `$TARGETARCH`, so every architecture is produced by a native compiler and none of it runs under emulation:
 
-```console
-$ docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 -t elfpak:local --load .
 ```
 
 `elfpak` has no C dependencies, so `rust-lld` links every supported target and no cross toolchain has to be installed. The result is a static musl binary per architecture, together in one image.
@@ -617,10 +621,10 @@ See the [Docker multi-platform documentation][multi-platform] for the details.
 
 Minimum supported Rust version: **1.98**.
 
-```console
-$ just check                       # fmt, clippy -D warnings, and the whole suite
-$ just test                        # unit and integration tests
-$ tests/docker/smoke.sh            # all Docker smoke tests
+```sh
+just check                       # fmt, clippy -D warnings, and the whole suite
+just test                        # unit and integration tests
+tests/docker/smoke.sh            # all Docker smoke tests
 $ tests/docker/smoke.sh axum       # Axum on scratch, host architecture
 $ tests/docker/smoke.sh axum-arm64 # Axum on scratch, linux/arm64
 $ tests/docker/smoke.sh ca         # CA roots come from the bundle, not the binary
@@ -656,10 +660,10 @@ The generated loader cache is checked against glibc the same way: `ldconfig -p` 
 
 The ELF parser is the only place where `elfpak` consumes untrusted binary input. `tests/elf_robustness.rs` runs deterministic truncation, bit-flip and garbage mutations on every `cargo test`, and `fuzz/` holds a `cargo-fuzz` target for deeper runs:
 
-```console
-$ cargo install cargo-fuzz
-$ mkdir -p fuzz/corpus/parse_elf && cp /usr/bin/ls /usr/bin/true fuzz/corpus/parse_elf/
-$ cargo +nightly fuzz run parse_elf
+```sh
+cargo install cargo-fuzz
+mkdir -p fuzz/corpus/parse_elf && cp /usr/bin/ls /usr/bin/true fuzz/corpus/parse_elf/
+cargo +nightly fuzz run parse_elf
 ```
 
 The corpus is not checked in; seed it from any system binaries. The fuzz crate is outside the workspace, so a normal build never needs nightly.
