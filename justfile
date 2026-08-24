@@ -29,6 +29,10 @@ bump kind:
         echo "release bumps require tomli (cargo binstall tomli)" >&2
         exit 1
     fi
+    case "$(uname -s)" in
+        Darwin) stat_format='-f %Lp' ;;
+        *) stat_format='-c %a' ;;
+    esac
 
     current="$(tomli query --strip-trailing-newline --filepath Cargo.toml workspace.package.version | tr -d '[:space:]\"')"
     if [[ ! "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
@@ -68,9 +72,9 @@ bump kind:
     tomli set --strip-trailing-newline workspace.package.version "$new_version" < Cargo.toml > "$workspace_manifest_next"
     tomli set --strip-trailing-newline dependencies.elfpak-core.version "$new_version" < crates/elfpak/Cargo.toml > "$elfpak_manifest_next"
     tomli set --strip-trailing-newline dependencies.elfpak.version "$new_version" < crates/cargo-elfpak/Cargo.toml > "$cargo_elfpak_manifest_next"
-    chmod --reference=Cargo.toml "$workspace_manifest_next"
-    chmod --reference=crates/elfpak/Cargo.toml "$elfpak_manifest_next"
-    chmod --reference=crates/cargo-elfpak/Cargo.toml "$cargo_elfpak_manifest_next"
+    chmod "$(stat $stat_format Cargo.toml)" "$workspace_manifest_next"
+    chmod "$(stat $stat_format crates/elfpak/Cargo.toml)" "$elfpak_manifest_next"
+    chmod "$(stat $stat_format crates/cargo-elfpak/Cargo.toml)" "$cargo_elfpak_manifest_next"
     mv "$workspace_manifest_next" Cargo.toml
     mv "$elfpak_manifest_next" crates/elfpak/Cargo.toml
     mv "$cargo_elfpak_manifest_next" crates/cargo-elfpak/Cargo.toml
