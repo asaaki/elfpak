@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".assets/elfpak.svg" alt="elfpak logo" width="256" height="256">
+  <img src="https://raw.githubusercontent.com/asaaki/elfpak/main/.assets/elfpak.svg" alt="elfpak logo" width="256" height="256">
 </p>
 
 <h1 align="center">elfpak</h1>
