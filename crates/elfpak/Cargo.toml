@@ -25,7 +25,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-elfpak-core = { path = "../elfpak-core", version = "0.5.2" }
+elfpak-core = { path = "../elfpak-core", version = "0.5.3" }
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
