@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/asaaki/elfpak"
 readme = "README.md"
 description = "Package a Linux ELF application and its runtime closure into a minimal rootfs"
+include = ["src/**", ".assets/**", "LICENSE*"]
 
 # Keep compiler warnings visible across the workspace.
 [workspace.lints.rust]

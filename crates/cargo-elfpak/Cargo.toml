@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+include.workspace = true
 description = "Cargo subcommand for packaging a binary and its Linux runtime closure"
 categories = ["command-line-utilities", "development-tools", "virtualization"]
 keywords = ["cargo-subcommand", "elf", "linux", "container", "rootfs"]

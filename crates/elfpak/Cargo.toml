@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+include.workspace = true
 description.workspace = true
 categories = ["command-line-utilities", "development-tools", "filesystem", "virtualization"]
 keywords = ["elf", "linux", "container", "rootfs", "packaging"]
