@@ -239,9 +239,18 @@ jobs:
               echo "* [\`${crate}\` ${VERSION}](https://crates.io/crates/${crate}/${VERSION}) — [docs](https://docs.rs/${crate}/${VERSION})"
             done
             echo
+            echo "#### Prebuilt binaries"
+            echo
             echo "\`\`\`sh"
-            echo "cargo install elfpak@${VERSION}"
-            echo "cargo install cargo-elfpak@${VERSION}"
+            echo "cargo binstall elfpak@${VERSION}"
+            echo "cargo binstall cargo-elfpak@${VERSION}"
+            echo "\`\`\`"
+            echo
+            echo "#### Build from source"
+            echo
+            echo "\`\`\`sh"
+            echo "cargo install --locked elfpak@${VERSION}"
+            echo "cargo install --locked cargo-elfpak@${VERSION}"
             echo "\`\`\`"
             echo
             echo "### Container image"
