@@ -32,11 +32,11 @@ WORKDIR /src
 COPY fixtures/axum-server/Cargo.toml fixtures/axum-server/Cargo.lock ./
 COPY fixtures/axum-server/src ./src
 
-# The target cache is keyed per architecture so the amd64 and arm64 builds do
-# not clobber each other (emulated rebuilds are expensive).
+# Both caches are keyed per architecture so the amd64 and arm64 builds do not
+# clobber each other (emulated rebuilds are expensive).
 ARG TARGETARCH
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=axum-target-${TARGETARCH},sharing=locked \
     cargo build --release --locked \
     && cp target/release/axum-server /axum-server

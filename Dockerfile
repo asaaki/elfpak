@@ -29,7 +29,10 @@ COPY crates ./crates
 # The two command-line tools have no C dependencies, so rust-lld links every
 # supported target and no cross toolchain is needed. `+crt-static` keeps each
 # result a single file with no runtime dependencies of its own.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#
+# Both caches are keyed per architecture so the amd64 and arm64 builds do not
+# clobber each other.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=elfpak-target-${TARGETARCH},sharing=locked <<'SHELL'
 set -eu
 case "${TARGETARCH}" in

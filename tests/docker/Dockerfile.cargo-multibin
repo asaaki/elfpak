@@ -18,7 +18,10 @@ COPY crates ./crates
 
 # Keep the tool build separate from the fixture so editing its tiny sources
 # does not rebuild cargo-elfpak and its dependency graph.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#
+# Both caches are keyed per architecture so the amd64 and arm64 builds do not
+# clobber each other.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=cargo-elfpak-smoke-${TARGETARCH},sharing=locked \
     cargo build --release --locked --bin cargo-elfpak \
     && cp target/release/cargo-elfpak /usr/local/bin/cargo-elfpak
@@ -27,7 +30,7 @@ WORKDIR /fixture
 
 COPY tests/docker/fixtures/cargo-multibin/ ./
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/fixture/target,id=cargo-multibin-fixture-${TARGETARCH},sharing=locked <<'SHELL'
 set -eu
 
